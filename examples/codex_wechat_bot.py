@@ -22,12 +22,16 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import json
 import logging
+import os
 import re
 import sys
+import tempfile
 import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -97,14 +101,75 @@ _SKILL_NAME_RE = re.compile(r"^\$([\w:-]+)")
 class Session:
     session_id: str
     summary: str = "未开始对话"
+    thread_id: Optional[str] = None
+    created_at: str = ""
+    updated_at: str = ""
 
 
 class SessionManager:
-    """Track named sessions and their Codex conversation keys per user."""
+    """Persist named sessions and their Codex thread IDs per user."""
 
-    def __init__(self) -> None:
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = path or (Path.home() / ".codex-wechat-bot" / "sessions.json")
         self._sessions: dict[str, dict[str, Session]] = {}
         self._active: dict[str, str] = {}
+        self._load()
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+
+        for user_id, record in data.get("users", {}).items():
+            session_records = record.get("sessions", {})
+            self._sessions[user_id] = {
+                session_id: Session(
+                    session_id=session_id,
+                    summary=value.get("summary", "未开始对话"),
+                    thread_id=value.get("thread_id"),
+                    created_at=value.get("created_at", ""),
+                    updated_at=value.get("updated_at", ""),
+                )
+                for session_id, value in session_records.items()
+            }
+            active = record.get("active")
+            if active in self._sessions[user_id]:
+                self._active[user_id] = active
+
+    def _save(self) -> None:
+        payload = {"version": 1, "users": {}}
+        for user_id, sessions in self._sessions.items():
+            payload["users"][user_id] = {
+                "active": self._active.get(user_id),
+                "sessions": {
+                    session_id: {
+                        "summary": session.summary,
+                        "thread_id": session.thread_id,
+                        "created_at": session.created_at,
+                        "updated_at": session.updated_at,
+                    }
+                    for session_id, session in sessions.items()
+                },
+            }
+
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix="sessions.", suffix=".tmp", dir=self.path.parent
+        )
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            os.chmod(temporary_path, 0o600)
+            os.replace(temporary_path, self.path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
 
     def _user_sessions(self, user_id: str) -> dict[str, Session]:
         return self._sessions.setdefault(user_id, {})
@@ -123,10 +188,18 @@ class SessionManager:
         requested_id = (session_id or "").strip()
         session_id = requested_id or f"session-{uuid.uuid4().hex[:8]}"
         if session_id in sessions:
+            self._active[user_id] = session_id
+            self._save()
             return sessions[session_id]
-        session = Session(session_id=session_id)
+        timestamp = self._now()
+        session = Session(
+            session_id=session_id,
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
         sessions[session_id] = session
         self._active[user_id] = session_id
+        self._save()
         return session
 
     def switch_or_create(
@@ -136,6 +209,7 @@ class SessionManager:
         requested_id = (session_id or "").strip()
         if requested_id and requested_id in sessions:
             self._active[user_id] = requested_id
+            self._save()
             return sessions[requested_id], False
         return self.create(user_id, requested_id), True
 
@@ -149,7 +223,20 @@ class SessionManager:
         del sessions[session_id]
         if self._active.get(user_id) == session_id:
             self._active.pop(user_id, None)
+        self._save()
         return True
+
+    def set_thread_id(self, user_id: str, thread_id: str) -> None:
+        session = self.current(user_id)
+        session.thread_id = thread_id
+        session.updated_at = self._now()
+        self._save()
+
+    def thread_id(self, user_id: str) -> Optional[str]:
+        return self.current(user_id).thread_id
+
+    def find_by_id(self, user_id: str, session_id: str) -> Optional[Session]:
+        return self._user_sessions(user_id).get(session_id)
 
     def conversation_id(self, user_id: str) -> str:
         return f"{user_id}:session:{self.current(user_id).session_id}"
@@ -160,6 +247,8 @@ class SessionManager:
             return
         summary = " ".join(message.split())
         session.summary = summary[:80] + ("..." if len(summary) > 80 else "")
+        session.updated_at = self._now()
+        self._save()
 
 
 def _render_qrcode(login_url: str) -> None:
@@ -246,6 +335,32 @@ def main() -> None:
     logger.info("codex agent ready: %s", agent.info())
     sessions = SessionManager()
 
+    def conversation_id(user_id: str) -> str:
+        return sessions.conversation_id(user_id)
+
+    def ensure_thread(user_id: str) -> str:
+        """Resume the persisted Codex thread for the active bot session."""
+        current_conversation = conversation_id(user_id)
+        saved_thread_id = sessions.thread_id(user_id)
+        if (
+            saved_thread_id
+            and agent.get_thread_id(current_conversation) != saved_thread_id
+        ):
+            try:
+                agent_loop.run_coro(
+                    agent.resume_thread(current_conversation, saved_thread_id),
+                    timeout=30,
+                )
+            except Exception:
+                logger.warning("stale Codex thread mapping: %s", saved_thread_id)
+                sessions.set_thread_id(user_id, "")
+        return current_conversation
+
+    def save_current_thread(user_id: str, current_conversation: str) -> None:
+        thread_id = agent.get_thread_id(current_conversation)
+        if thread_id:
+            sessions.set_thread_id(user_id, thread_id)
+
     def handle_message(client: Client, msg) -> None:
         print(format_message_summary(msg))
         if (
@@ -273,6 +388,23 @@ def main() -> None:
                     session, created = sessions.switch_or_create(
                         msg.from_user_id, requested_id
                     )
+                    if created and requested_id:
+                        sessions.set_thread_id(msg.from_user_id, requested_id)
+                        session = sessions.current(msg.from_user_id)
+                    if session.thread_id:
+                        try:
+                            agent_loop.run_coro(
+                                agent.resume_thread(
+                                    conversation_id(msg.from_user_id), session.thread_id
+                                ),
+                                timeout=30,
+                            )
+                        except Exception as exc:
+                            reply = f"cannot resume session {session.session_id}: {exc}"
+                            send_text_reply(
+                                client, msg.from_user_id, reply, msg.context_token
+                            )
+                            continue
                     action = "created and switched to" if created else "switched to"
                     reply = f"{action} session: {session.session_id}\nsummary: {session.summary}"
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
@@ -285,42 +417,63 @@ def main() -> None:
                     continue
 
                 if lower == "/sessions":
-                    session_list = sessions.list(msg.from_user_id)
-                    active = sessions.current(msg.from_user_id).session_id
-                    lines = ["sessions:"]
-                    for session in session_list:
-                        marker = " (current)" if session.session_id == active else ""
-                        lines.append(
-                            f"- {session.session_id}{marker}: {session.summary}"
+                    try:
+                        threads = agent_loop.run_coro(agent.list_threads(), timeout=30)
+                        active = sessions.thread_id(msg.from_user_id)
+                        lines = ["Codex sessions:"]
+                        for thread in threads:
+                            thread_id = thread.get("id", "")
+                            marker = " (current)" if thread_id == active else ""
+                            title = thread.get("title") or "(untitled)"
+                            updated = thread.get("updatedAt") or thread.get(
+                                "updated_at", ""
+                            )
+                            suffix = f" | {updated}" if updated else ""
+                            lines.append(f"- {thread_id}{marker}: {title}{suffix}")
+                        reply = (
+                            "\n".join(lines)
+                            if len(lines) > 1
+                            else "Codex sessions: (none)"
                         )
-                    send_text_reply(
-                        client, msg.from_user_id, "\n".join(lines), msg.context_token
-                    )
+                    except Exception as exc:
+                        reply = f"(codex error: {exc})"
+                    send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     continue
 
                 if lower.startswith("/delsession"):
                     session_id = stripped[len("/delsession") :].strip()
                     if not session_id:
                         reply = "usage: /delsession <session-id>"
-                    elif sessions.delete(msg.from_user_id, session_id):
-                        active = sessions.current(msg.from_user_id)
-                        reply = (
-                            f"deleted session: {session_id}\n"
-                            f"current session: {active.session_id}"
-                        )
                     else:
-                        reply = f"session not found: {session_id}"
+                        local_session = sessions.find_by_id(
+                            msg.from_user_id, session_id
+                        )
+                        thread_id = (
+                            local_session.thread_id if local_session else session_id
+                        )
+                        try:
+                            agent_loop.run_coro(
+                                agent.delete_thread(thread_id), timeout=30
+                            )
+                            sessions.delete(msg.from_user_id, session_id)
+                            active = sessions.current(msg.from_user_id)
+                            reply = (
+                                f"deleted Codex session: {thread_id}\n"
+                                f"current session: {active.session_id}"
+                            )
+                        except Exception as exc:
+                            reply = f"(codex error: {exc})"
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     continue
 
                 if lower in ("/clear", "/reset"):
                     try:
-                        agent_loop.run_coro(
-                            agent.reset_session(
-                                sessions.conversation_id(msg.from_user_id)
-                            ),
+                        current_conversation = ensure_thread(msg.from_user_id)
+                        new_thread_id = agent_loop.run_coro(
+                            agent.reset_session(current_conversation),
                             timeout=30,
                         )
+                        sessions.set_thread_id(msg.from_user_id, new_thread_id)
                         reply = "context cleared, starting a new conversation"
                     except Exception as exc:
                         reply = f"(codex error: {exc})"
@@ -332,14 +485,14 @@ def main() -> None:
                     arg = text.strip()[len("/model") :].strip()
                     if not arg:
                         current = (
-                            agent.get_model(sessions.conversation_id(msg.from_user_id))
+                            agent.get_model(conversation_id(msg.from_user_id))
                             or "(default)"
                         )
                         reply = (
                             f"current model: {current}\nusage: /model <name> to switch"
                         )
                     else:
-                        agent.set_model(sessions.conversation_id(msg.from_user_id), arg)
+                        agent.set_model(conversation_id(msg.from_user_id), arg)
                         reply = (
                             f"model set to: {arg} (takes effect on your next message)"
                         )
@@ -352,9 +505,7 @@ def main() -> None:
                 if lower in ("/models", "/listmodel", "/listmodels"):
                     try:
                         models = agent_loop.run_coro(agent.list_models(), timeout=30)
-                        current = agent.get_model(
-                            sessions.conversation_id(msg.from_user_id)
-                        )
+                        current = agent.get_model(conversation_id(msg.from_user_id))
                         lines = ["available models:"]
                         for m in models:
                             marker = " (current)" if m["id"] == current else ""
@@ -440,11 +591,13 @@ def main() -> None:
                             continue
 
                 try:
+                    current_conversation = ensure_thread(msg.from_user_id)
                     sessions.update_summary(msg.from_user_id, text)
                     reply = agent_loop.run_coro(
-                        agent.chat(sessions.conversation_id(msg.from_user_id), text),
+                        agent.chat(current_conversation, text),
                         timeout=120,
                     )
+                    save_current_thread(msg.from_user_id, current_conversation)
                 except Exception as exc:
                     reply = f"(codex error: {exc})"
                 send_text_reply(client, msg.from_user_id, reply, msg.context_token)

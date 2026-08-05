@@ -128,6 +128,74 @@ class CodexAppServerAgent:
         """Return the effective model for `conversation_id` (override or default)."""
         return self._conversation_models.get(conversation_id, self.model)
 
+    def get_thread_id(self, conversation_id: str) -> Optional[str]:
+        """Return the Codex thread currently bound to a conversation."""
+        return self._threads.get(conversation_id)
+
+    async def list_threads(
+        self,
+        *,
+        search_term: Optional[str] = None,
+        archived: Optional[bool] = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List persisted Codex threads through the native app-server API."""
+        if not self._started:
+            await self.start()
+
+        threads: list[dict[str, Any]] = []
+        cursor: Optional[str] = None
+        while True:
+            params: dict[str, Any] = {
+                "limit": limit,
+                "archived": archived,
+                "sortKey": "created_at",
+                "sortDirection": "desc",
+            }
+            if search_term:
+                params["searchTerm"] = search_term
+            if cursor:
+                params["cursor"] = cursor
+            result = await self._conn.request("thread/list", params)
+            threads.extend((result or {}).get("data", []))
+            cursor = (result or {}).get("nextCursor")
+            if not cursor:
+                return threads
+
+    async def resume_thread(
+        self,
+        conversation_id: str,
+        thread_id: str,
+        *,
+        include_turns: bool = False,
+    ) -> dict[str, Any]:
+        """Resume a persisted Codex thread and bind it to a conversation."""
+        if not self._started:
+            await self.start()
+
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "cwd": self.cwd,
+            "approvalPolicy": "never",
+            "sandbox": {"type": "danger-full-access"},
+        }
+        if not include_turns:
+            params["excludeTurns"] = True
+        result = await self._conn.request("thread/resume", params)
+        resumed = (result or {}).get("thread", {})
+        resumed_id = resumed.get("id") or thread_id
+        self._threads[conversation_id] = resumed_id
+        return resumed
+
+    async def delete_thread(self, thread_id: str) -> None:
+        """Delete a persisted Codex thread and clear local bindings."""
+        if not self._started:
+            await self.start()
+        await self._conn.request("thread/delete", {"threadId": thread_id})
+        for conversation_id, bound_id in list(self._threads.items()):
+            if bound_id == thread_id:
+                self._threads.pop(conversation_id, None)
+
     async def list_models(
         self, *, include_hidden: bool = False
     ) -> list[dict[str, Any]]:
