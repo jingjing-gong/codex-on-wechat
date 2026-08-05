@@ -97,6 +97,15 @@ HELP_TEXT = (
 _SKILL_NAME_RE = re.compile(r"^\$([\w:-]+)")
 
 
+def _is_codex_thread_id(value: str) -> bool:
+    """Return whether a value is a UUID accepted by Codex thread/resume."""
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return False
+    return True
+
+
 @dataclass
 class Session:
     session_id: str
@@ -388,8 +397,13 @@ def main() -> None:
                     session, created = sessions.switch_or_create(
                         msg.from_user_id, requested_id
                     )
-                    if created and requested_id:
+                    if created and requested_id and _is_codex_thread_id(requested_id):
                         sessions.set_thread_id(msg.from_user_id, requested_id)
+                        session = sessions.current(msg.from_user_id)
+                    elif session.thread_id and not _is_codex_thread_id(
+                        session.thread_id
+                    ):
+                        sessions.set_thread_id(msg.from_user_id, "")
                         session = sessions.current(msg.from_user_id)
                     if session.thread_id:
                         try:
@@ -451,18 +465,28 @@ def main() -> None:
                         thread_id = (
                             local_session.thread_id if local_session else session_id
                         )
-                        try:
-                            agent_loop.run_coro(
-                                agent.delete_thread(thread_id), timeout=30
-                            )
+                        if local_session and not thread_id:
                             sessions.delete(msg.from_user_id, session_id)
                             active = sessions.current(msg.from_user_id)
                             reply = (
-                                f"deleted Codex session: {thread_id}\n"
+                                f"deleted local session: {session_id}\n"
                                 f"current session: {active.session_id}"
                             )
-                        except Exception as exc:
-                            reply = f"(codex error: {exc})"
+                        elif not _is_codex_thread_id(thread_id):
+                            reply = f"invalid Codex session id: {thread_id}"
+                        else:
+                            try:
+                                agent_loop.run_coro(
+                                    agent.delete_thread(thread_id), timeout=30
+                                )
+                                sessions.delete(msg.from_user_id, session_id)
+                                active = sessions.current(msg.from_user_id)
+                                reply = (
+                                    f"deleted Codex session: {thread_id}\n"
+                                    f"current session: {active.session_id}"
+                                )
+                            except Exception as exc:
+                                reply = f"(codex error: {exc})"
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     continue
 
