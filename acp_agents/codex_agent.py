@@ -166,8 +166,6 @@ class CodexAppServerAgent:
         self,
         conversation_id: str,
         thread_id: str,
-        *,
-        include_turns: bool = False,
     ) -> dict[str, Any]:
         """Resume a persisted Codex thread and bind it to a conversation."""
         if not self._started:
@@ -179,8 +177,6 @@ class CodexAppServerAgent:
             "approvalPolicy": "never",
             "sandbox": "danger-full-access",
         }
-        if not include_turns:
-            params["excludeTurns"] = True
         result = await self._conn.request("thread/resume", params)
         resumed = (result or {}).get("thread", {})
         resumed_id = resumed.get("id") or thread_id
