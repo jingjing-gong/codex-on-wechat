@@ -24,6 +24,15 @@ Each WeChat contact gets their own Codex conversation. Send `/help` in a chat
 to see available commands (`/clear`, `/model`, `/models`, `/skills`), or
 `$skill-name <prompt>` to invoke a specific skill.
 
+Session commands are available per WeChat user:
+
+```text
+/session <session-id>       switch to an existing session or create it
+/session                     create and switch to a random session
+/sessions                    list sessions and their first-message summaries
+/delsession <session-id>     delete a session
+```
+
 ## Requirements
 
 - Python >= 3.9

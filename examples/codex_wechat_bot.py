@@ -26,6 +26,8 @@ import logging
 import re
 import sys
 import threading
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -67,6 +69,9 @@ KNOWN_COMMANDS = [
     "/skills",
     "/listskill",
     "/listskills",
+    "/session",
+    "/sessions",
+    "/delsession",
 ]
 
 HELP_TEXT = (
@@ -78,11 +83,83 @@ HELP_TEXT = (
     "\n/model <name> - switch model\n"
     "\n/models - list available models\n"
     "\n/skills - list available skills\n"
+    "\n/session [id] - switch to or create a session\n"
+    "\n/sessions - list your sessions\n"
+    "\n/delsession <id> - delete a session\n"
     "\n"
     "skills:\n\n send $skill-name <prompt> to invoke a skill"
 )
 
 _SKILL_NAME_RE = re.compile(r"^\$([\w:-]+)")
+
+
+@dataclass
+class Session:
+    session_id: str
+    summary: str = "未开始对话"
+
+
+class SessionManager:
+    """Track named sessions and their Codex conversation keys per user."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, dict[str, Session]] = {}
+        self._active: dict[str, str] = {}
+
+    def _user_sessions(self, user_id: str) -> dict[str, Session]:
+        return self._sessions.setdefault(user_id, {})
+
+    def current(self, user_id: str) -> Session:
+        sessions = self._user_sessions(user_id)
+        session_id = self._active.get(user_id)
+        if session_id and session_id in sessions:
+            return sessions[session_id]
+        session = self.create(user_id)
+        self._active[user_id] = session.session_id
+        return session
+
+    def create(self, user_id: str, session_id: Optional[str] = None) -> Session:
+        sessions = self._user_sessions(user_id)
+        requested_id = (session_id or "").strip()
+        session_id = requested_id or f"session-{uuid.uuid4().hex[:8]}"
+        if session_id in sessions:
+            return sessions[session_id]
+        session = Session(session_id=session_id)
+        sessions[session_id] = session
+        self._active[user_id] = session_id
+        return session
+
+    def switch_or_create(
+        self, user_id: str, session_id: Optional[str]
+    ) -> tuple[Session, bool]:
+        sessions = self._user_sessions(user_id)
+        requested_id = (session_id or "").strip()
+        if requested_id and requested_id in sessions:
+            self._active[user_id] = requested_id
+            return sessions[requested_id], False
+        return self.create(user_id, requested_id), True
+
+    def list(self, user_id: str) -> list[Session]:
+        return list(self._user_sessions(user_id).values())
+
+    def delete(self, user_id: str, session_id: str) -> bool:
+        sessions = self._user_sessions(user_id)
+        if session_id not in sessions:
+            return False
+        del sessions[session_id]
+        if self._active.get(user_id) == session_id:
+            self._active.pop(user_id, None)
+        return True
+
+    def conversation_id(self, user_id: str) -> str:
+        return f"{user_id}:session:{self.current(user_id).session_id}"
+
+    def update_summary(self, user_id: str, message: str) -> None:
+        session = self.current(user_id)
+        if session.summary != "未开始对话":
+            return
+        summary = " ".join(message.split())
+        session.summary = summary[:80] + ("..." if len(summary) > 80 else "")
 
 
 def _render_qrcode(login_url: str) -> None:
@@ -167,6 +244,7 @@ def main() -> None:
     agent = create_agent("codex")
     agent_loop.run_coro(agent.start(), timeout=30)
     logger.info("codex agent ready: %s", agent.info())
+    sessions = SessionManager()
 
     def handle_message(client: Client, msg) -> None:
         print(format_message_summary(msg))
@@ -187,10 +265,61 @@ def main() -> None:
                     logger.info("sent help to %s", msg.from_user_id)
                     continue
 
-                if text.strip().lower() in ("/clear", "/reset"):
+                stripped = text.strip()
+                lower = stripped.lower()
+
+                if lower == "/session" or lower.startswith("/session "):
+                    requested_id = stripped[len("/session") :].strip() or None
+                    session, created = sessions.switch_or_create(
+                        msg.from_user_id, requested_id
+                    )
+                    action = "created and switched to" if created else "switched to"
+                    reply = f"{action} session: {session.session_id}\nsummary: {session.summary}"
+                    send_text_reply(client, msg.from_user_id, reply, msg.context_token)
+                    logger.info(
+                        "session selected for %s: %s (created=%s)",
+                        msg.from_user_id,
+                        session.session_id,
+                        created,
+                    )
+                    continue
+
+                if lower == "/sessions":
+                    session_list = sessions.list(msg.from_user_id)
+                    active = sessions.current(msg.from_user_id).session_id
+                    lines = ["sessions:"]
+                    for session in session_list:
+                        marker = " (current)" if session.session_id == active else ""
+                        lines.append(
+                            f"- {session.session_id}{marker}: {session.summary}"
+                        )
+                    send_text_reply(
+                        client, msg.from_user_id, "\n".join(lines), msg.context_token
+                    )
+                    continue
+
+                if lower.startswith("/delsession"):
+                    session_id = stripped[len("/delsession") :].strip()
+                    if not session_id:
+                        reply = "usage: /delsession <session-id>"
+                    elif sessions.delete(msg.from_user_id, session_id):
+                        active = sessions.current(msg.from_user_id)
+                        reply = (
+                            f"deleted session: {session_id}\n"
+                            f"current session: {active.session_id}"
+                        )
+                    else:
+                        reply = f"session not found: {session_id}"
+                    send_text_reply(client, msg.from_user_id, reply, msg.context_token)
+                    continue
+
+                if lower in ("/clear", "/reset"):
                     try:
                         agent_loop.run_coro(
-                            agent.reset_session(msg.from_user_id), timeout=30
+                            agent.reset_session(
+                                sessions.conversation_id(msg.from_user_id)
+                            ),
+                            timeout=30,
                         )
                         reply = "context cleared, starting a new conversation"
                     except Exception as exc:
@@ -199,17 +328,18 @@ def main() -> None:
                     logger.info("cleared session for %s", msg.from_user_id)
                     continue
 
-                if text.strip().lower() == "/model" or text.strip().lower().startswith(
-                    "/model "
-                ):
+                if lower == "/model" or lower.startswith("/model "):
                     arg = text.strip()[len("/model") :].strip()
                     if not arg:
-                        current = agent.get_model(msg.from_user_id) or "(default)"
+                        current = (
+                            agent.get_model(sessions.conversation_id(msg.from_user_id))
+                            or "(default)"
+                        )
                         reply = (
                             f"current model: {current}\nusage: /model <name> to switch"
                         )
                     else:
-                        agent.set_model(msg.from_user_id, arg)
+                        agent.set_model(sessions.conversation_id(msg.from_user_id), arg)
                         reply = (
                             f"model set to: {arg} (takes effect on your next message)"
                         )
@@ -219,10 +349,12 @@ def main() -> None:
                     )
                     continue
 
-                if text.strip().lower() in ("/models", "/listmodel", "/listmodels"):
+                if lower in ("/models", "/listmodel", "/listmodels"):
                     try:
                         models = agent_loop.run_coro(agent.list_models(), timeout=30)
-                        current = agent.get_model(msg.from_user_id)
+                        current = agent.get_model(
+                            sessions.conversation_id(msg.from_user_id)
+                        )
                         lines = ["available models:"]
                         for m in models:
                             marker = " (current)" if m["id"] == current else ""
@@ -238,7 +370,7 @@ def main() -> None:
                     logger.info("listed models for %s", msg.from_user_id)
                     continue
 
-                if text.strip().lower() in ("/skills", "/listskill", "/listskills"):
+                if lower in ("/skills", "/listskill", "/listskills"):
                     try:
                         skills = agent_loop.run_coro(agent.list_skills(), timeout=30)
                         lines = ["available skills (use $skill-name <prompt>):"]
@@ -253,9 +385,6 @@ def main() -> None:
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     logger.info("listed skills for %s", msg.from_user_id)
                     continue
-
-                stripped = text.strip()
-                lower = stripped.lower()
 
                 if lower.startswith("/"):
                     first_token = lower.split()[0] if lower.split() else lower
@@ -311,8 +440,10 @@ def main() -> None:
                             continue
 
                 try:
+                    sessions.update_summary(msg.from_user_id, text)
                     reply = agent_loop.run_coro(
-                        agent.chat(msg.from_user_id, text), timeout=120
+                        agent.chat(sessions.conversation_id(msg.from_user_id), text),
+                        timeout=120,
                     )
                 except Exception as exc:
                     reply = f"(codex error: {exc})"
