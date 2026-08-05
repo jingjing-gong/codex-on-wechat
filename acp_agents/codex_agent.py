@@ -177,7 +177,7 @@ class CodexAppServerAgent:
             "threadId": thread_id,
             "cwd": self.cwd,
             "approvalPolicy": "never",
-            "sandbox": {"type": "danger-full-access"},
+            "sandbox": "danger-full-access",
         }
         if not include_turns:
             params["excludeTurns"] = True
