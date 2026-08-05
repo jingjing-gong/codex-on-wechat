@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+#
+# codex-on-wechat launcher.
+#
+# Usage:
+#   ./cow          # run the bot
+#   ./cow run      # run the bot
+#   ./cow login    # log in to WeChat and save credentials
+#   ./cow logout   # delete saved WeChat credentials
+#
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+if ! command -v uv >/dev/null 2>&1; then
+    echo "==> 'uv' not found, installing it (https://docs.astral.sh/uv/)"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+    if ! command -v uv >/dev/null 2>&1; then
+        echo "error: uv installation failed or is not on PATH. Install it manually from https://docs.astral.sh/uv/ and re-run this script." >&2
+        exit 1
+    fi
+fi
+
+command="${1:-run}"
+shift || true
+
+case "$command" in
+    run)
+        uv sync --extra test
+        exec uv run examples/codex_wechat_bot.py "$@"
+        ;;
+    login)
+        uv sync --extra test
+        exec uv run examples/codex_wechat_bot.py --login "$@"
+        ;;
+    logout)
+        uv sync --extra test
+        exec uv run examples/codex_wechat_bot.py --logout "$@"
+        ;;
+    -h|--help|help)
+        sed -n '3,10p' "$0"
+        ;;
+    *)
+        echo "unknown command: $command" >&2
+        echo "usage: ./cow [run|login|logout]" >&2
+        exit 2
+        ;;
+esac

@@ -14,6 +14,7 @@ codex agent; message handlers submit coroutines to it via
 
 Usage:
     python examples/codex_wechat_bot.py
+    python examples/codex_wechat_bot.py --login   # log in and save credentials
     python examples/codex_wechat_bot.py --logout  # forget saved WeChat login
 """
 
@@ -111,6 +112,13 @@ def login() -> Client:
     return Client(creds)
 
 
+def logout() -> None:
+    count = delete_all_credentials()
+    print(
+        f"deleted {count} saved credential file(s); next run will require a fresh QR-code login"
+    )
+
+
 class AsyncLoopThread:
     """Runs a persistent asyncio event loop on a background thread.
 
@@ -140,11 +148,15 @@ class AsyncLoopThread:
 
 
 def main() -> None:
-    if "--logout" in sys.argv[1:]:
-        count = delete_all_credentials()
-        print(
-            f"deleted {count} saved credential file(s); next run will require a fresh QR-code login"
-        )
+    args = set(sys.argv[1:])
+
+    if "--logout" in args:
+        logout()
+        return
+
+    if "--login" in args:
+        login()
+        print("login complete")
         return
 
     wechat_client = login()
