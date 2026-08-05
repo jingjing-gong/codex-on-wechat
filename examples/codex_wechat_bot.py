@@ -225,6 +225,19 @@ class SessionManager:
     def list(self, user_id: str) -> list[Session]:
         return list(self._user_sessions(user_id).values())
 
+    def format_list(self, user_id: str) -> str:
+        """Format user-facing session aliases without exposing thread UUIDs."""
+        session_list = self.list(user_id)
+        if not session_list:
+            return "sessions: (none)"
+
+        active = self._active.get(user_id)
+        lines = ["sessions:"]
+        for session in session_list:
+            marker = " (current)" if session.session_id == active else ""
+            lines.append(f"- {session.session_id}{marker}: {session.summary}")
+        return "\n".join(lines)
+
     def delete(self, user_id: str, session_id: str) -> bool:
         sessions = self._user_sessions(user_id)
         if session_id not in sessions:
@@ -431,26 +444,7 @@ def main() -> None:
                     continue
 
                 if lower == "/sessions":
-                    try:
-                        threads = agent_loop.run_coro(agent.list_threads(), timeout=30)
-                        active = sessions.thread_id(msg.from_user_id)
-                        lines = ["Codex sessions:"]
-                        for thread in threads:
-                            thread_id = thread.get("id", "")
-                            marker = " (current)" if thread_id == active else ""
-                            title = thread.get("title") or "(untitled)"
-                            updated = thread.get("updatedAt") or thread.get(
-                                "updated_at", ""
-                            )
-                            suffix = f" | {updated}" if updated else ""
-                            lines.append(f"- {thread_id}{marker}: {title}{suffix}")
-                        reply = (
-                            "\n".join(lines)
-                            if len(lines) > 1
-                            else "Codex sessions: (none)"
-                        )
-                    except Exception as exc:
-                        reply = f"(codex error: {exc})"
+                    reply = sessions.format_list(msg.from_user_id)
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     continue
 

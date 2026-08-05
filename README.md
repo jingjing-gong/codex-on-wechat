@@ -27,10 +27,10 @@ to see available commands (`/clear`, `/model`, `/models`, `/skills`), or
 Session commands are available per WeChat user:
 
 ```text
-/session <thread-id>        resume a Codex session or create a mapping
-/session                     create and switch to a new local session
-/sessions                    list Codex sessions from thread/list
-/delsession <thread-id>     delete the Codex session
+/session <session-id>       switch to or create a short session alias
+/session                    create and switch to a new local session
+/sessions                   list short session IDs and summaries
+/delsession <session-id>    delete the mapped Codex session
 ```
 
 ## Requirements
