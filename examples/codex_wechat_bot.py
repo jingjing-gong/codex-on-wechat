@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -76,6 +77,7 @@ KNOWN_COMMANDS = [
     "/session",
     "/sessions",
     "/delsession",
+    "/sh",
 ]
 
 HELP_TEXT = (
@@ -90,11 +92,41 @@ HELP_TEXT = (
     "\n/session [id] - switch to or create a session\n"
     "\n/sessions - list your sessions\n"
     "\n/delsession <id> - delete a session\n"
+    "\n/sh <command> - execute a shell command on the bot host\n"
     "\n"
     "skills:\n\n send $skill-name <prompt> to invoke a skill"
 )
 
 _SKILL_NAME_RE = re.compile(r"^\$([\w:-]+)")
+_MAX_SHELL_OUTPUT = 6000
+_SHELL_TIMEOUT = 30
+
+
+def run_shell_command(
+    command: str,
+    *,
+    cwd: Optional[Path] = None,
+    timeout: int = _SHELL_TIMEOUT,
+    max_output: int = _MAX_SHELL_OUTPUT,
+) -> str:
+    """Execute a shell command and format a bounded result for WeChat."""
+    completed = subprocess.run(
+        command,
+        shell=True,
+        executable="/bin/sh",
+        cwd=str(cwd or Path(__file__).resolve().parent.parent),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    output = completed.stdout
+    if completed.stderr:
+        output += f"\nstderr:\n{completed.stderr}"
+    output = output.rstrip() or "(no output)"
+    if len(output) > max_output:
+        output = output[:max_output] + "\n... (output truncated)"
+    return f"exit code: {completed.returncode}\n{output}"
 
 
 def _is_codex_thread_id(value: str) -> bool:
@@ -446,6 +478,23 @@ def main() -> None:
                 if lower == "/sessions":
                     reply = sessions.format_list(msg.from_user_id)
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
+                    continue
+
+                if lower == "/sh" or lower.startswith("/sh "):
+                    command = stripped[len("/sh") :].strip()
+                    if not command:
+                        reply = "usage: /sh <command>"
+                    else:
+                        try:
+                            reply = run_shell_command(command)
+                        except subprocess.TimeoutExpired:
+                            reply = f"shell command timed out after {_SHELL_TIMEOUT} seconds"
+                        except OSError as exc:
+                            reply = f"shell command failed to start: {exc}"
+                    send_text_reply(client, msg.from_user_id, reply, msg.context_token)
+                    logger.info(
+                        "executed shell command for %s: %r", msg.from_user_id, command
+                    )
                     continue
 
                 if lower.startswith("/delsession"):

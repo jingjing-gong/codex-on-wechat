@@ -33,6 +33,10 @@ Session commands are available per WeChat user:
 /delsession <session-id>    delete the mapped Codex session
 ```
 
+The `/sh <command>` command executes a shell command in the bot project's root
+directory and returns its output. It has a 30-second timeout and can execute
+arbitrary commands on the host, so use it only with trusted WeChat users.
+
 ## Requirements
 
 - Python >= 3.9
