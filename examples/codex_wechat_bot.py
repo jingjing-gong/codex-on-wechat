@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import uuid
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -100,6 +101,7 @@ HELP_TEXT = (
 _SKILL_NAME_RE = re.compile(r"^\$([\w:-]+)")
 _MAX_SHELL_OUTPUT = 6000
 _SHELL_TIMEOUT = 30
+_CODEX_TASK_TIMEOUT = 15 * 60
 
 
 def run_shell_command(
@@ -662,9 +664,14 @@ def main() -> None:
                     sessions.update_summary(msg.from_user_id, text)
                     reply = agent_loop.run_coro(
                         agent.chat(current_conversation, text),
-                        timeout=120,
+                        timeout=_CODEX_TASK_TIMEOUT,
                     )
                     save_current_thread(msg.from_user_id, current_conversation)
+                except FutureTimeoutError:
+                    reply = (
+                        "Codex is still working after 15 minutes. "
+                        "Please wait, then send a follow-up message in this session."
+                    )
                 except Exception as exc:
                     reply = f"(codex error: {exc})"
                 send_text_reply(client, msg.from_user_id, reply, msg.context_token)
