@@ -52,6 +52,7 @@ from wechat_ilink import (  # noqa: E402
     poll_qr_status,
     save_credentials,
     send_text_reply,
+    send_typing_state,
 )
 from wechat_ilink.types import (  # noqa: E402
     ITEM_TYPE_TEXT,
@@ -394,6 +395,36 @@ def main() -> None:
     def conversation_id(user_id: str) -> str:
         return sessions.conversation_id(user_id)
 
+    def resume_saved_thread(
+        user_id: str, current_conversation: str, saved_thread_id: str
+    ) -> None:
+        """Resume only histories that are safe for this bridge.
+
+        Codex Desktop and the bot share Codex's global session store.  An
+        existing thread can therefore contain client-side custom tool calls
+        whose outputs were never recorded.  Starting a marked replacement
+        prevents an incomplete history from poisoning future turns.
+        """
+        resumed = agent_loop.run_coro(
+            agent.resume_thread(current_conversation, saved_thread_id),
+            timeout=30,
+        )
+        can_safely_resume = getattr(agent, "can_safely_resume", lambda _: True)
+        if not can_safely_resume(resumed):
+            missing_outputs = getattr(
+                agent, "missing_custom_tool_outputs", lambda _: set()
+            )(resumed)
+            logger.warning(
+                "replacing unsafe Codex thread (thread=%s, source=%s, missing_outputs=%s)",
+                saved_thread_id,
+                resumed.get("threadSource") or "<unmarked>",
+                ",".join(sorted(missing_outputs)) or "<none>",
+            )
+            replacement_id = agent_loop.run_coro(
+                agent.reset_session(current_conversation), timeout=30
+            )
+            sessions.set_thread_id(user_id, replacement_id)
+
     def ensure_thread(user_id: str) -> str:
         """Resume the persisted Codex thread for the active bot session."""
         current_conversation = conversation_id(user_id)
@@ -403,9 +434,8 @@ def main() -> None:
             and agent.get_thread_id(current_conversation) != saved_thread_id
         ):
             try:
-                agent_loop.run_coro(
-                    agent.resume_thread(current_conversation, saved_thread_id),
-                    timeout=30,
+                resume_saved_thread(
+                    user_id, current_conversation, saved_thread_id
                 )
             except Exception:
                 logger.warning("stale Codex thread mapping: %s", saved_thread_id)
@@ -454,12 +484,12 @@ def main() -> None:
                         session = sessions.current(msg.from_user_id)
                     if session.thread_id:
                         try:
-                            agent_loop.run_coro(
-                                agent.resume_thread(
-                                    conversation_id(msg.from_user_id), session.thread_id
-                                ),
-                                timeout=30,
+                            resume_saved_thread(
+                                msg.from_user_id,
+                                conversation_id(msg.from_user_id),
+                                session.thread_id,
                             )
+                            session = sessions.current(msg.from_user_id)
                         except Exception as exc:
                             reply = f"cannot resume session {session.session_id}: {exc}"
                             send_text_reply(
@@ -658,6 +688,20 @@ def main() -> None:
                                 skill_name,
                             )
                             continue
+
+                # The Codex turn can take a while to complete.  Notify the
+                # user before starting it, but keep this best-effort so a
+                # typing API failure never prevents the actual response.
+                try:
+                    send_typing_state(
+                        client, msg.from_user_id, msg.context_token
+                    )
+                except Exception:
+                    logger.warning(
+                        "could not send typing indicator to %s",
+                        msg.from_user_id,
+                        exc_info=True,
+                    )
 
                 try:
                     current_conversation = ensure_thread(msg.from_user_id)

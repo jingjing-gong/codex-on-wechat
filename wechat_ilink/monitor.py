@@ -35,6 +35,8 @@ class Monitor:
         )
         self._get_updates_buf = ""
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._handler_locks: dict[str, threading.Lock] = {}
+        self._handler_locks_guard = threading.Lock()
         self._load_buf()
 
     def _load_buf(self) -> None:
@@ -126,10 +128,17 @@ class Monitor:
         logger.info("shutting down")
 
     def _safe_handle(self, msg: WeixinMessage) -> None:
-        try:
-            self.handler(self.client, msg)
-        except Exception:
-            logger.exception("message handler raised an exception")
+        # Keep messages from one contact ordered while retaining concurrency
+        # across contacts. Handlers often mutate per-contact session state.
+        with self._handler_locks_guard:
+            lock = self._handler_locks.setdefault(
+                msg.from_user_id, threading.Lock()
+            )
+        with lock:
+            try:
+                self.handler(self.client, msg)
+            except Exception:
+                logger.exception("message handler raised an exception")
 
 
 def format_message_summary(msg: WeixinMessage) -> str:

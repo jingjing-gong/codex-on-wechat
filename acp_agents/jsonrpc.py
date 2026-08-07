@@ -98,10 +98,6 @@ class StdioJsonRpcConnection:
             return
         self._started = False
 
-        for task in (self._read_task, self._stderr_task):
-            if task:
-                task.cancel()
-
         if self._process:
             try:
                 if self._process.stdin:
@@ -111,6 +107,17 @@ class StdioJsonRpcConnection:
                 await self._process.wait()
             except ProcessLookupError:
                 pass
+
+        # Let the readers consume EOF after the subprocess exits, then await
+        # them before the owning event loop is closed.  Cancelling the readers
+        # first leaves their pipe transports open and produces noisy
+        # ``Event loop is closed`` warnings during garbage collection.
+        tasks = [task for task in (self._read_task, self._stderr_task) if task]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._read_task = None
+        self._stderr_task = None
+        self._process = None
 
     async def request(
         self, method: str, params: Any = None, *, timeout: Optional[float] = 30.0
@@ -184,6 +191,14 @@ class StdioJsonRpcConnection:
                 await self._dispatch(msg)
         except asyncio.CancelledError:
             pass
+        finally:
+            # A subprocess can exit without sending JSON-RPC error responses
+            # for requests that are still in flight. Wake those callers
+            # immediately instead of leaving them blocked forever.
+            error = RuntimeError(f"agent connection closed: {self.command}")
+            for fut in list(self._pending.values()):
+                if not fut.done():
+                    fut.set_exception(error)
         logger.info("read loop ended (command=%s)", self.command)
 
     async def _dispatch(self, msg: dict[str, Any]) -> None:

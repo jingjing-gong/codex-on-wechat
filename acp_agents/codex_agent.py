@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 from typing import Any, Optional
@@ -23,6 +24,12 @@ from .base import AgentInfo, default_workspace
 from .jsonrpc import StdioJsonRpcConnection
 
 logger = logging.getLogger(__name__)
+
+# Keep bot-owned app-server threads distinguishable from threads created by
+# Codex Desktop/CLI.  Sharing the global Codex history directory otherwise
+# allows another client to append custom tool calls that this JSON-RPC client
+# cannot answer when the thread is resumed.
+THREAD_SOURCE = "codex-wechat-bot"
 
 # Matches a leading `$skill-name` mention (Codex's own "$skill-name <prompt>"
 # UI shortcut for attaching a skill to a turn), e.g. "$academic-research-suite
@@ -51,6 +58,11 @@ class CodexAppServerAgent:
         self._conn: Optional[StdioJsonRpcConnection] = None
         self._started = False
         self._threads: dict[str, str] = {}
+        # A Codex thread accepts only one in-flight turn.  The WeChat monitor
+        # dispatches messages from a thread pool, so serialize turns per
+        # conversation to avoid racing thread/start or overwriting the event
+        # queue for an active turn.
+        self._conversation_locks: dict[str, asyncio.Lock] = {}
         self._turn_queues: dict[str, asyncio.Queue] = {}
         self._conversation_models: dict[str, str] = {}
         self._skills_cache: Optional[list[dict[str, Any]]] = None
@@ -131,6 +143,59 @@ class CodexAppServerAgent:
     def get_thread_id(self, conversation_id: str) -> Optional[str]:
         """Return the Codex thread currently bound to a conversation."""
         return self._threads.get(conversation_id)
+
+    @staticmethod
+    def is_bot_thread(thread: dict[str, Any]) -> bool:
+        """Return whether thread metadata identifies a bot-owned thread.
+
+        Threads created before ``threadSource`` was added intentionally return
+        ``False``.  ``can_safely_resume`` separately permits an unmarked
+        history when it is complete, preserving valid legacy sessions.
+        """
+        return thread.get("threadSource") == THREAD_SOURCE
+
+    @staticmethod
+    def missing_custom_tool_outputs(thread: dict[str, Any]) -> set[str]:
+        """Return persisted custom-tool calls that have no matching output.
+
+        App-server exposes the local rollout path in thread metadata, but its
+        structured ``turns`` response omits raw custom-tool items.  Inspecting
+        the JSONL is therefore the only way to reject a broken history before
+        Codex tries to convert it into model input and logs
+        ``Custom tool call output is missing``.
+
+        A missing or unreadable history is not considered corrupt here; the
+        subsequent app-server request remains the authority in that case.
+        """
+        path = thread.get("path")
+        if not path:
+            return set()
+
+        pending: set[str] = set()
+        try:
+            with open(path, encoding="utf-8") as history:
+                for line in history:
+                    try:
+                        payload = json.loads(line).get("payload", {})
+                    except (json.JSONDecodeError, AttributeError):
+                        continue
+                    call_id = payload.get("call_id")
+                    if not call_id:
+                        continue
+                    if payload.get("type") == "custom_tool_call":
+                        pending.add(call_id)
+                    elif payload.get("type") == "custom_tool_call_output":
+                        pending.discard(call_id)
+        except OSError:
+            return set()
+        return pending
+
+    @classmethod
+    def can_safely_resume(cls, thread: dict[str, Any]) -> bool:
+        """Return whether a persisted thread is safe for this client to resume."""
+        source = thread.get("threadSource")
+        source_is_compatible = source is None or source == THREAD_SOURCE
+        return source_is_compatible and not cls.missing_custom_tool_outputs(thread)
 
     async def list_threads(
         self,
@@ -270,6 +335,11 @@ class CodexAppServerAgent:
         return [{"type": "text", "text": message}]
 
     async def chat(self, conversation_id: str, message: str) -> str:
+        lock = self._conversation_locks.setdefault(conversation_id, asyncio.Lock())
+        async with lock:
+            return await self._chat(conversation_id, message)
+
+    async def _chat(self, conversation_id: str, message: str) -> str:
         if not self._started:
             await self.start()
 
@@ -354,6 +424,7 @@ class CodexAppServerAgent:
             "approvalPolicy": "never",
             "cwd": self.cwd,
             "sandbox": "danger-full-access",
+            "threadSource": THREAD_SOURCE,
         }
         if self.model:
             params["model"] = self.model
