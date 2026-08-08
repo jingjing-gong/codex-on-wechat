@@ -48,12 +48,14 @@ class CodexAppServerAgent:
         model: str = "",
         cwd: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
+        turn_timeout: Optional[float] = 5 * 60,
     ):
         self.command = command
         self.args = args or []
         self.model = model
         self.cwd = cwd or default_workspace()
         self.env = env
+        self.turn_timeout = turn_timeout
 
         self._conn: Optional[StdioJsonRpcConnection] = None
         self._started = False
@@ -64,7 +66,9 @@ class CodexAppServerAgent:
         # queue for an active turn.
         self._conversation_locks: dict[str, asyncio.Lock] = {}
         self._turn_queues: dict[str, asyncio.Queue] = {}
+        self._active_turns: dict[str, str] = {}
         self._conversation_models: dict[str, str] = {}
+        self._conversation_reasoning_efforts: dict[str, str] = {}
         self._skills_cache: Optional[list[dict[str, Any]]] = None
 
     async def start(self) -> None:
@@ -76,7 +80,9 @@ class CodexAppServerAgent:
         )
         self._conn.on_notification("item/agentMessage/delta", self._on_item_delta)
         self._conn.on_notification("item/started", self._on_item_started)
+        self._conn.on_notification("item/completed", self._on_item_completed)
         self._conn.on_notification("turn/completed", self._on_turn_completed)
+        self._conn.on_default_notification(self._on_default_notification)
         self._conn.on_request("turn/approval/request", self._on_approval_request)
         await self._conn.start()
 
@@ -139,6 +145,27 @@ class CodexAppServerAgent:
     def get_model(self, conversation_id: str) -> str:
         """Return the effective model for `conversation_id` (override or default)."""
         return self._conversation_models.get(conversation_id, self.model)
+
+    def set_reasoning_effort(self, conversation_id: str, effort: str) -> None:
+        """Override the reasoning effort used for `conversation_id`'s turns.
+
+        Pass an empty string to return to the selected model's default effort.
+        Callers should validate a non-empty value against `model/list` before
+        setting it.
+        """
+        if effort:
+            self._conversation_reasoning_efforts[conversation_id] = effort
+        else:
+            self._conversation_reasoning_efforts.pop(conversation_id, None)
+        logger.info(
+            "reasoning effort set (conversation=%s, effort=%s)",
+            conversation_id,
+            effort or "<model default>",
+        )
+
+    def get_reasoning_effort(self, conversation_id: str) -> str:
+        """Return the configured effort override, or an empty string for default."""
+        return self._conversation_reasoning_efforts.get(conversation_id, "")
 
     def get_thread_id(self, conversation_id: str) -> Optional[str]:
         """Return the Codex thread currently bound to a conversation."""
@@ -335,11 +362,22 @@ class CodexAppServerAgent:
         return [{"type": "text", "text": message}]
 
     async def chat(self, conversation_id: str, message: str) -> str:
+        parts: list[str] = []
+        async for text in self.chat_stream(conversation_id, message):
+            parts.append(text)
+        result = "".join(parts).strip()
+        if not result:
+            raise RuntimeError("agent returned empty response")
+        return result
+
+    async def chat_stream(self, conversation_id: str, message: str):
+        """Yield completed agent-message items as soon as Codex emits them."""
         lock = self._conversation_locks.setdefault(conversation_id, asyncio.Lock())
         async with lock:
-            return await self._chat(conversation_id, message)
+            async for text in self._stream_chat(conversation_id, message):
+                yield text
 
-    async def _chat(self, conversation_id: str, message: str) -> str:
+    async def _stream_chat(self, conversation_id: str, message: str):
         if not self._started:
             await self.start()
 
@@ -362,7 +400,9 @@ class CodexAppServerAgent:
 
         queue: asyncio.Queue = asyncio.Queue()
         self._turn_queues[thread_id] = queue
-        parts: list[str] = []
+        started_text: dict[str, str] = {}
+        delta_parts: dict[str, list[str]] = {}
+        completed_items: set[str] = set()
 
         input_items = await self._build_turn_input(message)
 
@@ -376,6 +416,9 @@ class CodexAppServerAgent:
         model = self.get_model(conversation_id)
         if model:
             turn_params["model"] = model
+        effort = self.get_reasoning_effort(conversation_id)
+        if effort:
+            turn_params["effort"] = effort
 
         # `turn/start`'s own RPC response is just a fast "accepted" ack, not
         # the final answer — the actual content streams in via
@@ -386,34 +429,89 @@ class CodexAppServerAgent:
 
         try:
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(
+                        queue.get(), timeout=self.turn_timeout
+                    )
+                except asyncio.TimeoutError as exc:
+                    logger.error(
+                        "turn timed out waiting for an event (pid=%s, thread=%s, conversation=%s)",
+                        pid,
+                        thread_id,
+                        conversation_id,
+                    )
+                    await self._interrupt_turn(thread_id)
+                    yield "======TURN TIMED OUT======"
+                    break
                 if item.get("kind") == "error":
                     raise RuntimeError(f"turn error: {item.get('text')}")
-                if item.get("delta"):
-                    parts.append(item["delta"])
-                if item.get("text"):
-                    parts.append(item["text"])
-                if item.get("kind") == "completed":
+                item_id = item.get("itemId") or "<default>"
+                if item.get("kind") == "item-completed":
+                    text = item.get("text", "").strip()
+                    if text:
+                        completed_items.add(item_id)
+                        yield text
+                    continue
+                if item.get("kind") == "delta":
+                    delta_parts.setdefault(item_id, []).append(item["delta"])
+                    continue
+                if item.get("kind") == "item-started":
+                    started_text[item_id] = item.get("text", "")
+                    continue
+                if item.get("kind") == "turn-completed":
+                    for current_item_id in delta_parts.keys() | started_text.keys():
+                        if current_item_id in completed_items:
+                            continue
+                        text = "".join(delta_parts.get(current_item_id, [])).strip()
+                        if not text:
+                            text = started_text.get(current_item_id, "").strip()
+                        if text:
+                            yield text
                     break
+        except asyncio.CancelledError:
+            await self._interrupt_turn(thread_id)
+            raise
         finally:
             self._turn_queues.pop(thread_id, None)
+            self._active_turns.pop(thread_id, None)
             if not turn_task.done():
                 turn_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await turn_task
 
-        text = "".join(parts).strip()
-        if not text:
-            raise RuntimeError("agent returned empty response")
-        return text
-
     async def _run_turn_start(
         self, params: dict[str, Any], queue: asyncio.Queue
     ) -> None:
         try:
-            await self._conn.request("turn/start", params, timeout=None)
+            result = await self._conn.request("turn/start", params, timeout=None)
+            turn_id = (result or {}).get("turn", {}).get("id")
+            if turn_id:
+                self._active_turns[params["threadId"]] = turn_id
         except Exception as exc:
             queue.put_nowait({"kind": "error", "text": str(exc)})
+
+    async def _interrupt_turn(self, thread_id: str) -> None:
+        turn_id = self._active_turns.get(thread_id)
+        if not turn_id:
+            return
+        try:
+            await self._conn.request(
+                "turn/interrupt",
+                {"threadId": thread_id, "turnId": turn_id},
+                timeout=10.0,
+            )
+            logger.info(
+                "interrupted timed-out Codex turn (thread=%s, turn=%s)",
+                thread_id,
+                turn_id,
+            )
+        except Exception:
+            logger.warning(
+                "could not interrupt timed-out Codex turn (thread=%s, turn=%s)",
+                thread_id,
+                turn_id,
+                exc_info=True,
+            )
 
     async def _get_or_create_thread(self, conversation_id: str) -> tuple[str, bool]:
         thread_id = self._threads.get(conversation_id)
@@ -441,7 +539,14 @@ class CodexAppServerAgent:
         params = msg.get("params", {})
         delta = params.get("delta", "")
         if delta:
-            self._dispatch(params.get("threadId"), {"delta": delta})
+            self._dispatch(
+                params.get("threadId"),
+                {
+                    "kind": "delta",
+                    "itemId": params.get("itemId"),
+                    "delta": delta,
+                },
+            )
 
     async def _on_item_started(self, msg: dict[str, Any]) -> None:
         params = msg.get("params", {})
@@ -450,11 +555,47 @@ class CodexAppServerAgent:
             return
         for content in item.get("content", []) or []:
             if content.get("type") == "text" and content.get("text"):
-                self._dispatch(params.get("threadId"), {"text": content["text"]})
+                self._dispatch(
+                    params.get("threadId"),
+                    {
+                        "kind": "item-started",
+                        "itemId": item.get("id"),
+                        "text": content["text"],
+                    },
+                )
 
     async def _on_turn_completed(self, msg: dict[str, Any]) -> None:
         params = msg.get("params", {})
-        self._dispatch(params.get("threadId"), {"kind": "completed"})
+        self._dispatch(params.get("threadId"), {"kind": "turn-completed"})
+
+    async def _on_item_completed(self, msg: dict[str, Any]) -> None:
+        params = msg.get("params", {})
+        item = params.get("item", {})
+        if item.get("type") != "agentMessage":
+            return
+
+        text = item.get("text", "")
+        if not text:
+            text = "".join(
+                content.get("text", "")
+                for content in item.get("content", []) or []
+                if content.get("type") == "text"
+            )
+        event: dict[str, Any] = {
+            "kind": "item-completed",
+            "itemId": item.get("id"),
+        }
+        if text:
+            event["text"] = text
+        self._dispatch(params.get("threadId"), event)
+
+    async def _on_default_notification(self, msg: dict[str, Any]) -> None:
+        """Keep an active turn alive while ignoring non-terminal notifications."""
+        params = msg.get("params", {})
+        self._dispatch(
+            params.get("threadId"),
+            {"kind": "notification", "method": msg.get("method"), "message": msg},
+        )
 
     async def _on_approval_request(self, msg: dict[str, Any]) -> None:
         params = msg.get("params", {})

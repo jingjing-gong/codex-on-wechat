@@ -47,6 +47,7 @@ class StdioJsonRpcConnection:
         self._pending: dict[int, asyncio.Future] = {}
         self._request_handlers: dict[str, JsonRpcHandler] = {}
         self._notification_handlers: dict[str, JsonRpcHandler] = {}
+        self._default_notification_handler: Optional[JsonRpcHandler] = None
         self._read_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._last_stderr_line = ""
@@ -64,6 +65,10 @@ class StdioJsonRpcConnection:
     def on_notification(self, method: str, handler: JsonRpcHandler) -> None:
         """Register a handler for a server->client notification (no response)."""
         self._notification_handlers[method] = handler
+
+    def on_default_notification(self, handler: JsonRpcHandler) -> None:
+        """Register a handler for notifications without a method-specific handler."""
+        self._default_notification_handler = handler
 
     async def start(self) -> None:
         if self._started:
@@ -234,8 +239,12 @@ class StdioJsonRpcConnection:
             handler = self._notification_handlers.get(method)
             if handler:
                 asyncio.create_task(handler(msg))
+                logger.debug("handled notification: %s, %s", method, json.dumps(msg))
+            elif self._default_notification_handler:
+                asyncio.create_task(self._default_notification_handler(msg))
+                logger.debug("default notification handler: %s", method)
             else:
-                logger.debug("unhandled notification: %s", method)
+                logger.debug("unhandled notification: %s, %s", method, json.dumps(msg))
 
     async def _stderr_loop(self) -> None:
         assert self._process and self._process.stderr

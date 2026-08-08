@@ -87,9 +87,10 @@ HELP_TEXT = (
     "\n/help - show this message\n"
     "\n/clear - clear conversation context\n"
     "\n/reset - clear conversation context\n"
-    "\n/model - show current model\n"
-    "\n/model <name> - switch model\n"
-    "\n/models - list available models\n"
+    "\n/model - show current model and reasoning level\n"
+    "\n/model <name> [level] - switch model and optionally set reasoning\n"
+    "\n/model effort <level|default> - set or reset reasoning level\n"
+    "\n/models - list available models and reasoning levels\n"
     "\n/skills - list available skills\n"
     "\n/session [id] - switch to or create a session\n"
     "\n/sessions - list your sessions\n"
@@ -141,17 +142,101 @@ def _is_codex_thread_id(value: str) -> bool:
     return True
 
 
+def _parse_model_command(argument: str) -> tuple[str, str, str]:
+    """Return a model-command action, model ID, and requested reasoning effort."""
+    parts = argument.split()
+    if not parts:
+        return "show", "", ""
+    if parts[0].lower() == "effort":
+        if len(parts) != 2:
+            raise ValueError("usage: /model effort <level|default>")
+        return "set-effort", "", parts[1]
+    if len(parts) > 2:
+        raise ValueError("usage: /model <name> [level]")
+    return "set-model", parts[0], parts[1] if len(parts) == 2 else ""
+
+
+def _find_model(
+    models: list[dict[str, Any]], model_id: str
+) -> Optional[dict[str, Any]]:
+    return next((model for model in models if model.get("id") == model_id), None)
+
+
+def _current_model(
+    models: list[dict[str, Any]], configured_model: str
+) -> Optional[dict[str, Any]]:
+    if configured_model:
+        return _find_model(models, configured_model)
+    return next((model for model in models if model.get("isDefault")), None)
+
+
+def _reasoning_efforts(model: Optional[dict[str, Any]]) -> list[str]:
+    if not model:
+        return []
+    efforts: list[str] = []
+    for option in model.get("supportedReasoningEfforts", []):
+        effort = option.get("reasoningEffort") if isinstance(option, dict) else option
+        if isinstance(effort, str) and effort:
+            efforts.append(effort)
+    return efforts
+
+
+def _matching_reasoning_effort(
+    model: Optional[dict[str, Any]], requested_effort: str
+) -> Optional[str]:
+    requested_lower = requested_effort.lower()
+    return next(
+        (
+            effort
+            for effort in _reasoning_efforts(model)
+            if effort.lower() == requested_lower
+        ),
+        None,
+    )
+
+
+def _format_models(
+    models: list[dict[str, Any]],
+    configured_model: str,
+    configured_effort: str,
+) -> str:
+    """Format model capabilities and the active conversation's effective level."""
+    current = _current_model(models, configured_model)
+    lines = ["available models:"]
+    for model in models:
+        is_current = current is not None and model["id"] == current.get("id")
+        marker = " (current)" if is_current else ""
+        marker += " [default]" if model.get("isDefault") else ""
+        lines.append(f"- {model['id']}: {model.get('displayName', '')}{marker}")
+
+        efforts = ", ".join(_reasoning_efforts(model)) or "(not reported)"
+        details: list[str] = []
+        default_effort = model.get("defaultReasoningEffort")
+        if default_effort:
+            details.append(f"default: {default_effort}")
+        if is_current:
+            effective_effort = configured_effort or default_effort
+            if effective_effort:
+                source = "override" if configured_effort else "default"
+                details.append(f"current: {effective_effort} ({source})")
+        suffix = f" [{', '.join(details)}]" if details else ""
+        lines.append(f"  reasoning: {efforts}{suffix}")
+    lines.append("use /model <id> [level] to switch")
+    return "\n".join(lines)
+
+
 @dataclass
 class Session:
     session_id: str
     summary: str = "未开始对话"
     thread_id: Optional[str] = None
+    reasoning_effort: str = ""
     created_at: str = ""
     updated_at: str = ""
 
 
 class SessionManager:
-    """Persist named sessions and their Codex thread IDs per user."""
+    """Persist named sessions and their Codex thread/configuration per user."""
 
     def __init__(self, path: Optional[Path] = None) -> None:
         self.path = path or (Path.home() / ".codex-wechat-bot" / "sessions.json")
@@ -176,6 +261,7 @@ class SessionManager:
                     session_id=session_id,
                     summary=value.get("summary", "未开始对话"),
                     thread_id=value.get("thread_id"),
+                    reasoning_effort=value.get("reasoning_effort", ""),
                     created_at=value.get("created_at", ""),
                     updated_at=value.get("updated_at", ""),
                 )
@@ -194,6 +280,7 @@ class SessionManager:
                     session_id: {
                         "summary": session.summary,
                         "thread_id": session.thread_id,
+                        "reasoning_effort": session.reasoning_effort,
                         "created_at": session.created_at,
                         "updated_at": session.updated_at,
                     }
@@ -292,6 +379,15 @@ class SessionManager:
     def thread_id(self, user_id: str) -> Optional[str]:
         return self.current(user_id).thread_id
 
+    def set_reasoning_effort(self, user_id: str, effort: str) -> None:
+        session = self.current(user_id)
+        session.reasoning_effort = effort
+        session.updated_at = self._now()
+        self._save()
+
+    def reasoning_effort(self, user_id: str) -> str:
+        return self.current(user_id).reasoning_effort
+
     def find_by_id(self, user_id: str, session_id: str) -> Optional[Session]:
         return self._user_sessions(user_id).get(session_id)
 
@@ -365,6 +461,14 @@ class AsyncLoopThread:
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
         return future.result(timeout=timeout)
 
+    def run_stream(self, stream, on_item) -> None:
+        async def consume() -> None:
+            async for item in stream:
+                on_item(item)
+
+        future = asyncio.run_coroutine_threadsafe(consume(), self.loop)
+        future.result()
+
     def stop(self) -> None:
         self.loop.call_soon_threadsafe(self.loop.stop)
         self._thread.join(timeout=5)
@@ -394,6 +498,14 @@ def main() -> None:
 
     def conversation_id(user_id: str) -> str:
         return sessions.conversation_id(user_id)
+
+    def sync_reasoning_effort(user_id: str) -> str:
+        """Apply the active session's persisted effort to the agent."""
+        current_conversation = conversation_id(user_id)
+        persisted_effort = sessions.reasoning_effort(user_id)
+        if agent.get_reasoning_effort(current_conversation) != persisted_effort:
+            agent.set_reasoning_effort(current_conversation, persisted_effort)
+        return current_conversation
 
     def resume_saved_thread(
         user_id: str, current_conversation: str, saved_thread_id: str
@@ -427,16 +539,14 @@ def main() -> None:
 
     def ensure_thread(user_id: str) -> str:
         """Resume the persisted Codex thread for the active bot session."""
-        current_conversation = conversation_id(user_id)
+        current_conversation = sync_reasoning_effort(user_id)
         saved_thread_id = sessions.thread_id(user_id)
         if (
             saved_thread_id
             and agent.get_thread_id(current_conversation) != saved_thread_id
         ):
             try:
-                resume_saved_thread(
-                    user_id, current_conversation, saved_thread_id
-                )
+                resume_saved_thread(user_id, current_conversation, saved_thread_id)
             except Exception:
                 logger.warning("stale Codex thread mapping: %s", saved_thread_id)
                 sessions.set_thread_id(user_id, "")
@@ -484,9 +594,12 @@ def main() -> None:
                         session = sessions.current(msg.from_user_id)
                     if session.thread_id:
                         try:
+                            current_conversation = sync_reasoning_effort(
+                                msg.from_user_id
+                            )
                             resume_saved_thread(
                                 msg.from_user_id,
-                                conversation_id(msg.from_user_id),
+                                current_conversation,
                                 session.thread_id,
                             )
                             session = sessions.current(msg.from_user_id)
@@ -581,20 +694,155 @@ def main() -> None:
                     continue
 
                 if lower == "/model" or lower.startswith("/model "):
-                    arg = text.strip()[len("/model") :].strip()
-                    if not arg:
-                        current = (
-                            agent.get_model(conversation_id(msg.from_user_id))
-                            or "(default)"
+                    arg = stripped[len("/model") :].strip()
+                    current_conversation = sync_reasoning_effort(msg.from_user_id)
+                    try:
+                        action, requested_model, requested_effort = (
+                            _parse_model_command(arg)
                         )
-                        reply = (
-                            f"current model: {current}\nusage: /model <name> to switch"
-                        )
-                    else:
-                        agent.set_model(conversation_id(msg.from_user_id), arg)
-                        reply = (
-                            f"model set to: {arg} (takes effect on your next message)"
-                        )
+                        models = agent_loop.run_coro(agent.list_models(), timeout=30)
+                        configured_model = agent.get_model(current_conversation)
+                        selected_model = _current_model(models, configured_model)
+
+                        if action == "show":
+                            model_name = (
+                                selected_model.get("id")
+                                if selected_model
+                                else configured_model or "(default)"
+                            )
+                            configured_effort = agent.get_reasoning_effort(
+                                current_conversation
+                            )
+                            if configured_effort:
+                                effort_display = f"{configured_effort} (override)"
+                            else:
+                                default_effort = (
+                                    selected_model.get("defaultReasoningEffort")
+                                    if selected_model
+                                    else None
+                                )
+                                effort_display = (
+                                    f"{default_effort} (default)"
+                                    if default_effort
+                                    else "(model default)"
+                                )
+                            efforts = _reasoning_efforts(selected_model)
+                            available = ", ".join(efforts) or "(not reported)"
+                            reply = (
+                                f"current model: {model_name}\n"
+                                f"current reasoning: {effort_display}\n"
+                                f"available reasoning: {available}\n"
+                                "use /model effort <level|default> to change"
+                            )
+                        elif action == "set-effort":
+                            if requested_effort.lower() == "default":
+                                agent.set_reasoning_effort(current_conversation, "")
+                                sessions.set_reasoning_effort(msg.from_user_id, "")
+                                default_effort = (
+                                    selected_model.get("defaultReasoningEffort")
+                                    if selected_model
+                                    else None
+                                )
+                                reply = "reasoning reset to model default" + (
+                                    f": {default_effort}" if default_effort else ""
+                                )
+                            else:
+                                effort = _matching_reasoning_effort(
+                                    selected_model, requested_effort
+                                )
+                                if not selected_model:
+                                    reply = (
+                                        "current model is not available; use /models"
+                                    )
+                                elif not effort:
+                                    available = (
+                                        ", ".join(_reasoning_efforts(selected_model))
+                                        or "(none)"
+                                    )
+                                    reply = (
+                                        f"unsupported reasoning level: {requested_effort}\n"
+                                        f"available: {available}"
+                                    )
+                                else:
+                                    agent.set_reasoning_effort(
+                                        current_conversation, effort
+                                    )
+                                    sessions.set_reasoning_effort(
+                                        msg.from_user_id, effort
+                                    )
+                                    reply = (
+                                        f"reasoning level set to: {effort} "
+                                        "(takes effect on your next message)"
+                                    )
+                        else:
+                            model = _find_model(models, requested_model)
+                            if not model:
+                                available = ", ".join(
+                                    item.get("id", "") for item in models
+                                )
+                                reply = (
+                                    f"unknown model: {requested_model}\n"
+                                    f"available: {available}"
+                                )
+                            else:
+                                effort = ""
+                                if requested_effort:
+                                    if requested_effort.lower() != "default":
+                                        effort = (
+                                            _matching_reasoning_effort(
+                                                model, requested_effort
+                                            )
+                                            or ""
+                                        )
+                                        if not effort:
+                                            available = (
+                                                ", ".join(_reasoning_efforts(model))
+                                                or "(none)"
+                                            )
+                                            reply = (
+                                                f"model {requested_model} does not support "
+                                                f"reasoning level: {requested_effort}\n"
+                                                f"available: {available}"
+                                            )
+                                            send_text_reply(
+                                                client,
+                                                msg.from_user_id,
+                                                reply,
+                                                msg.context_token,
+                                            )
+                                            continue
+                                else:
+                                    previous_effort = agent.get_reasoning_effort(
+                                        current_conversation
+                                    )
+                                    if (
+                                        previous_effort
+                                        and not _matching_reasoning_effort(
+                                            model, previous_effort
+                                        )
+                                    ):
+                                        effort = ""
+                                    else:
+                                        effort = previous_effort
+
+                                agent.set_model(current_conversation, requested_model)
+                                agent.set_reasoning_effort(current_conversation, effort)
+                                sessions.set_reasoning_effort(msg.from_user_id, effort)
+                                if effort:
+                                    reply = (
+                                        f"model set to: {requested_model}\n"
+                                        f"reasoning level: {effort} "
+                                        "(takes effect on your next message)"
+                                    )
+                                else:
+                                    default_effort = model.get("defaultReasoningEffort")
+                                    reply = f"model set to: {requested_model}"
+                                    if default_effort:
+                                        reply += f"\nreasoning level: {default_effort} (default)"
+                    except ValueError as exc:
+                        reply = str(exc)
+                    except Exception as exc:
+                        reply = f"(codex error: {exc})"
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     logger.info(
                         "model command for %s: %r", msg.from_user_id, arg or "<show>"
@@ -604,16 +852,12 @@ def main() -> None:
                 if lower in ("/models", "/listmodel", "/listmodels"):
                     try:
                         models = agent_loop.run_coro(agent.list_models(), timeout=30)
-                        current = agent.get_model(conversation_id(msg.from_user_id))
-                        lines = ["available models:"]
-                        for m in models:
-                            marker = " (current)" if m["id"] == current else ""
-                            marker += " [default]" if m.get("isDefault") else ""
-                            lines.append(
-                                f"- {m['id']}: {m.get('displayName', '')}{marker}"
-                            )
-                        lines.append("use /model <id> to switch")
-                        reply = "\n".join(lines)
+                        current_conversation = sync_reasoning_effort(msg.from_user_id)
+                        reply = _format_models(
+                            models,
+                            agent.get_model(current_conversation),
+                            agent.get_reasoning_effort(current_conversation),
+                        )
                     except Exception as exc:
                         reply = f"(codex error: {exc})"
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
@@ -693,9 +937,7 @@ def main() -> None:
                 # user before starting it, but keep this best-effort so a
                 # typing API failure never prevents the actual response.
                 try:
-                    send_typing_state(
-                        client, msg.from_user_id, msg.context_token
-                    )
+                    send_typing_state(client, msg.from_user_id, msg.context_token)
                 except Exception:
                     logger.warning(
                         "could not send typing indicator to %s",
@@ -706,19 +948,27 @@ def main() -> None:
                 try:
                     current_conversation = ensure_thread(msg.from_user_id)
                     sessions.update_summary(msg.from_user_id, text)
-                    reply = agent_loop.run_coro(
-                        agent.chat(current_conversation, text),
-                        timeout=_CODEX_TASK_TIMEOUT,
+                    replies: list[str] = []
+
+                    def send_partial(partial: str) -> None:
+                        replies.append(partial)
+                        send_text_reply(
+                            client, msg.from_user_id, partial, msg.context_token
+                        )
+
+                    agent_loop.run_stream(
+                        agent.chat_stream(current_conversation, text), send_partial
                     )
                     save_current_thread(msg.from_user_id, current_conversation)
-                except FutureTimeoutError:
-                    reply = (
-                        "Codex is still working after 15 minutes. "
-                        "Please wait, then send a follow-up message in this session."
-                    )
+                    reply = "".join(replies)
                 except Exception as exc:
                     reply = f"(codex error: {exc})"
-                send_text_reply(client, msg.from_user_id, reply, msg.context_token)
+                if reply and not replies:
+                    send_text_reply(client, msg.from_user_id, reply, msg.context_token)
+                if len(replies) > 1:
+                    send_text_reply(
+                        client, msg.from_user_id, "-----", msg.context_token
+                    )
                 logger.info("sent reply to %s: %r", msg.from_user_id, reply)
 
     monitor = Monitor(wechat_client, handle_message)
