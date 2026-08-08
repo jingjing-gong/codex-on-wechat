@@ -5,8 +5,6 @@ from __future__ import annotations
 import base64
 import os
 import struct
-from typing import Optional
-
 import requests
 
 from .types import (
@@ -43,7 +41,7 @@ def generate_wechat_uin() -> str:
 class Client:
     """iLink HTTP API client."""
 
-    def __init__(self, creds: Optional[Credentials] = None, timeout: float = 10.0):
+    def __init__(self, creds: Credentials | None = None, timeout: float = 10.0):
         if creds is not None:
             self.base_url = creds.baseurl or DEFAULT_BASE_URL
             self.bot_token = creds.bot_token

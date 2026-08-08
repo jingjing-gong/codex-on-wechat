@@ -6,8 +6,6 @@ extra mapping.
 
 from __future__ import annotations
 
-from typing import List, Optional
-
 from pydantic import BaseModel, ConfigDict, Field
 
 # Message types
@@ -45,7 +43,7 @@ class ILinkModel(BaseModel):
 
 
 class BaseInfo(ILinkModel):
-    channel_version: Optional[str] = None
+    channel_version: str | None = None
 
 
 class Credentials(ILinkModel):
@@ -87,7 +85,7 @@ class MediaInfo(ILinkModel):
 
 
 class VoiceItem(ILinkModel):
-    media: Optional[MediaInfo] = None
+    media: MediaInfo | None = None
     voice_size: int = 0
     encode_type: int = 0  # 1=pcm 2=adpcm 3=feature 4=speex 5=amr 6=silk 7=mp3
     bits_per_sample: int = 0
@@ -98,28 +96,28 @@ class VoiceItem(ILinkModel):
 
 class ImageItem(ILinkModel):
     url: str = ""
-    media: Optional[MediaInfo] = None
+    media: MediaInfo | None = None
     mid_size: int = 0  # ciphertext size
 
 
 class VideoItem(ILinkModel):
-    media: Optional[MediaInfo] = None
+    media: MediaInfo | None = None
     video_size: int = 0
 
 
 class FileItem(ILinkModel):
-    media: Optional[MediaInfo] = None
+    media: MediaInfo | None = None
     file_name: str = ""
     len: str = ""  # plaintext size as string
 
 
 class MessageItem(ILinkModel):
     type: int = ITEM_TYPE_NONE
-    text_item: Optional[TextItem] = None
-    image_item: Optional[ImageItem] = None
-    voice_item: Optional[VoiceItem] = None
-    video_item: Optional[VideoItem] = None
-    file_item: Optional[FileItem] = None
+    text_item: TextItem | None = None
+    image_item: ImageItem | None = None
+    voice_item: VoiceItem | None = None
+    video_item: VideoItem | None = None
+    file_item: FileItem | None = None
 
 
 class WeixinMessage(ILinkModel):
@@ -131,7 +129,7 @@ class WeixinMessage(ILinkModel):
     to_user_id: str = ""
     message_type: int = MESSAGE_TYPE_NONE
     message_state: int = MESSAGE_STATE_NEW
-    item_list: List[MessageItem] = Field(default_factory=list)
+    item_list: list[MessageItem] = Field(default_factory=list)
     context_token: str = ""
 
 
@@ -144,7 +142,7 @@ class GetUpdatesResponse(ILinkModel):
     ret: int = 0
     errcode: int = 0
     errmsg: str = ""
-    msgs: List[WeixinMessage] = Field(default_factory=list)
+    msgs: list[WeixinMessage] = Field(default_factory=list)
     get_updates_buf: str = ""
     longpolling_timeout_ms: int = 0
 
@@ -176,7 +174,7 @@ class SendMsg(ILinkModel):
     client_id: str = ""
     message_type: int = MESSAGE_TYPE_BOT
     message_state: int = MESSAGE_STATE_FINISH
-    item_list: List[MessageItem] = Field(default_factory=list)
+    item_list: list[MessageItem] = Field(default_factory=list)
     context_token: str = ""
 
 
@@ -192,7 +190,7 @@ class SendMessageResponse(ILinkModel):
 
 class GetConfigRequest(ILinkModel):
     ilink_user_id: str = ""
-    context_token: Optional[str] = None
+    context_token: str | None = None
     base_info: BaseInfo = Field(default_factory=BaseInfo)
 
 

@@ -128,12 +128,17 @@ class Monitor:
         logger.info("shutting down")
 
     def _safe_handle(self, msg: WeixinMessage) -> None:
-        # Keep messages from one contact ordered while retaining concurrency
-        # across contacts. Handlers often mutate per-contact session state.
+        # Keep ordinary messages ordered per contact. Commands are independent
+        # control operations and must remain responsive during a long Codex turn.
+        if _is_command_message(msg):
+            try:
+                self.handler(self.client, msg)
+            except Exception:
+                logger.exception("message handler raised an exception")
+            return
+
         with self._handler_locks_guard:
-            lock = self._handler_locks.setdefault(
-                msg.from_user_id, threading.Lock()
-            )
+            lock = self._handler_locks.setdefault(msg.from_user_id, threading.Lock())
         with lock:
             try:
                 self.handler(self.client, msg)
@@ -153,4 +158,13 @@ def format_message_summary(msg: WeixinMessage) -> str:
     return (
         f"from={msg.from_user_id} type={msg.message_type} "
         f"state={msg.message_state} text={text!r}"
+    )
+
+
+def _is_command_message(msg: WeixinMessage) -> bool:
+    """Return whether a message starts with a slash command."""
+    return any(
+        item.text_item is not None and item.text_item.text.lstrip().startswith("/")
+        for item in msg.item_list
+        if item.type == ITEM_TYPE_TEXT
     )

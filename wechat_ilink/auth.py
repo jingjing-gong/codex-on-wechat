@@ -6,7 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Callable, List, Optional
+from collections.abc import Callable
 
 import requests
 
@@ -30,8 +30,8 @@ def fetch_qrcode() -> QRCodeResponse:
 
 def poll_qr_status(
     qrcode: str,
-    on_status: Optional[Callable[[str], None]] = None,
-    stop_check: Optional[Callable[[], bool]] = None,
+    on_status: Callable[[str], None] | None = None,
+    stop_check: Callable[[], bool] | None = None,
 ) -> Credentials:
     """Poll for QR scan/confirmation until login succeeds or the code expires.
 
@@ -89,13 +89,13 @@ def save_credentials(creds: Credentials) -> None:
     os.chmod(path, 0o600)
 
 
-def load_all_credentials() -> List[Credentials]:
+def load_all_credentials() -> list[Credentials]:
     """Load all saved account credentials."""
     directory = accounts_dir()
     if not directory.exists():
         return []
 
-    result: List[Credentials] = []
+    result: list[Credentials] = []
     for entry in sorted(directory.iterdir()):
         if entry.suffix != ".json":
             continue

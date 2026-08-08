@@ -1,4 +1,4 @@
-# acp-agents
+# codex-on-wechat
 
 Bridges a real WeChat account to the Codex AI coding agent, so you can chat
 with Codex from WeChat.
@@ -21,8 +21,7 @@ Login and logout directly:
 ```
 
 Each WeChat contact gets their own Codex conversation. Send `/help` in a chat
-to see available commands (`/clear`, `/model`, `/models`, `/skills`), or
-`$skill-name <prompt>` to invoke a specific skill.
+to see available commands (`/clear`, `/model`, and `/models`).
 
 Session commands are available per WeChat user:
 
@@ -39,8 +38,7 @@ arbitrary commands on the host, so use it only with trusted WeChat users.
 
 ## Requirements
 
-- Python >= 3.9
-- A `codex` CLI on `PATH` (supporting `codex app-server`, or the `codex-acp`
-  wrapper binary)
+- Python >= 3.10
+- The `openai-codex` package, installed automatically by `uv`
 - A WeChat account
 

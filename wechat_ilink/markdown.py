@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from typing import List
 
 _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -25,6 +24,6 @@ def markdown_to_plain_text(text: str) -> str:
     return text.strip()
 
 
-def extract_image_urls(text: str) -> List[str]:
+def extract_image_urls(text: str) -> list[str]:
     """Extract image URLs from markdown image syntax `![alt](url)`."""
     return _IMAGE_URL_RE.findall(text)

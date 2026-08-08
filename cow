@@ -30,15 +30,15 @@ shift || true
 case "$command" in
     run)
         uv sync --extra test
-        exec uv run examples/codex_wechat_bot.py "$@"
+        exec uv run src/codex_wechat_bot.py "$@"
         ;;
     login)
         uv sync --extra test
-        exec uv run examples/codex_wechat_bot.py --login "$@"
+        exec uv run src/codex_wechat_bot.py --login "$@"
         ;;
     logout)
         uv sync --extra test
-        exec uv run examples/codex_wechat_bot.py --logout "$@"
+        exec uv run src/codex_wechat_bot.py --logout "$@"
         ;;
     -h|--help|help)
         sed -n '3,10p' "$0"
