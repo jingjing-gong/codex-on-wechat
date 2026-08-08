@@ -230,8 +230,13 @@ class StdioJsonRpcConnection:
             handler = self._request_handlers.get(method)
             if handler:
                 asyncio.create_task(handler(msg))
+                logger.info(
+                    "handled request from agent: %s, %s", method, json.dumps(msg)
+                )
             else:
-                logger.warning("unhandled request from agent: %s", method)
+                logger.info(
+                    "unhandled request from agent: %s, %s", method, json.dumps(msg)
+                )
             return
 
         # Notification (no id).

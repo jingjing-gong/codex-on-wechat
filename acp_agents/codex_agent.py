@@ -48,7 +48,7 @@ class CodexAppServerAgent:
         model: str = "",
         cwd: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
-        turn_timeout: Optional[float] = 5 * 60,
+        turn_timeout: Optional[float] = 300,
     ):
         self.command = command
         self.args = args or []
@@ -90,7 +90,6 @@ class CodexAppServerAgent:
             await self._conn.request(
                 "initialize",
                 {"clientInfo": {"name": "acp-agents", "version": "0.1.0"}},
-                timeout=30.0,
             )
             await self._conn.notify("initialized")
         except Exception as exc:
@@ -440,9 +439,23 @@ class CodexAppServerAgent:
                         thread_id,
                         conversation_id,
                     )
-                    await self._interrupt_turn(thread_id)
+                    interrupted = await self._interrupt_turn(thread_id)
+                    if interrupted:
+                        logger.info(
+                            "turn interrupted after timeout (pid=%s, thread=%s, conversation=%s)",
+                            pid,
+                            thread_id,
+                            conversation_id,
+                        )
+                    else:
+                        logger.warning(
+                            "turn could not be interrupted after timeout (pid=%s, thread=%s, conversation=%s)",
+                            pid,
+                            thread_id,
+                            conversation_id,
+                        )
                     yield "======TURN TIMED OUT======"
-                    break
+                    continue
                 if item.get("kind") == "error":
                     raise RuntimeError(f"turn error: {item.get('text')}")
                 item_id = item.get("itemId") or "<default>"
@@ -490,28 +503,28 @@ class CodexAppServerAgent:
         except Exception as exc:
             queue.put_nowait({"kind": "error", "text": str(exc)})
 
-    async def _interrupt_turn(self, thread_id: str) -> None:
+    async def _interrupt_turn(self, thread_id: str) -> bool:
         turn_id = self._active_turns.get(thread_id)
         if not turn_id:
-            return
+            return False
         try:
             await self._conn.request(
-                "turn/interrupt",
-                {"threadId": thread_id, "turnId": turn_id},
-                timeout=10.0,
+                "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
             )
             logger.info(
                 "interrupted timed-out Codex turn (thread=%s, turn=%s)",
                 thread_id,
                 turn_id,
             )
-        except Exception:
+            return True
+        except Exception as exc:
             logger.warning(
-                "could not interrupt timed-out Codex turn (thread=%s, turn=%s)",
+                "could not interrupt timed-out Codex turn (thread=%s, turn=%s, exc=%s)",
                 thread_id,
                 turn_id,
-                exc_info=True,
+                str(exc),
             )
+            return False
 
     async def _get_or_create_thread(self, conversation_id: str) -> tuple[str, bool]:
         thread_id = self._threads.get(conversation_id)
