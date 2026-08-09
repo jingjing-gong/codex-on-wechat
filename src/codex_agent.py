@@ -208,6 +208,7 @@ class CodexAgent:
                         if remaining <= 0:
                             raise asyncio.TimeoutError
                         event = await asyncio.wait_for(anext(stream), remaining)
+                    logger.info("received Codex event: %r", event)
 
                     if event.method == "item/completed":
                         item = getattr(event.payload, "item", None)
@@ -229,12 +230,35 @@ class CodexAgent:
                         interrupted = status_value == "interrupted"
                         break
             except asyncio.TimeoutError:
-                await turn.interrupt()
+                try:
+                    await turn.interrupt()
+                except Exception:
+                    logger.warning(
+                        "failed to interrupt timed-out Codex turn for %s",
+                        conversation_id,
+                        exc_info=True,
+                    )
                 raise RuntimeError("Codex turn timed out")
+            except Exception as exc:
+                await turn.interrupt()
+                logger.warning(
+                    "Codex turn for %s raised an exception: %s",
+                    conversation_id,
+                    exc,
+                    exc_info=True,
+                )
+                raise RuntimeError(f"Codex turn failed: {exc}") from exc
             finally:
                 self._active_turns.pop(conversation_id, None)
                 self._active_messages.pop(conversation_id, None)
-                await stream.aclose()
+                try:
+                    await stream.aclose()
+                except Exception:
+                    logger.warning(
+                        "failed to close Codex event stream for %s",
+                        conversation_id,
+                        exc_info=True,
+                    )
 
             if not emitted_text and not interrupted:
                 raise RuntimeError("Codex returned an empty response")
