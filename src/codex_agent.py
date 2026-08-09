@@ -230,8 +230,7 @@ class CodexAgent:
                         break
             except asyncio.TimeoutError:
                 await turn.interrupt()
-                yield "======TURN TIMED OUT======"
-                return
+                raise RuntimeError("Codex turn timed out")
             finally:
                 self._active_turns.pop(conversation_id, None)
                 self._active_messages.pop(conversation_id, None)

@@ -906,10 +906,6 @@ def main() -> None:
                     reply = f"(codex error: {exc})"
                 if reply and not replies:
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
-                if len(replies) > 1:
-                    send_text_reply(
-                        client, msg.from_user_id, "-----", msg.context_token
-                    )
                 logger.info("sent reply to %s: %r", msg.from_user_id, reply)
 
     monitor = Monitor(wechat_client, handle_message)
