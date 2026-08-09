@@ -21,7 +21,7 @@ from .types import (
 
 logger = logging.getLogger("wechat_ilink.sender")
 
-MAX_TEXT_REPLY_LENGTH = 1000
+MAX_TEXT_REPLY_LENGTH = 2500
 
 
 def new_client_id() -> str:
@@ -36,6 +36,12 @@ def _split_text(text: str, max_length: int = MAX_TEXT_REPLY_LENGTH) -> list[str]
     return [
         text[index : index + max_length] for index in range(0, len(text), max_length)
     ]
+
+
+def prepare_text_reply(text: str) -> list[str]:
+    """Convert a reply to plain text and split it into iLink-sized chunks."""
+    chunks = _split_text(markdown_to_plain_text(text))
+    return chunks or [""]
 
 
 def send_typing_state(client: Client, user_id: str, context_token: str = "") -> None:
@@ -57,16 +63,13 @@ def send_text_reply(
     text: str,
     context_token: str = "",
     client_id: str = "",
+    message_state: int = MESSAGE_STATE_FINISH,
 ) -> None:
     """Send a text reply to a user through the iLink API.
 
     If client_id is empty, a new one is generated.
     """
-    # Convert markdown to plain text for WeChat display.
-    plain_text = markdown_to_plain_text(text)
-    chunks = _split_text(plain_text)
-    if not chunks:
-        chunks = [""]
+    chunks = prepare_text_reply(text)
 
     for index, chunk in enumerate(chunks):
         chunk_client_id = (
@@ -78,7 +81,7 @@ def send_text_reply(
                 to_user_id=to_user_id,
                 client_id=chunk_client_id,
                 message_type=MESSAGE_TYPE_BOT,
-                message_state=MESSAGE_STATE_FINISH,
+                message_state=message_state,
                 item_list=[
                     MessageItem(type=ITEM_TYPE_TEXT, text_item=TextItem(text=chunk))
                 ],

@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,6 +48,7 @@ from wechat_ilink import (  # noqa: E402
     format_message_summary,
     load_all_credentials,
     poll_qr_status,
+    prepare_text_reply,
     save_credentials,
     send_text_reply,
     send_typing_state,
@@ -79,6 +81,7 @@ KNOWN_COMMANDS = [
     "/reset",
     "/interrupt",
     "/status",
+    "/recv",
     "/model",
     "/models",
     "/listmodel",
@@ -96,6 +99,7 @@ HELP_TEXT = (
     "\n/reset - clear conversation context\n"
     "\n/interrupt - stop the current Codex turn\n"
     "\n/status - show whether Codex is busy or idle\n"
+    "\n/recv - receive buffered Codex results after the reply quota resets\n"
     "\n/model - show current model and reasoning level\n"
     "\n/model <name> [level] - switch model and optionally set reasoning\n"
     "\n/model effort <level|default> - set or reset reasoning level\n"
@@ -110,6 +114,162 @@ HELP_TEXT = (
 _MAX_SHELL_OUTPUT = 6000
 _SHELL_TIMEOUT = 30
 _CODEX_TASK_TIMEOUT = None
+_SENDMESSAGE_QUOTA = 10
+_REPLY_FLUSH_INTERVAL = 120.0
+_TYPING_INTERVAL = 10.0
+_QUOTA_NOTICE = ">请发送 /recv 继续查看结果"
+
+
+@dataclass
+class UserDeliveryState:
+    context_token: str = ""
+    sent_count: int = 0
+    pending_text: str = ""
+    last_send_at: float = 0.0
+    last_typing_at: float = 0.0
+    active_turn: bool = False
+
+
+class DeliveryManager:
+    """Track per-user iLink context, quota, buffered replies, and typing cadence."""
+
+    def __init__(self, quota: int = _SENDMESSAGE_QUOTA) -> None:
+        self.quota = quota
+        self._states: dict[str, UserDeliveryState] = {}
+        self._send_locks: dict[str, threading.Lock] = {}
+        self._lock = threading.RLock()
+
+    def state(self, user_id: str) -> UserDeliveryState:
+        with self._lock:
+            return self._states.setdefault(user_id, UserDeliveryState())
+
+    def _send_lock(self, user_id: str) -> threading.Lock:
+        with self._lock:
+            return self._send_locks.setdefault(user_id, threading.Lock())
+
+    def note_inbound(self, user_id: str, context_token: str) -> None:
+        with self._lock:
+            state = self._states.setdefault(user_id, UserDeliveryState())
+            if context_token:
+                state.context_token = context_token
+            if not state.active_turn:
+                state.sent_count = 0
+
+    def begin_turn(self, user_id: str) -> None:
+        with self._lock:
+            self._states.setdefault(user_id, UserDeliveryState()).active_turn = True
+
+    def end_turn(self, user_id: str) -> None:
+        with self._lock:
+            self._states.setdefault(user_id, UserDeliveryState()).active_turn = False
+
+    def send(self, client: Client, user_id: str, text: str) -> bool:
+        chunks = prepare_text_reply(text)
+        with self._send_lock(user_id):
+            for index, chunk in enumerate(chunks):
+                with self._lock:
+                    state = self._states.setdefault(user_id, UserDeliveryState())
+                    if state.sent_count >= self.quota:
+                        logger.warning("sendmessage quota exhausted for %s", user_id)
+                        state.pending_text = (
+                            "".join(chunks[index:]) + state.pending_text
+                        )
+                        return False
+                    token = state.context_token
+                    is_last_quota = state.sent_count + 1 == self.quota
+                original_chunk = chunk
+                if is_last_quota:
+                    suffix = f"\n\n{_QUOTA_NOTICE}"
+                    chunk = chunk[: max(0, 2500 - len(suffix))] + suffix
+                try:
+                    send_text_reply(
+                        client,
+                        user_id,
+                        chunk,
+                        token,
+                    )
+                except Exception:
+                    with self._lock:
+                        state = self._states.setdefault(user_id, UserDeliveryState())
+                        state.pending_text = (
+                            original_chunk
+                            + "".join(chunks[index + 1 :])
+                            + state.pending_text
+                        )
+                    raise
+                with self._lock:
+                    state = self._states.setdefault(user_id, UserDeliveryState())
+                    state.sent_count += 1
+                    state.last_send_at = time.monotonic()
+                    logger.info(
+                        "sendmessage quota for %s: %d/%d",
+                        user_id,
+                        state.sent_count,
+                        self.quota,
+                    )
+                if is_last_quota:
+                    with self._lock:
+                        state = self._states.setdefault(user_id, UserDeliveryState())
+                        state.pending_text = (
+                            "".join(chunks[index + 1 :]) + state.pending_text
+                        )
+                    break
+            return bool(chunks)
+
+    def append(self, user_id: str, text: str) -> int:
+        with self._lock:
+            state = self._states.setdefault(user_id, UserDeliveryState())
+            state.pending_text += text
+            return len(state.pending_text)
+
+    def should_flush(self, user_id: str, now: float | None = None) -> bool:
+        with self._lock:
+            state = self._states.setdefault(user_id, UserDeliveryState())
+            if len(state.pending_text) >= 2500:
+                return True
+            current = now if now is not None else time.monotonic()
+            return bool(
+                state.pending_text
+                and state.last_send_at
+                and current - state.last_send_at >= _REPLY_FLUSH_INTERVAL
+            )
+
+    def flush(self, client: Client, user_id: str) -> bool:
+        with self._lock:
+            state = self._states.setdefault(user_id, UserDeliveryState())
+            if not state.pending_text:
+                return False
+            text = state.pending_text
+            state.pending_text = ""
+        try:
+            if self.send(client, user_id, text):
+                return True
+        except Exception:
+            logger.exception("could not flush buffered reply to %s", user_id)
+        return False
+
+    def has_pending(self, user_id: str) -> bool:
+        with self._lock:
+            return bool(
+                self._states.setdefault(user_id, UserDeliveryState()).pending_text
+            )
+
+    def send_typing(self, client: Client, user_id: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            state = self._states.setdefault(user_id, UserDeliveryState())
+            if now - state.last_typing_at < _TYPING_INTERVAL:
+                return False
+            token = state.context_token
+            state.last_typing_at = now
+        try:
+            send_typing_state(client, user_id, token)
+            return True
+        except Exception:
+            logger.warning(
+                "could not send typing indicator to %s", user_id, exc_info=True
+            )
+            return False
 
 
 def run_shell_command(
@@ -470,10 +630,20 @@ class AsyncLoopThread:
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
         return future.result(timeout=timeout)
 
-    def run_stream(self, stream, on_item) -> None:
+    def run_stream(self, stream, on_item, on_complete=None, on_error=None) -> None:
         async def consume() -> None:
-            async for item in stream:
-                on_item(item)
+            try:
+                async for item in stream:
+                    on_item(item)
+            except BaseException:
+                if on_error is not None:
+                    await on_error()
+                raise
+            else:
+                if on_complete is not None:
+                    on_complete()
+            finally:
+                await stream.aclose()
 
         future = asyncio.run_coroutine_threadsafe(consume(), self.loop)
         future.result()
@@ -504,6 +674,18 @@ def main() -> None:
     agent_loop.run_coro(agent.start(), timeout=30)
     logger.info("codex agent ready: %s", agent.info())
     sessions = SessionManager()
+    delivery = DeliveryManager()
+
+    def send_user_reply(client: Client, user_id: str, text: str) -> bool:
+        return delivery.send(client, user_id, text)
+
+    def send_text_reply(
+        client: Client,
+        user_id: str,
+        text: str,
+        _context_token: str = "",
+    ) -> None:
+        send_user_reply(client, user_id, text)
 
     def conversation_id(user_id: str) -> str:
         return sessions.conversation_id(user_id)
@@ -547,10 +729,10 @@ def main() -> None:
 
     def handle_message(client: Client, msg) -> None:
         print(format_message_summary(msg))
-        if (
-            msg.message_type != MESSAGE_TYPE_USER
-            or msg.message_state != MESSAGE_STATE_FINISH
-        ):
+        if msg.message_type != MESSAGE_TYPE_USER:
+            return
+        delivery.note_inbound(msg.from_user_id, msg.context_token)
+        if msg.message_state != MESSAGE_STATE_FINISH:
             return
         for item in msg.item_list:
             if item.type == ITEM_TYPE_TEXT and item.text_item:
@@ -566,6 +748,16 @@ def main() -> None:
 
                 stripped = text.strip()
                 lower = stripped.lower()
+
+                if lower == "/recv":
+                    if not delivery.flush(client, msg.from_user_id):
+                        send_text_reply(
+                            client,
+                            msg.from_user_id,
+                            "当前没有待接收的 Codex 结果",
+                            msg.context_token,
+                        )
+                    continue
 
                 if lower == "/session" or lower.startswith("/session "):
                     requested_id = stripped[len("/session") :].strip() or None
@@ -890,35 +1082,46 @@ def main() -> None:
                 # user before starting it, but keep this best-effort so a
                 # typing API failure never prevents the actual response.
                 try:
-                    send_typing_state(client, msg.from_user_id, msg.context_token)
-                except Exception:
-                    logger.warning(
-                        "could not send typing indicator to %s",
-                        msg.from_user_id,
-                        exc_info=True,
-                    )
-                try:
+                    delivery.begin_turn(msg.from_user_id)
                     current_conversation = ensure_thread(msg.from_user_id)
                     sessions.update_summary(msg.from_user_id, text)
 
                     def send_partial(partial: str) -> None:
-                        send_text_reply(
-                            client, msg.from_user_id, partial, msg.context_token
-                        )
+                        delivery.append(msg.from_user_id, partial)
+                        if delivery.should_flush(msg.from_user_id):
+                            delivery.flush(client, msg.from_user_id)
                         logger.info(
-                            "sent partial reply to %s: %r", msg.from_user_id, partial
+                            "buffered partial reply for %s: %r",
+                            msg.from_user_id,
+                            partial,
                         )
 
+                    def handle_codex_event(event) -> None:
+                        if event.method == "turn/completed":
+                            turn = getattr(event.payload, "turn", None)
+                            status = getattr(turn, "status", None)
+                            status_value = getattr(status, "value", status)
+                            if status_value in ("completed", "interrupted"):
+                                delivery.flush(client, msg.from_user_id)
+                            return
+                        delivery.send_typing(client, msg.from_user_id)
+
                     agent_loop.run_stream(
-                        agent.chat_stream(current_conversation, text), send_partial
+                        agent.chat_stream(
+                            current_conversation,
+                            text,
+                            on_event=handle_codex_event,
+                        ),
+                        send_partial,
                     )
+                    delivery.flush(client, msg.from_user_id)
                     save_current_thread(msg.from_user_id, current_conversation)
                 except Exception as exc:
                     reply = f"(codex error: {exc})"
-                    _safe_send_text_reply(
-                        client, msg.from_user_id, reply, msg.context_token
-                    )
+                    send_user_reply(client, msg.from_user_id, reply)
                     logger.exception("codex chat failed for %s", msg.from_user_id)
+                finally:
+                    delivery.end_turn(msg.from_user_id)
 
     monitor = Monitor(wechat_client, handle_message)
     stop_event = threading.Event()

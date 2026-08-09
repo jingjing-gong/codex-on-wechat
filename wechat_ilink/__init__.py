@@ -29,7 +29,12 @@ from .cdn import (
 from .client import Client, ILinkError
 from .markdown import extract_image_urls, markdown_to_plain_text
 from .monitor import Monitor, format_message_summary
-from .sender import new_client_id, send_text_reply, send_typing_state
+from .sender import (
+    new_client_id,
+    prepare_text_reply,
+    send_text_reply,
+    send_typing_state,
+)
 from .types import (
     Credentials,
     ImageItem,
@@ -62,6 +67,7 @@ __all__ = [
     "normalize_account_id",
     "send_text_reply",
     "send_typing_state",
+    "prepare_text_reply",
     "new_client_id",
     "markdown_to_plain_text",
     "extract_image_urls",

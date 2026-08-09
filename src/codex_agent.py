@@ -171,7 +171,7 @@ class CodexAgent:
         return result
 
     async def chat_stream(
-        self, conversation_id: str, message: str
+        self, conversation_id: str, message: str, on_event=None
     ) -> AsyncIterator[str]:
         lock = self._conversation_locks.setdefault(conversation_id, asyncio.Lock())
         async with lock:
@@ -209,6 +209,8 @@ class CodexAgent:
                             raise asyncio.TimeoutError
                         event = await asyncio.wait_for(anext(stream), remaining)
                     logger.info("received Codex event: %r", event)
+                    if on_event is not None:
+                        await asyncio.to_thread(on_event, event)
 
                     if event.method == "item/completed":
                         item = getattr(event.payload, "item", None)
