@@ -62,6 +62,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("codex_wechat_bot")
 
+
+def _safe_send_text_reply(
+    client: Client, user_id: str, text: str, context_token: str
+) -> None:
+    """Send an error reply without masking the error that triggered it."""
+    try:
+        send_text_reply(client, user_id, text, context_token)
+    except Exception:
+        logger.exception("could not send error reply to %s", user_id)
+
+
 KNOWN_COMMANDS = [
     "/help",
     "/clear",
@@ -904,7 +915,9 @@ def main() -> None:
                     save_current_thread(msg.from_user_id, current_conversation)
                 except Exception as exc:
                     reply = f"(codex error: {exc})"
-                    send_text_reply(client, msg.from_user_id, reply, msg.context_token)
+                    _safe_send_text_reply(
+                        client, msg.from_user_id, reply, msg.context_token
+                    )
                     logger.exception("codex chat failed for %s", msg.from_user_id)
 
     monitor = Monitor(wechat_client, handle_message)

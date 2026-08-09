@@ -21,10 +21,21 @@ from .types import (
 
 logger = logging.getLogger("wechat_ilink.sender")
 
+MAX_TEXT_REPLY_LENGTH = 1000
+
 
 def new_client_id() -> str:
     """Generate a new unique client ID for message correlation."""
     return str(uuid.uuid4())
+
+
+def _split_text(text: str, max_length: int = MAX_TEXT_REPLY_LENGTH) -> list[str]:
+    """Split text into non-empty chunks that fit the iLink text limit."""
+    if max_length <= 0:
+        raise ValueError("max_length must be positive")
+    return [
+        text[index : index + max_length] for index in range(0, len(text), max_length)
+    ]
 
 
 def send_typing_state(client: Client, user_id: str, context_token: str = "") -> None:
@@ -51,29 +62,53 @@ def send_text_reply(
 
     If client_id is empty, a new one is generated.
     """
-    if not client_id:
-        client_id = new_client_id()
-
     # Convert markdown to plain text for WeChat display.
     plain_text = markdown_to_plain_text(text)
+    chunks = _split_text(plain_text)
+    if not chunks:
+        chunks = [""]
 
-    req = SendMessageRequest(
-        msg=SendMsg(
-            from_user_id=client.bot_id,
-            to_user_id=to_user_id,
-            client_id=client_id,
-            message_type=MESSAGE_TYPE_BOT,
-            message_state=MESSAGE_STATE_FINISH,
-            item_list=[
-                MessageItem(type=ITEM_TYPE_TEXT, text_item=TextItem(text=plain_text))
-            ],
-            context_token=context_token,
-        ),
-        base_info=BaseInfo(),
-    )
+    for index, chunk in enumerate(chunks):
+        chunk_client_id = (
+            client_id if len(chunks) == 1 and client_id else new_client_id()
+        )
+        req = SendMessageRequest(
+            msg=SendMsg(
+                from_user_id=client.bot_id,
+                to_user_id=to_user_id,
+                client_id=chunk_client_id,
+                message_type=MESSAGE_TYPE_BOT,
+                message_state=MESSAGE_STATE_FINISH,
+                item_list=[
+                    MessageItem(type=ITEM_TYPE_TEXT, text_item=TextItem(text=chunk))
+                ],
+                context_token=context_token,
+            ),
+            base_info=BaseInfo(),
+        )
 
-    resp = client.send_message(req)
-    if resp.ret != 0:
-        raise RuntimeError(f"send message failed: ret={resp.ret} errmsg={resp.errmsg}")
+        resp = client.send_message(req)
+        if resp.ret != 0:
+            logger.error(
+                "iLink send failed: to=%s ret=%s errmsg=%s chars=%d "
+                "has_context=%s client_id=%s chunk=%d/%d",
+                to_user_id,
+                resp.ret,
+                resp.errmsg,
+                len(chunk),
+                bool(context_token),
+                chunk_client_id,
+                index + 1,
+                len(chunks),
+            )
+            raise RuntimeError(
+                f"send message failed: ret={resp.ret} errmsg={resp.errmsg}"
+            )
 
-    logger.info("sent reply to %s: %r", to_user_id, text[:50])
+        logger.info(
+            "sent reply to %s: chars=%d chunk=%d/%d",
+            to_user_id,
+            len(chunk),
+            index + 1,
+            len(chunks),
+        )
