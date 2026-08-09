@@ -98,7 +98,7 @@ HELP_TEXT = (
 
 _MAX_SHELL_OUTPUT = 6000
 _SHELL_TIMEOUT = 30
-_CODEX_TASK_TIMEOUT = 15 * 60
+_CODEX_TASK_TIMEOUT = None
 
 
 def run_shell_command(
@@ -889,24 +889,23 @@ def main() -> None:
                 try:
                     current_conversation = ensure_thread(msg.from_user_id)
                     sessions.update_summary(msg.from_user_id, text)
-                    replies: list[str] = []
 
                     def send_partial(partial: str) -> None:
-                        replies.append(partial)
                         send_text_reply(
                             client, msg.from_user_id, partial, msg.context_token
+                        )
+                        logger.info(
+                            "sent partial reply to %s: %r", msg.from_user_id, partial
                         )
 
                     agent_loop.run_stream(
                         agent.chat_stream(current_conversation, text), send_partial
                     )
                     save_current_thread(msg.from_user_id, current_conversation)
-                    reply = "".join(replies)
                 except Exception as exc:
                     reply = f"(codex error: {exc})"
-                if reply and not replies:
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
-                logger.info("sent reply to %s: %r", msg.from_user_id, reply)
+                    logger.exception("codex chat failed for %s", msg.from_user_id)
 
     monitor = Monitor(wechat_client, handle_message)
     stop_event = threading.Event()

@@ -202,7 +202,7 @@ class CodexAgent:
             try:
                 while True:
                     if deadline is None:
-                        event = await anext(stream)
+                        event = await asyncio.wait_for(anext(stream), timeout=600)
                     else:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
