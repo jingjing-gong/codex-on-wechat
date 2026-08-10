@@ -32,6 +32,7 @@ from .monitor import Monitor, format_message_summary
 from .sender import (
     new_client_id,
     prepare_text_reply,
+    send_text_chunk,
     send_text_reply,
     send_typing_state,
 )
@@ -66,6 +67,7 @@ __all__ = [
     "credentials_path",
     "normalize_account_id",
     "send_text_reply",
+    "send_text_chunk",
     "send_typing_state",
     "prepare_text_reply",
     "new_client_id",

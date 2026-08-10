@@ -50,6 +50,7 @@ from wechat_ilink import (  # noqa: E402
     poll_qr_status,
     prepare_text_reply,
     save_credentials,
+    send_text_chunk,
     send_text_reply,
     send_typing_state,
 )
@@ -182,7 +183,7 @@ class DeliveryManager:
                     suffix = f"\n\n{_QUOTA_NOTICE}"
                     chunk = chunk[: max(0, 2500 - len(suffix))] + suffix
                 try:
-                    send_text_reply(
+                    send_text_chunk(
                         client,
                         user_id,
                         chunk,
