@@ -234,24 +234,35 @@ class CodexAgent:
                         interrupted = status_value == "interrupted"
                         break
             except asyncio.TimeoutError:
+                timeout_error = RuntimeError("Codex turn timed out")
                 try:
                     await turn.interrupt()
-                except Exception:
+                except Exception as interrupt_error:
                     logger.warning(
                         "failed to interrupt timed-out Codex turn for %s",
                         conversation_id,
                         exc_info=True,
                     )
-                raise RuntimeError("Codex turn timed out")
+                    raise interrupt_error from timeout_error
+                raise timeout_error
             except Exception as exc:
-                await turn.interrupt()
+                turn_error = RuntimeError(f"Codex turn failed: {exc}")
+                try:
+                    await turn.interrupt()
+                except Exception as interrupt_error:
+                    logger.warning(
+                        "failed to interrupt failed Codex turn for %s",
+                        conversation_id,
+                        exc_info=True,
+                    )
+                    raise interrupt_error from turn_error
                 logger.warning(
                     "Codex turn for %s raised an exception: %s",
                     conversation_id,
                     exc,
                     exc_info=True,
                 )
-                raise RuntimeError(f"Codex turn failed: {exc}") from exc
+                raise turn_error from exc
             finally:
                 self._active_turns.pop(conversation_id, None)
                 self._active_messages.pop(conversation_id, None)
