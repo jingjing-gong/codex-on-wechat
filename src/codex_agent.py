@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from openai_codex import ApprovalMode, AsyncCodex, AsyncThread, Sandbox
+from openai_codex import (
+    ApprovalMode,
+    AsyncCodex,
+    AsyncThread,
+    Sandbox,
+    SkillInput,
+    TextInput,
+)
+from openai_codex.generated.v2_all import SkillsListResponse
 
 logger = logging.getLogger(__name__)
+
+_SKILL_MENTION_RE = re.compile(r"^\$([\w:-]+)(?:\s+(.*))?$", re.DOTALL)
 
 
 def _default_workspace() -> str:
@@ -60,6 +71,7 @@ class CodexAgent:
         self._conversation_locks: dict[str, asyncio.Lock] = {}
         self._conversation_models: dict[str, str] = {}
         self._conversation_reasoning_efforts: dict[str, str] = {}
+        self._skills_cache: list[dict[str, Any]] | None = None
 
     async def start(self) -> None:
         if self._started:
@@ -161,6 +173,43 @@ class CodexAgent:
         response = await self._codex.models(include_hidden=include_hidden)
         return [self._to_dict(model) for model in response.data]
 
+    async def list_skills(self, *, refresh: bool = False) -> list[dict[str, Any]]:
+        if self._skills_cache is not None and not refresh:
+            return self._skills_cache
+        await self.start()
+        response = await self._codex._client.request(
+            "skills/list",
+            {"cwds": [self.cwd], "forceReload": refresh},
+            response_model=SkillsListResponse,
+        )
+        skills = [
+            self._to_dict(skill)
+            for entry in response.data
+            for skill in entry.skills
+        ]
+        self._skills_cache = skills
+        return skills
+
+    async def _build_turn_input(self, message: str) -> Any:
+        match = _SKILL_MENTION_RE.match(message.strip())
+        if not match:
+            return message
+        requested_name, prompt = match.groups()
+        skill = next(
+            (
+                item
+                for item in await self.list_skills()
+                if item.get("name", "").lower() == requested_name.lower()
+            ),
+            None,
+        )
+        if not skill:
+            return message
+        turn_input = [SkillInput(name=skill["name"], path=skill["path"])]
+        if prompt:
+            turn_input.append(TextInput(prompt))
+        return turn_input
+
     async def chat(self, conversation_id: str, message: str) -> str:
         parts: list[str] = []
         async for text in self.chat_stream(conversation_id, message):
@@ -188,7 +237,7 @@ class CodexAgent:
             if effort:
                 kwargs["effort"] = effort
 
-            turn = await thread.turn(message, **kwargs)
+            turn = await thread.turn(await self._build_turn_input(message), **kwargs)
             self._active_turns[conversation_id] = turn
             self._active_messages[conversation_id] = message.strip()
             stream = turn.stream()

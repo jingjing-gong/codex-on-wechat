@@ -24,6 +24,7 @@ import difflib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -87,6 +88,9 @@ KNOWN_COMMANDS = [
     "/models",
     "/listmodel",
     "/listmodels",
+    "/skills",
+    "/listskill",
+    "/listskills",
     "/session",
     "/sessions",
     "/delsession",
@@ -105,13 +109,16 @@ HELP_TEXT = (
     "\n/model <name> [level] - switch model and optionally set reasoning\n"
     "\n/model effort <level|default> - set or reset reasoning level\n"
     "\n/models - list available models and reasoning levels\n"
+    "\n/skills - list available skills\n"
     "\n/session [id] - switch to or create a session\n"
     "\n/sessions - list your sessions\n"
     "\n/delsession <id> - delete a session\n"
     "\n/sh <command> - execute a shell command on the bot host\n"
     "\n"
+    "skills:\n\n send $skill-name <prompt> to invoke a skill"
 )
 
+_SKILL_NAME_RE = re.compile(r"^\$([\w:-]+)")
 _MAX_SHELL_OUTPUT = 6000
 _SHELL_TIMEOUT = 30
 _CODEX_TASK_TIMEOUT = None
@@ -392,6 +399,15 @@ def _format_models(
         suffix = f" [{', '.join(details)}]" if details else ""
         lines.append(f"  reasoning: {efforts}{suffix}")
     lines.append("use /model <id> [level] to switch")
+    return "\n".join(lines)
+
+
+def _format_skills(skills: list[dict[str, Any]]) -> str:
+    lines = ["available skills (use $skill-name <prompt>):"]
+    for skill in skills:
+        interface = skill.get("interface") or {}
+        display = interface.get("displayName") or skill["name"]
+        lines.append(f"- ${skill['name']}: {display}")
     return "\n".join(lines)
 
 
@@ -1060,6 +1076,16 @@ def main() -> None:
                     logger.info("listed models for %s", msg.from_user_id)
                     continue
 
+                if lower in ("/skills", "/listskill", "/listskills"):
+                    try:
+                        skills = agent_loop.run_coro(agent.list_skills(), timeout=30)
+                        reply = _format_skills(skills)
+                    except Exception as exc:
+                        reply = f"(codex error: {exc})"
+                    send_text_reply(client, msg.from_user_id, reply, msg.context_token)
+                    logger.info("listed skills for %s", msg.from_user_id)
+                    continue
+
                 if lower.startswith("/"):
                     first_token = lower.split()[0] if lower.split() else lower
                     suggestion = difflib.get_close_matches(
@@ -1079,6 +1105,44 @@ def main() -> None:
                 if _is_command(text):
                     logger.warning("ignoring unhandled command: %r", stripped)
                     continue
+
+                if stripped.startswith("$"):
+                    name_match = _SKILL_NAME_RE.match(stripped)
+                    if name_match:
+                        skill_name = name_match.group(1)
+                        try:
+                            skills = agent_loop.run_coro(
+                                agent.list_skills(), timeout=30
+                            )
+                        except Exception as exc:
+                            skills = []
+                            logger.warning("could not fetch skills list: %s", exc)
+                        skill_names = [skill["name"] for skill in skills]
+                        if not any(
+                            name.lower() == skill_name.lower()
+                            for name in skill_names
+                        ):
+                            suggestion = difflib.get_close_matches(
+                                skill_name, skill_names, n=1, cutoff=0.4
+                            )
+                            reply = (
+                                f"unknown skill: ${skill_name}. "
+                                f"did you mean ${suggestion[0]}?"
+                                if suggestion
+                                else (
+                                    f"unknown skill: ${skill_name}. "
+                                    "use /skills to see available skills"
+                                )
+                            )
+                            send_text_reply(
+                                client, msg.from_user_id, reply, msg.context_token
+                            )
+                            logger.info(
+                                "unknown skill from %s: %r",
+                                msg.from_user_id,
+                                skill_name,
+                            )
+                            continue
 
                 # The Codex turn can take a while to complete.  Notify the
                 # user before starting it, but keep this best-effort so a
