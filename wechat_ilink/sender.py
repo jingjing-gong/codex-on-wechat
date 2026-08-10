@@ -79,9 +79,7 @@ def send_text_chunk(
             client_id=chunk_client_id,
             message_type=MESSAGE_TYPE_BOT,
             message_state=message_state,
-            item_list=[
-                MessageItem(type=ITEM_TYPE_TEXT, text_item=TextItem(text=text))
-            ],
+            item_list=[MessageItem(type=ITEM_TYPE_TEXT, text_item=TextItem(text=text))],
             context_token=context_token,
         ),
         base_info=BaseInfo(),
