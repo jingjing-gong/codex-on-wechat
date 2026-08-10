@@ -739,6 +739,7 @@ def main() -> None:
             if item.type == ITEM_TYPE_TEXT and item.text_item:
                 text = item.text_item.text
                 logger.info("from=%s text=%r", msg.from_user_id, text)
+                delivery.send_typing(client, msg.from_user_id)
 
                 if text.strip().lower() in ("/help", "/commands"):
                     send_text_reply(
@@ -1097,21 +1098,11 @@ def main() -> None:
                             partial,
                         )
 
-                    def handle_codex_event(event) -> None:
-                        if event.method == "turn/completed":
-                            turn = getattr(event.payload, "turn", None)
-                            status = getattr(turn, "status", None)
-                            status_value = getattr(status, "value", status)
-                            if status_value in ("completed", "interrupted"):
-                                delivery.flush(client, msg.from_user_id)
-                            return
-                        delivery.send_typing(client, msg.from_user_id)
-
                     agent_loop.run_stream(
                         agent.chat_stream(
                             current_conversation,
                             text,
-                            on_event=handle_codex_event,
+                            on_event=None,
                         ),
                         send_partial,
                     )
