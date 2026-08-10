@@ -219,6 +219,8 @@ class CodexAgent:
                             continue
                         text = (getattr(item, "text", "") or "").strip()
                         if text:
+                            if emitted_text:
+                                text = f"\n\n{text}"
                             emitted_text = True
                             yield text
                     elif event.method == "turn/completed":
