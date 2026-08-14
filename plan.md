@@ -1261,6 +1261,38 @@ command receipt. User-level task ownership alone is insufficient because old
 delimiter-joined request IDs can collide when session or message components
 contain colons.
 
+### Task-scoped Agent-to-Agent requests
+
+Agents created through `/agent` may exchange `ask` requests through an
+owner-only local bridge. The bridge accepts a running `task_id`, lists only
+public peers allowed by that task's immutable EffectivePolicy, and delegates
+every send to `TaskManager.send_agent_message`; it never inserts a mailbox row
+or emits a destination event directly. A random, short-lived bearer capability
+is issued only to an authorized turn and is bound in memory to its task and
+execution IDs. SQLite rechecks both the running-task state and execution ID in
+the mailbox transaction, so another same-UID process cannot authorize itself
+with a visible task ID and a task that finishes or loses ownership between
+authorization and commit cannot send afterward.
+
+This authority begins with the explicit collaboration-capable v3 Profile.
+Profiles and tasks at v1/v2 remain deny-by-default and are not rewritten.
+Generated `/agent` aliases restored from SQLite receive the current template as
+a new immutable Profile version while retaining all older versions for queued
+and historical task snapshots. An explicit `*` peer grant means all registered
+public peers, but exact or wildcard denial still wins. The only initially
+accepted request type is `ask`.
+
+Codex discovers the bridge through per-turn context containing the current
+task ID and its unguessable execution capability. Thread-level instructions
+cannot carry these values because one policy-bound thread serves multiple
+tasks. Internal synthetic mailbox turns do not advertise the durable-task
+bridge. The Unix socket, capability binding, TaskManager policy checks,
+active-execution fence, and destination request-type declaration form the
+authorization boundary. Correlated replies return through the Agent mailbox
+and never project directly to a user channel. The CLI derives its default
+request ID from the task and logical request so retrying after a lost response
+does not enqueue duplicate work.
+
 An invocation that owns or reopens a command receipt must cover its complete
 effect-and-completion lifecycle. If monitor timeout, shutdown, or another
 in-process cancellation ends that invocation, it durably transitions a still
@@ -2042,7 +2074,7 @@ uv run pytest
 - RabbitMQ, Redis, NATS, or PostgreSQL
 - Multiple processes or machines
 - Feishu
-- Autonomous Agent collaboration
+- Unbounded Agent spawning or collaboration outside the task-scoped mailbox bridge
 - Local audio/video processing (voice uses the channel-provided transcript only)
 - Editable Profile/Mode administration UI
 - Skill installation, editing, or registry mutation from a channel command

@@ -1971,11 +1971,19 @@ class SQLiteStore:
         # registry.  Older databases contain deliberately sparse placeholders;
         # _ensure_* recognizes those rows and upgrades only that known seed,
         # while any real immutable version conflict remains fail-closed.
-        from .modes import builtin_modes, legacy_builtin_modes
+        from .modes import (
+            builtin_modes,
+            collaborative_builtin_modes,
+            legacy_builtin_modes,
+        )
         from .registry import codex_profile
 
         profile = codex_profile()
-        modes = [*legacy_builtin_modes().values(), *builtin_modes().values()]
+        modes = [
+            *legacy_builtin_modes().values(),
+            *builtin_modes().values(),
+            *collaborative_builtin_modes().values(),
+        ]
         self._ensure_profile_tx(
             conn,
             agent_id=profile.agent_id,
@@ -1996,9 +2004,9 @@ class SQLiteStore:
             )
 
     def _seed_dynamic_mode_v2(self, conn: sqlite3.Connection) -> None:
-        """Seed full-access v2 Modes for proven `/agent` aliases."""
+        """Seed current Modes for proven ``/agent`` aliases."""
 
-        from .modes import builtin_modes
+        from .modes import builtin_modes, collaborative_builtin_modes
         from .registry import DYNAMIC_AGENT_SUMMARY
 
         now = _utc_text()
@@ -2011,7 +2019,10 @@ class SQLiteStore:
             ).fetchall()
         )
         for agent_id in agent_ids:
-            for mode in builtin_modes().values():
+            for mode in (
+                *builtin_modes().values(),
+                *collaborative_builtin_modes().values(),
+            ):
                 self._ensure_mode_tx(
                     conn,
                     agent_id=agent_id,
@@ -8043,17 +8054,31 @@ class SQLiteStore:
         source_item_ordinal = cls._reply_event_field(
             event, "source_item_ordinal", None
         )
-        has_payload = bool(
-            str(cls._reply_event_field(event, "content", "") or "").strip()
-            or tuple(cls._reply_event_field(event, "attachments", ()) or ())
+        content = str(
+            cls._reply_event_field(event, "content", "") or ""
+        ).strip()
+        attachments = tuple(
+            cls._reply_event_field(event, "attachments", ()) or ()
+        )
+        stable_text = bool(
+            source_type == "agentmessage"
+            and event_type in {"agentmessage", "message"}
+            and (content or attachments)
+        )
+        # Image-generation output reaches this boundary only after its bytes
+        # have been promoted into a registered managed attachment.  Do not
+        # broaden this to arbitrary tool items or path-bearing diagnostics.
+        stable_image = bool(
+            source_type == "imagegeneration"
+            and event_type == "imagegeneration"
+            and attachments
+            and not content
         )
         return bool(
             visibility == EventVisibility.USER.value
             and not cls._reply_event_field(event, "destination_agent_id", None)
-            and source_type == "agentmessage"
-            and event_type in {"agentmessage", "message"}
             and (source_item_id or source_item_ordinal is not None)
-            and has_payload
+            and (stable_text or stable_image)
         )
 
     @classmethod
@@ -13309,6 +13334,8 @@ class SQLiteStore:
         session_id: str = "default",
         original_mailbox_id: str | None = None,
         original_claim_token: str | None = None,
+        require_active_task: bool = False,
+        required_execution_id: str | None = None,
         now: datetime | str | None = None,
     ) -> AgentMailboxItem:
         """Create a correlated Agent mailbox message, never a user delivery."""
@@ -13365,6 +13392,31 @@ class SQLiteStore:
                             raise StoreError(
                                 f"mailbox response claim conflicts ({field})"
                             )
+                if require_active_task or required_execution_id is not None:
+                    if task_id is None:
+                        raise StoreError("Agent bridge requires a task ID")
+                    active_task = conn.execute(
+                        """SELECT t.state, (
+                                   SELECT e.execution_id
+                                   FROM task_executions AS e
+                                   WHERE e.task_id=t.task_id
+                                   ORDER BY e.attempt DESC LIMIT 1
+                               ) AS execution_id
+                           FROM tasks AS t WHERE t.task_id=?""",
+                        (task_id,),
+                    ).fetchone()
+                    if active_task is None:
+                        raise NotFoundError(f"task not found: {task_id}")
+                    if require_active_task and str(
+                        active_task["state"] or ""
+                    ) != "running":
+                        raise StoreError("Agent bridge requires a running task")
+                    if required_execution_id is not None and str(
+                        active_task["execution_id"] or ""
+                    ) != str(required_execution_id):
+                        raise StoreError(
+                            "Agent bridge capability does not match the task execution"
+                        )
                 attachment_values = self._input_attachment_values(payload_snapshot)
                 # A request ID is logical across retries; return an existing
                 # destination row rather than enqueueing duplicate work.  Do
@@ -13434,14 +13486,28 @@ class SQLiteStore:
                 if task_id is not None:
                     task_scope = conn.execute(
                         "SELECT agent_id, channel, bot_id, external_user_id, "
-                        "session_id, conversation_id, reply_target_json, mode_id, "
+                        "session_id, conversation_id, reply_target_json, mode_id, state, "
                         "profile_version, policy_version, model, reasoning_effort, "
-                        "metadata_json "
+                        "metadata_json, ("
+                        "    SELECT e.execution_id FROM task_executions AS e "
+                        "    WHERE e.task_id=tasks.task_id "
+                        "    ORDER BY e.attempt DESC LIMIT 1"
+                        ") AS execution_id "
                         "FROM tasks WHERE task_id=?",
                         (task_id,),
                     ).fetchone()
                     if task_scope is None:
                         raise NotFoundError(f"task not found: {task_id}")
+                    if require_active_task and str(task_scope["state"] or "") != "running":
+                        raise StoreError("Agent bridge requires a running task")
+                    if required_execution_id is not None and str(
+                        task_scope["execution_id"] or ""
+                    ) != str(required_execution_id):
+                        raise StoreError(
+                            "Agent bridge capability does not match the task execution"
+                        )
+                elif require_active_task or required_execution_id is not None:
+                    raise StoreError("Agent bridge requires a task ID")
                 resolved_execution_snapshot = self._mailbox_execution_snapshot_tx(
                     conn,
                     destination_agent_id=destination_agent_id,
@@ -14647,6 +14713,57 @@ class SQLiteStore:
                 if row is not None
                 else (default_mode_id, int(default_policy_version))
             )
+        return await self._call(op)
+
+    async def upgrade_collaboration_chat_preferences(
+        self,
+        agent_ids: Iterable[str],
+        *,
+        now: datetime | str | None = None,
+    ) -> int:
+        """Move mutable chat-v2 selections to an available chat-v3 mode.
+
+        Profile, task, and conversation snapshots are immutable policy
+        history.  ``session_modes`` instead selects the mode for a future
+        task, so restored collaborative aliases may safely adopt the explicit
+        v3 chat definition after that definition has been persisted.
+        """
+
+        normalized_ids = tuple(
+            sorted(
+                {
+                    str(agent_id or "").strip()
+                    for agent_id in agent_ids or ()
+                    if str(agent_id or "").strip()
+                }
+            )
+        )
+        if not normalized_ids:
+            return 0
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> int:
+            updated = 0
+            with _transaction(conn):
+                for agent_id in normalized_ids:
+                    cursor = conn.execute(
+                        """UPDATE session_modes
+                           SET policy_version=3, updated_at=?
+                           WHERE agent_id=?
+                             AND mode_id='chat'
+                             AND policy_version=2
+                             AND EXISTS (
+                                 SELECT 1
+                                 FROM agent_modes
+                                 WHERE agent_modes.agent_id=session_modes.agent_id
+                                   AND agent_modes.mode_id='chat'
+                                   AND agent_modes.policy_version=3
+                             )""",
+                        (now_text, agent_id),
+                    )
+                    updated += max(int(cursor.rowcount), 0)
+            return updated
+
         return await self._call(op)
 
     async def set_session_model_preference(

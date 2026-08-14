@@ -404,13 +404,49 @@ class TaskManager:
                     profile = None
                 mode_id = _get(profile, "default_mode_id", None)
         mode_id = str(mode_id or self.default_mode_id).strip().lower()
-        mode = self.mode_registry.get(mode_id)
+        mode = self._mode_for_agent(agent_id, mode_id)
         version = _get(mode, "policy_version", self.policy_version)
         try:
             version = int(version)
         except (TypeError, ValueError):
             version = int(self.policy_version)
         return mode_id, version
+
+    def _mode_for_agent(self, agent_id: str, mode_id: str) -> Any:
+        """Resolve the latest mode compatible with an Agent's Profile grant."""
+
+        mode_id = str(mode_id or "").strip().lower()
+        mode = self.mode_registry.get(mode_id)
+        if mode is None:
+            raise KeyError(f"unknown Agent mode: {mode_id}")
+        # Chat v3 exists solely for the explicit collaborative deployment
+        # Profile. Preserve chat v2 semantics for generic/custom profiles that
+        # may have exact ACLs but intentionally keep ordinary chat non-agentic.
+        if mode_id == "chat" and int(_get(mode, "policy_version", 1)) >= 3:
+            profile = self.registry.profile(agent_id)
+            if not self._profile_enables_dynamic_collaboration(profile):
+                legacy = self.mode_registry.get("chat", 2)
+                if legacy is not None:
+                    mode = legacy
+        return mode
+
+    @staticmethod
+    def _profile_enables_dynamic_collaboration(profile: Any) -> bool:
+        """Recognize only the explicit v3 wildcard/ask Profile grant."""
+
+        try:
+            version = int(_get(profile, "profile_version", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        allowed_peers = frozenset(_get(profile, "allowed_peers", ()) or ())
+        allowed_requests = frozenset(
+            _get(profile, "allowed_request_types", ()) or ()
+        )
+        return bool(
+            version >= 3
+            and "*" in allowed_peers
+            and "ask" in allowed_requests
+        )
 
     def _default_profile_version(self, agent_id: str) -> int:
         """Resolve a registered Agent profile version for new task snapshots."""
@@ -615,6 +651,7 @@ class TaskManager:
             # a restart.
             await self._restore_dynamic_agents()
             await self._persist_registry_definitions()
+            await self._upgrade_collaboration_mode_preferences()
             # ``AgentRegistry.start`` rolls back runtimes it started itself,
             # but a failure can still occur before it returns.  Treat the
             # attempt as owned by this lifecycle so the outer rollback closes
@@ -656,6 +693,31 @@ class TaskManager:
                 except Exception:
                     logger.debug("failed to roll back store startup", exc_info=True)
             raise
+
+    async def _upgrade_collaboration_mode_preferences(self) -> None:
+        """Move mutable chat selections to v3 for collaboration Profiles.
+
+        Profile and task snapshots remain immutable. ``session_modes`` is only
+        a future-task preference, so an alias restored onto the explicit v3
+        collaboration Profile should not remain silently pinned to chat v2's
+        mode-level messaging denial.
+        """
+
+        upgrade = getattr(
+            self.store, "upgrade_collaboration_chat_preferences", None
+        )
+        if upgrade is None:
+            return
+        agent_ids: list[str] = []
+        for descriptor in self.registry.list():
+            agent_id = str(_get(descriptor, "agent_id", "") or "").strip()
+            if not agent_id:
+                continue
+            profile = self.registry.profile(agent_id)
+            if self._profile_enables_dynamic_collaboration(profile):
+                agent_ids.append(agent_id)
+        if agent_ids:
+            await _call_compatible(upgrade, tuple(sorted(agent_ids)))
 
     def _live_reconcile_method(self) -> Any | None:
         """Return only a conservative same-process lease recovery method."""
@@ -889,7 +951,11 @@ class TaskManager:
             resolved_policy_version = int(route_mode[1])
         else:
             resolved_policy_version = int(
-                _get(self.mode_registry.get(resolved_mode), "policy_version", default_mode_version)
+                _get(
+                    self._mode_for_agent(resolved_agent, resolved_mode),
+                    "policy_version",
+                    default_mode_version,
+                )
             )
         preferred_model, preferred_effort = await self._get_model_for_target(
             target_for_route, resolved_agent
@@ -1176,7 +1242,11 @@ class TaskManager:
             resolved_policy_version = int(route_mode[1])
         else:
             resolved_policy_version = int(
-                _get(self.mode_registry.get(resolved_mode), "policy_version", default_mode_version)
+                _get(
+                    self._mode_for_agent(resolved_agent, resolved_mode),
+                    "policy_version",
+                    default_mode_version,
+                )
             )
         preferred_model, preferred_effort = await self._get_model_for_target(
             target, resolved_agent
@@ -1794,10 +1864,27 @@ class TaskManager:
                 register_profile(value)
         if not candidates:
             return
-        runtime, _template = self._dynamic_template()
-        for agent_id, (_version, profile) in sorted(candidates.items()):
+        runtime, template = self._dynamic_template()
+        for agent_id, (version, profile) in sorted(candidates.items()):
             if self.registry.registration(agent_id) is not None:
                 continue
+            # Generated aliases track the trusted template for *future* tasks,
+            # while every older immutable Profile remains registered for queued
+            # and historical task snapshots.  A version bump is the only safe
+            # way to add collaboration authority; never rewrite an existing
+            # profile row in place.
+            desired = self._named_profile(agent_id, template)
+            desired_version = int(desired.profile_version)
+            if desired_version > int(version):
+                register_profile = getattr(self.registry, "register_profile", None)
+                if register_profile is not None:
+                    register_profile(desired)
+                profile = desired
+            elif desired_version == int(version) and desired != profile:
+                raise ValueError(
+                    "dynamic Agent profile metadata conflicts: "
+                    f"{agent_id}@{desired_version}"
+                )
             self.registry.register(
                 agent_id,
                 _NamedAgentRuntime(agent_id, runtime),
@@ -2736,7 +2823,7 @@ class TaskManager:
                         # complete authorization provenance.
                         fallback = (default_mode_id, default_policy_version)
                         if fallback[0] == "execute":
-                            chat = self.mode_registry.get("chat")
+                            chat = self._mode_for_agent(agent_id, "chat")
                             if chat is None:
                                 raise PermissionError(
                                     "unauthorized execute mode has no safe fallback"
@@ -2957,13 +3044,6 @@ class TaskManager:
         self._assert_loop()
         session_id = session_id or "default"
         mode_id = str(mode_id).strip().lower()
-        mode = self.mode_registry.require(mode_id)
-        decision = self.policy_engine.authorize_mode(
-            mode,
-            actor=actor or external_user_id,
-            explicit=explicit,
-        )
-        decision.require()
         active = agent_id or await self.get_active_agent(
             channel=channel,
             bot_id=bot_id,
@@ -2974,6 +3054,13 @@ class TaskManager:
             active = self._canonical_route_agent(active)
         active = str(active).strip()
         self.registry.require(active)
+        mode = self._mode_for_agent(active, mode_id)
+        decision = self.policy_engine.authorize_mode(
+            mode,
+            actor=actor or external_user_id,
+            explicit=explicit,
+        )
+        decision.require()
         profile_getter = getattr(self.registry, "profile", None)
         profile = profile_getter(active) if profile_getter is not None else None
         if mode.mode_id == "execute" and profile is None:
@@ -3206,6 +3293,8 @@ class TaskManager:
         source_agent_id: str,
         *,
         task_id: str | None = None,
+        require_active_task: bool = False,
+        required_execution_id: str | None = None,
         channel: str = "",
         bot_id: str = "",
         external_user_id: str = "",
@@ -3217,6 +3306,20 @@ class TaskManager:
                 raise PermissionError(f"task unavailable: {task_id}")
             if str(_get(task, "agent_id", "") or "") != str(source_agent_id):
                 raise PermissionError("source Agent does not own the task")
+            if required_execution_id is not None and str(
+                _get(task, "execution_id", "") or ""
+            ) != str(required_execution_id):
+                raise PermissionError(
+                    "Agent bridge capability does not match the task execution"
+                )
+            if require_active_task:
+                state = getattr(
+                    _get(task, "state", _get(task, "status", "")),
+                    "value",
+                    _get(task, "state", _get(task, "status", "")),
+                )
+                if str(state or "").strip().lower() != "running":
+                    raise PermissionError("Agent bridge requires a running task")
 
             task_target = self._coerce_target(_get(task, "reply_target", None))
             supplied_scope = (channel, bot_id, external_user_id)
@@ -3277,6 +3380,10 @@ class TaskManager:
                 raise PermissionError("task policy snapshot is unavailable")
             return self.policy_engine.effective_policy(profile, mode)
 
+        if required_execution_id is not None:
+            raise PermissionError(
+                "Agent bridge capability requires a durable task"
+            )
         profile = self.registry.profile(source_agent_id)
         if profile is None or not profile.enabled:
             raise PermissionError(f"Agent profile unavailable: {source_agent_id}")
@@ -3292,6 +3399,55 @@ class TaskManager:
         if mode is None:
             raise PermissionError(f"Agent mode unavailable: {mode_id}@{version}")
         return self.policy_engine.effective_policy(profile, mode)
+
+    async def list_agent_peers(
+        self,
+        task_id: str,
+        *,
+        request_type: str = "ask",
+        require_active_task: bool = True,
+        required_execution_id: str | None = None,
+    ) -> list[Any]:
+        """Return public peers authorized by one immutable task snapshot.
+
+        This is the discovery half of the local Agent bridge.  It exposes only
+        public descriptors, never Profile prompts or private configuration, and
+        applies the same mode/Profile/request-type gates as message enqueueing.
+        """
+
+        self._assert_loop()
+        task = await self.get_task(str(task_id))
+        if task is None:
+            raise PermissionError(f"task unavailable: {task_id}")
+        source = str(_get(task, "agent_id", "") or "").strip()
+        if not source:
+            raise PermissionError("task Agent is unavailable")
+        request_kind = str(request_type or "ask").strip()
+        policy = await self._collaboration_policy(
+            source,
+            task_id=str(task_id),
+            require_active_task=require_active_task,
+            required_execution_id=required_execution_id,
+        )
+        self.policy_engine.check_request_type(policy, request_kind).require()
+
+        peers: list[Any] = []
+        for descriptor in self.registry.list():
+            destination = str(_get(descriptor, "agent_id", "") or "").strip()
+            if not destination or destination == source:
+                continue
+            if not self.policy_engine.check_peer(policy, destination).allowed:
+                continue
+            accepted = frozenset(
+                _get(descriptor, "accepted_request_types", ()) or ()
+            )
+            if request_kind not in accepted:
+                continue
+            public = getattr(descriptor, "peer_descriptor", None)
+            peers.append(public() if public is not None else descriptor)
+        return peers
+
+    agent_peers = list_agent_peers
 
     async def _audit_collaboration(
         self,
@@ -3535,6 +3691,8 @@ class TaskManager:
         session_id: str = "default",
         agent_id: str | None = None,
         actor: str = "",
+        require_active_task: bool = False,
+        required_execution_id: str | None = None,
         **_: Any,
     ) -> Any:
         """Authorize and enqueue an Agent-directed message.
@@ -3573,6 +3731,8 @@ class TaskManager:
             policy = await self._collaboration_policy(
                 source,
                 task_id=task_id,
+                require_active_task=require_active_task,
+                required_execution_id=required_execution_id,
                 channel=channel,
                 bot_id=bot_id,
                 external_user_id=external_user_id,
@@ -3637,6 +3797,8 @@ class TaskManager:
             task_id=task_id,
             payload=envelope_payload,
             execution_snapshot=execution_snapshot,
+            require_active_task=require_active_task,
+            required_execution_id=required_execution_id,
         )
         await self._audit_collaboration(
             allowed=True,

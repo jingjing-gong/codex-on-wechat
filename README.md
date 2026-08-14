@@ -87,6 +87,16 @@ notifications for the destination Agent are disabled. Each non-empty text item
 identifies its source as `<agent-id>: <message>` before 3,000-character reply
 chunking.
 
+New tasks on the durable v3 Agent profile can also contact other Agents created
+with `/agent`. Codex receives a task-scoped local `list`/`send` capability; the
+command carries a short-lived, unguessable token bound to the current task
+execution. The bridge rechecks that execution, the running task's immutable
+mode, peer ACL, and request type before writing to the durable Agent mailbox.
+Repeated identical CLI sends use a stable request ID. Agent mailbox traffic is
+internal and never bypasses the user outbox to send directly to WeChat. Replies
+return to the requesting Agent's conversation without creating an automatic
+reply loop.
+
 ### Shell access
 
 `/sh <command>` executes a shell through `/bin/sh` in the configured bot
@@ -109,6 +119,14 @@ reject the message and typing does not consume one of the ten reply slots.
 Text and voice messages with a non-empty channel transcript create tasks.
 Uploaded files are staged in managed storage and acknowledged without
 implicitly executing their caption.
+
+Completed Codex image-generation items are sent as native WeChat images. The
+runtime accepts the SDK's workspace-local `savedPath` or a bounded
+`data:image/...;base64` result, verifies PNG/JPEG/GIF/WebP bytes, copies them to
+managed attachment storage, and then uses the durable CDN/media worker. Paths
+outside `CODEX_WECHAT_WORKSPACE`, symlinks, spoofed image bytes, and oversized
+outputs fail closed. Delivery retries reuse the same attachment and WeChat
+reply identity.
 Task results and user deliveries survive restart. Work interrupted by an
 uncertain process exit becomes orphaned and requires explicit `/retry`.
 
@@ -129,6 +147,7 @@ The durable runtime recognizes these environment variables:
 | `CODEX_WECHAT_DB` | `~/.codex-wechat-bot/runtime.sqlite3` | SQLite runtime database |
 | `CODEX_WECHAT_ATTACHMENTS` | `~/.codex-wechat-bot/attachments` | Managed attachment root |
 | `CODEX_WECHAT_WORKSPACE` | `~/.codex-on-wechat/workspace` | Shared Codex and `/sh` working directory |
+| `CODEX_WECHAT_AGENT_SOCKET` | `<database>.agent.sock` | Owner-only local Agent mailbox bridge |
 | `CODEX_WECHAT_WORKERS` | `1` | Concurrent task workers |
 | `CODEX_WECHAT_TURN_TIMEOUT` | unset | Optional Codex turn timeout in seconds |
 | `CODEX_WECHAT_SKILL_ROOTS` | unset | Path-separated trusted skill roots |

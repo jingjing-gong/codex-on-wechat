@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
+import shlex
 import time
 import uuid
 from dataclasses import dataclass
@@ -152,6 +153,9 @@ class CodexRuntime:
         skill_root: str | Path | None = None,
         trusted_skill_root: str | Path | None = None,
         trusted_skill_roots: Sequence[str | Path] | None = None,
+        image_output_publisher: Callable[..., Any] | None = None,
+        agent_bridge_command: Sequence[str] | str | None = None,
+        agent_bridge_capability_issuer: Callable[[AgentTask], str] | None = None,
     ) -> None:
         self.model = model
         self.cwd = cwd or default_workspace()
@@ -204,6 +208,19 @@ class CodexRuntime:
             Path(root).expanduser().resolve() for root in roots if str(root).strip()
         )
         self._profile_resolver = profile_resolver
+        # The SDK supplies generated-image bytes/path metadata, but durable
+        # publication belongs to the embedding because it owns the attachment
+        # store and SQLite ACL.  The callback returns one managed attachment ID.
+        self._image_output_publisher = image_output_publisher
+        if isinstance(agent_bridge_command, str):
+            self._agent_bridge_command = agent_bridge_command.strip()
+        elif agent_bridge_command:
+            self._agent_bridge_command = shlex.join(
+                str(value) for value in agent_bridge_command
+            )
+        else:
+            self._agent_bridge_command = ""
+        self._agent_bridge_capability_issuer = agent_bridge_capability_issuer
 
     # ------------------------------------------------------------------
     # Lifecycle and state ownership
@@ -734,6 +751,7 @@ class CodexRuntime:
             # call.  Revalidating here minimizes the mutation window between
             # hashing the complete bundle and handing its path to the SDK.
             input_value = self._translate_input(task.inputs)
+            input_value = self._with_agent_bridge_context(task, input_value)
             turn = await self._await_with_deadline(
                 self._start_turn(binding.thread, input_value, kwargs), deadline
             )
@@ -760,6 +778,12 @@ class CodexRuntime:
         # execution, so a byte-for-byte replay is ignored and conflicting
         # reuse fails the turn before it can append a second reply candidate.
         completed_items_by_id: dict[str, tuple[str, str, tuple[Any, ...]]] = {}
+        # Image publication copies bytes and registers durable metadata, so it
+        # must not run twice before the ordinary completed-event deduplicator
+        # sees a replay. Cache the first publication by immutable SDK item ID.
+        completed_images_by_id: dict[
+            str, tuple[tuple[str, str], tuple[AgentEvent, ...]]
+        ] = {}
         text_parts: list[str] = []
         delta_parts: list[str] = []
         stream_deltas = task.task_id in self._streaming_task_ids
@@ -777,13 +801,14 @@ class CodexRuntime:
                     else getattr(notification, "method", "")
                 ).lower()
                 is_completed_item = method in {"item/completed", "item_completed"}
-                extracted = self._events_from_notification(
+                extracted = await self._events_for_notification(
                     task,
                     notification,
                     sequence,
                     source_item_ordinal=(
                         completed_item_ordinal if is_completed_item else None
                     ),
+                    completed_images_by_id=completed_images_by_id,
                 )
                 if is_completed_item:
                     completed_item_ordinal += 1
@@ -917,7 +942,15 @@ class CodexRuntime:
                 text_parts.append(final_event.content)
                 if not (stream_deltas and delta_parts):
                     await emit_if_awaitable(emit, final_event)
-        if status == "completed" and not text_parts and not interrupted:
+        has_media_output = any(
+            tuple(event.attachments or ()) for event in emitted
+        )
+        if (
+            status == "completed"
+            and not text_parts
+            and not has_media_output
+            and not interrupted
+        ):
             status = "failed"
             error_text = error_text or "Codex returned an empty response"
         return AgentResult(
@@ -1494,6 +1527,71 @@ class CodexRuntime:
             return items
         return value
 
+    def _with_agent_bridge_context(self, task: AgentTask, value: Any) -> Any:
+        """Prepend a task-scoped collaboration capability when policy allows.
+
+        Thread developer instructions are policy-bound and may be reused by
+        several tasks, so they cannot safely carry a task ID.  This context is
+        attached to the individual turn instead.  The local bridge revalidates
+        the running task and its immutable policy before every list/send call;
+        the text here is discovery, not authorization.
+        """
+
+        command = self._agent_bridge_command
+        issuer = self._agent_bridge_capability_issuer
+        policy = self._effective_policy_for_task(task)
+        can_send = (
+            policy.get("can_send_agent_messages")
+            if isinstance(policy, Mapping)
+            else getattr(policy, "can_send_agent_messages", None)
+            if policy is not None
+            else None
+        )
+        # Discovery is exposed only by an explicit immutable policy grant.
+        # Falling back to a raw mode would advertise the bridge to legacy
+        # v1/v2 tasks whose Profile ACL intentionally denies collaboration.
+        metadata = task.metadata if isinstance(task.metadata, Mapping) else {}
+        # Mailbox workers create claim-scoped synthetic tasks rather than rows
+        # in the durable task table. Do not advertise a task bridge that would
+        # necessarily fail active-task validation for those internal turns.
+        if (
+            not command
+            or issuer is None
+            or can_send is not True
+            or bool(metadata.get("internal_mailbox"))
+        ):
+            return value
+        task_id = str(task.task_id or "").strip()
+        execution_id = str(task.execution_id or "").strip()
+        if not task_id or not execution_id:
+            return value
+        capability = str(issuer(task) or "").strip()
+        if not capability:
+            raise RuntimeError("Agent bridge capability issuer returned no token")
+        quoted_task_id = shlex.quote(task_id)
+        quoted_capability = shlex.quote(capability)
+        context_text = (
+            "Codex-on-WeChat collaboration capability for this turn:\n"
+            "You may communicate with Agents created by /agent through the "
+            "durable local mailbox. Discover authorized peers with:\n"
+            f"  {command} --task-id {quoted_task_id} "
+            f"--capability {quoted_capability} list\n"
+            "Send a request with:\n"
+            f"  {command} --task-id {quoted_task_id} "
+            f"--capability {quoted_capability} send <agent-id> "
+            "'<message>'\n"
+            "Use only these commands for named-Agent communication. The bridge "
+            "enforces this task's immutable ACL and returns a durable request ID."
+        )
+        context = TextInput(context_text) if TextInput is not None else context_text
+        if isinstance(value, list):
+            return [context, *value]
+        if isinstance(value, tuple):
+            return [context, *value]
+        if value in (None, ""):
+            return context
+        return [context, value]
+
     def _media_context_input(self, media: Sequence[Any]) -> Any:
         """Build a textual SDK input that explicitly labels unsupported media."""
         import json
@@ -1784,6 +1882,171 @@ class CodexRuntime:
         if isinstance(error, Mapping):
             error = error.get("message", error)
         return str(getattr(error, "message", None) or error or "Codex turn failed")
+
+    @classmethod
+    def _completed_image_output(cls, notification: Any) -> dict[str, Any] | None:
+        """Extract one successful SDK image-generation completion.
+
+        ``ImageGenerationThreadItem`` is a tool item, but unlike command and
+        reasoning diagnostics it has an explicit user-visible image output.
+        Keep this parser narrow so a generic tool path/result cannot become a
+        channel attachment.
+        """
+
+        method = str(
+            notification.get("method", "")
+            if isinstance(notification, Mapping)
+            else getattr(notification, "method", "")
+        ).lower()
+        if method not in {"item/completed", "item_completed"}:
+            return None
+        payload = cls._payload(notification)
+        envelope = (
+            payload.get("item", payload)
+            if isinstance(payload, Mapping)
+            else getattr(payload, "item", payload)
+        )
+        item = (
+            envelope.get("root", envelope)
+            if isinstance(envelope, Mapping)
+            else getattr(envelope, "root", envelope)
+        )
+
+        def field(value: Any, *names: str) -> Any:
+            if isinstance(value, Mapping):
+                for name in names:
+                    if name in value:
+                        return value[name]
+                return None
+            for name in names:
+                if hasattr(value, name):
+                    return getattr(value, name)
+            return None
+
+        raw_kind = str(field(item, "type") or "")
+        kind = "".join(
+            character for character in raw_kind.lower() if character.isalnum()
+        )
+        if kind != "imagegeneration":
+            return None
+        status = str(field(item, "status") or "").strip().lower()
+        if status in {"failed", "error", "cancelled", "canceled"}:
+            return {}
+        item_id = field(item, "id", "item_id", "itemId")
+        if not item_id:
+            item_id = field(envelope, "id", "item_id", "itemId")
+
+        def scalar_text(value: Any) -> str:
+            # The pinned SDK represents absolute paths as a Pydantic RootModel;
+            # ``str(AbsolutePathBuf)`` renders ``root='...'`` rather than the
+            # filesystem path. Mapping-shaped protocol shims use the same root
+            # envelope, so unwrap either form before crossing the SDK boundary.
+            for _ in range(3):
+                if isinstance(value, Mapping) and set(value) == {"root"}:
+                    value = value["root"]
+                    continue
+                if not isinstance(value, (str, bytes, bytearray)) and hasattr(
+                    value, "root"
+                ):
+                    value = getattr(value, "root")
+                    continue
+                break
+            return str(value or "").strip()
+
+        return {
+            "source_item_id": str(item_id or "").strip(),
+            "source_item_type": kind,
+            "saved_path": scalar_text(field(item, "saved_path", "savedPath")),
+            "result": scalar_text(field(item, "result")),
+        }
+
+    async def _events_for_notification(
+        self,
+        task: AgentTask,
+        notification: Any,
+        sequence: int,
+        *,
+        source_item_ordinal: int | None = None,
+        completed_images_by_id: dict[
+            str, tuple[tuple[str, str], tuple[AgentEvent, ...]]
+        ]
+        | None = None,
+    ) -> list[AgentEvent]:
+        image = self._completed_image_output(notification)
+        if image is None:
+            return self._events_from_notification(
+                task,
+                notification,
+                sequence,
+                source_item_ordinal=source_item_ordinal,
+            )
+        if not image:
+            return []
+        source_item_id = str(image["source_item_id"] or "").strip()
+        raw_snapshot = (str(image["saved_path"]), str(image["result"]))
+        if source_item_id and completed_images_by_id is not None:
+            previous = completed_images_by_id.get(source_item_id)
+            if previous is not None:
+                previous_snapshot, previous_events = previous
+                if previous_snapshot != raw_snapshot:
+                    raise RuntimeError(
+                        "Codex completed item identity conflicts: "
+                        f"{source_item_id}"
+                    )
+                return list(previous_events)
+        publisher = self._image_output_publisher
+        if publisher is None:
+            logger.warning(
+                "Codex produced image item %s without a managed image publisher",
+                image["source_item_id"] or source_item_ordinal,
+            )
+            return []
+        kwargs = {
+            "source_item_id": image["source_item_id"],
+            "source_item_ordinal": source_item_ordinal,
+            "saved_path": image["saved_path"],
+            "result": image["result"],
+        }
+        published = publisher(
+            task,
+            **self._supported_kwargs(publisher, kwargs),
+        )
+        if inspect.isawaitable(published):
+            published = await published
+        if isinstance(published, Mapping):
+            attachment_id = published.get(
+                "attachment_id", published.get("id", "")
+            )
+        else:
+            attachment_id = getattr(published, "attachment_id", published)
+        attachment_id = str(attachment_id or "").strip()
+        if not attachment_id:
+            raise RuntimeError("managed image publisher returned no attachment ID")
+        events = [
+            AgentEvent(
+                task_id=task.task_id,
+                sequence=sequence,
+                event_type="image_generation",
+                visibility=EventVisibility.USER,
+                priority=int(EventPriority.NORMAL),
+                content="",
+                attachments=(attachment_id,),
+                execution_id=task.execution_id or None,
+                source_item_id=image["source_item_id"] or None,
+                source_item_type=image["source_item_type"],
+                source_item_ordinal=(
+                    sequence
+                    if source_item_ordinal is None
+                    else int(source_item_ordinal)
+                ),
+            )
+        ]
+        if source_item_id and completed_images_by_id is not None:
+            completed_images_by_id[source_item_id] = (
+                raw_snapshot,
+                tuple(events),
+            )
+        return events
 
     @classmethod
     def _events_from_notification(

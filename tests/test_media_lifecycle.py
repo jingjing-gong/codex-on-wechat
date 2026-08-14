@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,7 +18,11 @@ from src.channels.wechat import (
     WeChatMediaDeliveryWorker,
     send_media_delivery,
 )
-from src.runtime.media import AttachmentStore
+from src.runtime.media import (
+    AttachmentError,
+    AttachmentStore,
+    ManagedImageOutputPublisher,
+)
 from src.runtime.models import InboundMessage, MediaDeliveryState
 from src.runtime.sqlite_store import InvalidTransition, SQLiteStore, StoreError
 from wechat_ilink.types import ITEM_TYPE_IMAGE, ITEM_TYPE_TEXT
@@ -81,6 +87,134 @@ def test_process_local_attachment_reference_replay_is_idempotent(tmp_path):
     ]
 
 
+def test_generated_image_publisher_manages_path_and_data_outputs_idempotently(
+    tmp_path,
+):
+    async def scenario() -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        managed_root = tmp_path / "attachments"
+        source = workspace / "generated.png"
+        png = b"\x89PNG\r\n\x1a\ngenerated-image"
+        source.write_bytes(png)
+        store = SQLiteStore(
+            tmp_path / "runtime.sqlite",
+            attachment_root=managed_root,
+        )
+        await store.initialize()
+        files = AttachmentStore(
+            managed_root,
+            reference_checker=store.attachment_referenced,
+        )
+        publisher = ManagedImageOutputPublisher(
+            files,
+            store,
+            workspace_root=workspace,
+        )
+        task = SimpleNamespace(
+            task_id="task-1",
+            execution_id="execution-1",
+            agent_id="codex",
+            reply_target=SimpleNamespace(
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            ),
+        )
+        try:
+            attachment_id = await publisher(
+                task,
+                source_item_id="image-item-1",
+                source_item_ordinal=0,
+                saved_path=str(source),
+            )
+            replay = await publisher(
+                task,
+                source_item_id="image-item-1",
+                source_item_ordinal=0,
+                saved_path=str(source),
+            )
+            assert replay == attachment_id
+            stored = await store.get_attachment(attachment_id)
+            assert stored is not None
+            assert stored.mime_type == "image/png"
+            assert stored.local_path.parent == managed_root.resolve()
+            assert stored.local_path != source
+            assert stored.local_path.read_bytes() == png
+            assert await store.can_access_attachment(
+                attachment_id,
+                agent_id="codex",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+
+            data_id = await publisher(
+                task,
+                source_item_id="image-item-2",
+                source_item_ordinal=1,
+                result=(
+                    "data:image/png;base64,"
+                    + base64.b64encode(png).decode("ascii")
+                ),
+            )
+            assert data_id != attachment_id
+            assert files.read_bytes(data_id) == png
+
+            outside = tmp_path / "outside.png"
+            outside.write_bytes(png)
+            with pytest.raises(AttachmentError, match="outside"):
+                await publisher(
+                    task,
+                    source_item_id="image-item-3",
+                    source_item_ordinal=2,
+                    saved_path=str(outside),
+                )
+
+            nested = workspace / "nested"
+            nested.mkdir()
+            nested_source = nested / "nested.png"
+            nested_source.write_bytes(png)
+            linked_parent = workspace / "linked-parent"
+            linked_parent.symlink_to(nested, target_is_directory=True)
+            with pytest.raises(AttachmentError, match="unavailable"):
+                await publisher(
+                    task,
+                    source_item_id="image-item-symlink",
+                    source_item_ordinal=3,
+                    saved_path=str(linked_parent / "nested.png"),
+                )
+
+            fifo = workspace / "not-an-image.fifo"
+            fifo.unlink(missing_ok=True)
+            os.mkfifo(fifo)
+            with pytest.raises(AttachmentError, match="regular file"):
+                await asyncio.wait_for(
+                    publisher(
+                        task,
+                        source_item_id="image-item-fifo",
+                        source_item_ordinal=4,
+                        saved_path=str(fifo),
+                    ),
+                    timeout=1,
+                )
+
+            source.write_bytes(b"\x89PNG\r\n\x1a\nchanged-image")
+            with pytest.raises(AttachmentError, match="conflicts"):
+                await publisher(
+                    task,
+                    source_item_id="image-item-1",
+                    source_item_ordinal=0,
+                    saved_path=str(source),
+                )
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
 def test_media_send_requires_send_pending_checkpoint(tmp_path):
     async def scenario() -> None:
         store = SQLiteStore(tmp_path / "runtime.sqlite", attachment_root=tmp_path / "attachments")
@@ -129,6 +263,72 @@ def test_media_send_requires_send_pending_checkpoint(tmp_path):
             )
         finally:
             await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_ciphertext_size_survives_store_restart_before_wechat_send(tmp_path):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+        root = tmp_path / "attachments"
+        first = SQLiteStore(database, attachment_root=root)
+        await first.initialize()
+        files = AttachmentStore(root)
+        stored = files.put_bytes(
+            b"\x89PNG\r\n\x1a\nrestart-image",
+            attachment_id="restart-image",
+        )
+        await first.register_attachment(stored, kind="image")
+        media = await first.create_outgoing_media(
+            attachment_id=stored.attachment_id,
+            channel="wechat",
+            bot_id="bot",
+            external_user_id="user",
+            agent_id="codex",
+            media_id="restart-media-op",
+            idempotency_key="restart-media-op",
+        )
+        claim = (await first.claim_outgoing_media("uploader"))[0]
+        assert await first.transition_outgoing_media(
+            media.media_id,
+            MediaDeliveryState.UPLOADED,
+            claim_token=claim.claim_token,
+            remote_id="encrypted-query",
+            upload_param="upload-query",
+            encryption_key="00" * 16,
+            metadata={"cipher_size": 32},
+        )
+        assert await first.transition_outgoing_media(
+            media.media_id,
+            MediaDeliveryState.SEND_PENDING,
+            claim_token=claim.claim_token,
+        )
+        await first.close()
+
+        second = SQLiteStore(database, attachment_root=root)
+        await second.initialize()
+        try:
+            restored = await second.get_outgoing_media(media.media_id)
+            assert restored is not None
+            assert restored.metadata["cipher_size"] == 32
+
+            class Client:
+                bot_id = "bot"
+
+                def __init__(self) -> None:
+                    self.requests = []
+
+                def send_message(self, request):
+                    self.requests.append(request)
+                    return SimpleNamespace(ret=0, errcode=0, errmsg="")
+
+            client = Client()
+            assert send_media_delivery(client, restored)
+            item = client.requests[0].msg.item_list[0]
+            assert item.type == ITEM_TYPE_IMAGE
+            assert item.image_item.mid_size == 32
+        finally:
+            await second.close()
 
     asyncio.run(scenario())
 
@@ -625,6 +825,7 @@ def test_real_workers_preserve_text_media_text_fifo_and_one_sender_identity(
                 remote_id="cdn-query",
                 upload_param="cdn-query",
                 encryption_key="00" * 16,
+                cipher_size=32,
             )
 
         text_worker = WeChatDeliveryWorker(
@@ -664,6 +865,7 @@ def test_real_workers_preserve_text_media_text_fifo_and_one_sender_identity(
             assert [item.type for item in media_request.item_list] == [
                 ITEM_TYPE_IMAGE
             ]
+            assert media_request.item_list[0].image_item.mid_size == 32
 
             persisted_parent = await store.get_outbox_item(parent.outbox_id)
             persisted_children = await store.list_outgoing_media(

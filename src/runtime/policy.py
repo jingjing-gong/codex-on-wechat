@@ -162,7 +162,14 @@ class EffectivePolicy:
     def can_peer(self, peer_id: str) -> bool:
         peer_id = str(peer_id).strip()
         # Missing peer permission is deny-by-default (plan invariant 8).
-        return bool(peer_id and peer_id in self.allowed_peers and peer_id not in self.denied_peers)
+        # ``*`` is an explicit administrator/profile grant, not an empty-list
+        # fallback.  Exact and wildcard denials both retain precedence.
+        return bool(
+            peer_id
+            and (peer_id in self.allowed_peers or "*" in self.allowed_peers)
+            and peer_id not in self.denied_peers
+            and "*" not in self.denied_peers
+        )
 
     def can_request(self, request_type: str) -> bool:
         request_type = str(request_type).strip()
@@ -276,6 +283,30 @@ class PolicyEngine:
             return incoming
         return current & incoming
 
+    @staticmethod
+    def _intersect_peer_allow(
+        current: frozenset[str] | None,
+        incoming: frozenset[str] | None,
+    ) -> frozenset[str] | None:
+        """Intersect peer ACLs while treating ``*`` as an explicit universe.
+
+        The ordinary set intersection is correct for tools and request types,
+        where ``*`` has no special meaning.  Peer ACLs deliberately support a
+        wildcard so a newer named Agent can be addressed without rewriting an
+        already immutable Profile.  A narrower administrator/task allow-list
+        still wins over the wildcard.
+        """
+
+        if incoming is None:
+            return current
+        if current is None:
+            return incoming
+        if "*" in current:
+            return incoming
+        if "*" in incoming:
+            return current
+        return current & incoming
+
     def effective_policy(
         self,
         profile: AgentProfile | Mapping[str, Any],
@@ -311,7 +342,9 @@ class PolicyEngine:
         for restriction in (self.hard_policy, admin, task):
             allowed_tools = self._intersect_allow(allowed_tools, restriction.allowed_tools)
             denied_tools.update(restriction.denied_tools)
-            allowed_peers = self._intersect_allow(allowed_peers, restriction.allowed_peers)
+            allowed_peers = self._intersect_peer_allow(
+                allowed_peers, restriction.allowed_peers
+            )
             denied_peers.update(restriction.denied_peers)
             allowed_requests = self._intersect_allow(allowed_requests, restriction.allowed_request_types)
             denied_requests.update(restriction.denied_request_types)

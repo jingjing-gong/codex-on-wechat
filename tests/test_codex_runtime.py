@@ -19,6 +19,7 @@ from openai_codex import (  # noqa: E402
 )
 from openai_codex.generated.v2_all import (  # noqa: E402
     AgentMessageThreadItem,
+    ImageGenerationThreadItem,
     InputModality,
     Model,
     ModelListResponse,
@@ -262,6 +263,120 @@ def test_completed_item_fallback_order_counts_ineligible_sdk_items():
         assert [event.content for event in events] == ["answer"]
         assert events[0].source_item_id == "answer-1"
         assert events[0].source_item_ordinal == 1
+
+    asyncio.run(scenario())
+
+
+def test_completed_image_generation_is_stable_attachment_only_output(tmp_path):
+    async def scenario() -> None:
+        saved_path = tmp_path / "generated.png"
+        saved_path.write_bytes(b"\x89PNG\r\n\x1a\ngenerated")
+        item = ThreadItem(
+            root=ImageGenerationThreadItem(
+                id="image-item-1",
+                result="",
+                savedPath=str(saved_path),
+                status="completed",
+                type="imageGeneration",
+            )
+        )
+        fake = _FakeCodex(
+            [
+                Notification(
+                    method="item/completed",
+                    payload=ItemCompletedNotification(
+                        completedAtMs=1,
+                        item=item,
+                        threadId="thread-1",
+                        turnId="turn-1",
+                    ),
+                ),
+                _turn_notification(TurnStatus.completed),
+            ]
+        )
+        publications: list[tuple[str, dict[str, Any]]] = []
+
+        async def publish(task, **kwargs):
+            publications.append((task.task_id, kwargs))
+            return "managed-image-1"
+
+        runtime = CodexRuntime(
+            codex=fake,
+            cwd="/workspace",
+            image_output_publisher=publish,
+        )
+        events = []
+        result = await runtime.run(
+            _task(execution_id="execution-1"),
+            events.append,
+        )
+
+        assert result.status == "completed"
+        assert result.content == ""
+        assert result.events == tuple(events)
+        assert len(events) == 1
+        assert events[0].event_type == "image_generation"
+        assert events[0].content == ""
+        assert events[0].attachments == ("managed-image-1",)
+        assert events[0].source_item_id == "image-item-1"
+        assert events[0].source_item_type == "imagegeneration"
+        assert events[0].source_item_ordinal == 0
+        assert publications == [
+            (
+                "task-1",
+                {
+                    "source_item_id": "image-item-1",
+                    "source_item_ordinal": 0,
+                    "saved_path": str(saved_path),
+                    "result": "",
+                },
+            )
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_replayed_image_completion_publishes_only_once():
+    async def scenario() -> None:
+        notification = {
+            "method": "item/completed",
+            "payload": {
+                "item": {
+                    "id": "image-replay-1",
+                    "type": "imageGeneration",
+                    "status": "completed",
+                    "savedPath": "/workspace/generated.png",
+                    "result": "",
+                }
+            },
+        }
+        fake = _FakeCodex(
+            [
+                notification,
+                notification,
+                _turn_notification(TurnStatus.completed),
+            ]
+        )
+        calls = 0
+
+        async def publish(_task, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise AssertionError("replayed image item was republished")
+            return "managed-image-replay"
+
+        runtime = CodexRuntime(
+            codex=fake,
+            cwd="/workspace",
+            image_output_publisher=publish,
+        )
+        result = await runtime.run(_task(execution_id="execution-replay"))
+
+        assert result.status == "completed"
+        assert calls == 1
+        assert len(result.events) == 1
+        assert result.events[0].attachments == ("managed-image-replay",)
 
     asyncio.run(scenario())
 
@@ -661,6 +776,109 @@ def test_turn_kwargs_match_openai_codex_01444_surface():
         assert turn_kwargs["cwd"] == "/workspace"
         assert turn_kwargs["model"] == "gpt-test"
         assert turn_kwargs["effort"] == "high"
+
+    asyncio.run(scenario())
+
+
+def test_collaboration_bridge_context_is_scoped_to_the_current_task():
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        runtime = CodexRuntime(
+            codex=fake,
+            cwd="/workspace",
+            agent_bridge_command=(
+                "/python path/bin/python",
+                "-m",
+                "src.agent_cli",
+                "--socket",
+                "/tmp/agent bridge.sock",
+            ),
+            agent_bridge_capability_issuer=lambda _task: "turn-capability",
+        )
+        task = _task(
+            task_id="task-current",
+            profile_version=3,
+            policy_version=3,
+            metadata={
+                "effective_policy": {
+                    "profile_id": "codex",
+                    "profile_version": 3,
+                    "mode_id": "chat",
+                    "mode_policy_version": 3,
+                    "can_send_agent_messages": True,
+                },
+                "mode": {
+                    "mode_id": "chat",
+                    "policy_version": 3,
+                    "sandbox_policy": "full-access",
+                    "approval_policy": "deny_all",
+                },
+            },
+        )
+
+        result = await runtime.run(task)
+
+        assert result.status == "completed"
+        input_value = fake.thread.turns[0].turn_calls[0][0]
+        assert isinstance(input_value, list)
+        assert len(input_value) == 2
+        context, prompt = input_value
+        assert isinstance(context, TextInput)
+        assert isinstance(prompt, TextInput)
+        assert "task-current" in context.text
+        assert "--capability turn-capability" in context.text
+        assert "src.agent_cli" in context.text
+        assert "'/tmp/agent bridge.sock'" in context.text
+        assert prompt.text == "hello"
+
+    asyncio.run(scenario())
+
+
+def test_internal_mailbox_turn_does_not_advertise_task_bridge():
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        issued = 0
+
+        def issue(_task):
+            nonlocal issued
+            issued += 1
+            return "must-not-be-issued"
+
+        runtime = CodexRuntime(
+            codex=fake,
+            cwd="/workspace",
+            agent_bridge_command=("python", "-m", "src.agent_cli"),
+            agent_bridge_capability_issuer=issue,
+        )
+        task = _task(
+            execution_id="mailbox-execution",
+            profile_version=3,
+            policy_version=3,
+            metadata={
+                "internal_mailbox": True,
+                "effective_policy": {
+                    "profile_id": "codex",
+                    "profile_version": 3,
+                    "mode_id": "chat",
+                    "mode_policy_version": 3,
+                    "can_send_agent_messages": True,
+                },
+                "mode": {
+                    "mode_id": "chat",
+                    "policy_version": 3,
+                    "sandbox_policy": "full-access",
+                    "approval_policy": "deny_all",
+                },
+            },
+        )
+
+        result = await runtime.run(task)
+
+        assert result.status == "completed"
+        assert issued == 0
+        input_value = fake.thread.turns[0].turn_calls[0][0]
+        assert isinstance(input_value, TextInput)
+        assert input_value.text == "hello"
 
     asyncio.run(scenario())
 

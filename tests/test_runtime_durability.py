@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from src.agents.base import AgentEvent, AgentResult
+from src.runtime.media import AttachmentStore
 from src.runtime.sqlite_store import SQLiteStore
 from src.runtime.sqlite_store import StoreError
 from src.runtime.worker import AgentMailboxWorker, TaskWorker
@@ -91,6 +92,87 @@ def test_worker_projects_completed_items_before_terminal_without_duplication(tmp
             # resolve to the same projection rather than creating a terminal
             # duplicate.
             assert [item.content for item in outbox] == ["durable final response"]
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_worker_projects_completed_generated_image_without_empty_text(tmp_path):
+    class Runtime:
+        agent_id = "codex"
+
+        async def run(self, task, emit):
+            event = AgentEvent(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                event_type="image_generation",
+                content="",
+                attachments=("generated-image",),
+                source_item_id="image-item-1",
+                source_item_type="imagegeneration",
+                source_item_ordinal=0,
+            )
+            await emit(event)
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="completed",
+                events=(event,),
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return True
+
+    async def scenario() -> None:
+        attachment_root = tmp_path / "attachments"
+        files = AttachmentStore(attachment_root)
+        stored = files.put_bytes(
+            b"\x89PNG\r\n\x1a\ngenerated",
+            filename="generated.png",
+            attachment_id="generated-image",
+        )
+        store = SQLiteStore(
+            tmp_path / "runtime.sqlite",
+            attachment_root=attachment_root,
+        )
+        try:
+            await store.register_attachment(
+                stored,
+                kind="image",
+                metadata={
+                    "filename": stored.filename,
+                    "owner_agent_id": "codex",
+                    "channel": "wechat",
+                    "bot_id": "bot",
+                    "external_user_id": "user",
+                    "session_id": "default",
+                },
+            )
+            task = await store.create_task(_task())
+            worker = TaskWorker(store, runtime=Runtime(), worker_id="worker")
+
+            assert await worker.run_once() is True
+            assert (await store.get_task(task.task_id)).state.value == "completed"
+            events = [
+                event
+                for event in await store.list_task_events(task.task_id)
+                if event.event_type == "image_generation"
+            ]
+            assert len(events) == 1
+            assert events[0].attachments == (stored.attachment_id,)
+            outbox = [
+                item
+                for item in await store.list_outbox()
+                if item.task_id == task.task_id
+            ]
+            assert len(outbox) == 1
+            assert outbox[0].content == ""
+            assert outbox[0].attachments == (stored.attachment_id,)
+            media = await store.list_outgoing_media(limit=10)
+            assert len(media) == 1
+            assert media[0].outbox_id == outbox[0].outbox_id
+            assert media[0].attachment_id == stored.attachment_id
         finally:
             await store.close()
 

@@ -130,6 +130,24 @@ def builtin_modes() -> dict[str, AgentMode]:
     }
 
 
+def collaborative_builtin_modes() -> dict[str, AgentMode]:
+    """Return newer built-ins introduced for explicit Agent collaboration.
+
+    Keep the complete v2 catalog in :func:`builtin_modes` so tasks already
+    snapshotted at that version remain resolvable.  Chat v3 only opens the
+    mode-level messaging gate; a Profile still needs an explicit peer and
+    request-type grant before the effective policy permits a message.
+    """
+
+    return {
+        "chat": replace(
+            builtin_modes()["chat"],
+            can_send_agent_messages=True,
+            policy_version=3,
+        )
+    }
+
+
 def legacy_builtin_modes() -> dict[str, AgentMode]:
     """Version-1 built-ins retained for persisted tasks and session routes."""
 
@@ -206,6 +224,8 @@ class ModeRegistry:
             for mode in legacy_builtin_modes().values():
                 self.register(mode)
             for mode in builtin_modes().values():
+                self.register(mode)
+            for mode in collaborative_builtin_modes().values():
                 self.register(mode)
         if modes:
             values = modes.values() if isinstance(modes, Mapping) else modes

@@ -321,9 +321,10 @@ def test_wechat_media_send_reuses_stable_wire_identity_and_target():
         },
     )
     client = Client()
+    uploaded = SimpleNamespace(cipher_size=48)
 
-    assert send_media_delivery(client, record)
-    assert send_media_delivery(client, record)
+    assert send_media_delivery(client, record, uploaded)
+    assert send_media_delivery(client, record, uploaded)
     first, replay = (request.msg for request in client.requests)
     assert first.client_id == replay.client_id
     assert first.to_user_id == "user"
@@ -332,7 +333,7 @@ def test_wechat_media_send_reuses_stable_wire_identity_and_target():
     item = first.item_list[0]
     assert item.type == ITEM_TYPE_IMAGE
     assert item.image_item is not None
-    assert item.image_item.mid_size == 42
+    assert item.image_item.mid_size == 48
     assert item.image_item.media is not None
     assert item.image_item.media.encrypt_query_param == "encrypted-download-param"
     assert item.image_item.media.aes_key == aes_key_to_base64(aes_key)

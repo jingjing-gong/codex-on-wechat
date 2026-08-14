@@ -5,11 +5,23 @@ exports lightweight makes it possible to use the policy/registry classes in
 unit tests without opening a database or importing a channel SDK.
 """
 
-from .modes import AgentMode, Mode, ModeRegistry, builtin_modes, legacy_builtin_modes
+from .modes import (
+    AgentMode,
+    Mode,
+    ModeRegistry,
+    builtin_modes,
+    collaborative_builtin_modes,
+    legacy_builtin_modes,
+)
 from .policy import AgentProfile, EffectivePolicy, PolicyDecision, PolicyEngine
 from .registry import AgentDescriptor, AgentRegistry, RegisteredAgent, Registry, RuntimeRegistry, codex_profile
 from .dispatcher import Dispatcher, SQLiteDispatcher, TaskDispatcher
 from .manager import Manager, TaskManager
+from .agent_bridge import (
+    AgentBridgeCapabilityAuthority,
+    AgentBridgeGrant,
+    AgentBridgeServer,
+)
 from .worker import (
     AgentMailboxSupervisor,
     AgentMailboxWorker,
@@ -56,6 +68,7 @@ from .media import (
     AttachmentError,
     AttachmentStore,
     InboundMediaRef,
+    ManagedImageOutputPublisher,
     MediaStore,
     RuntimeMediaInput,
     StoredAttachment,
@@ -99,6 +112,9 @@ __all__ = [
     "TaskDispatcher",
     "TaskManager",
     "Manager",
+    "AgentBridgeCapabilityAuthority",
+    "AgentBridgeGrant",
+    "AgentBridgeServer",
     "TaskWorker",
     "TaskExecutionWorker",
     "Worker",
@@ -107,6 +123,7 @@ __all__ = [
     "AgentMessageWorker",
     "MailboxWorker",
     "builtin_modes",
+    "collaborative_builtin_modes",
     "legacy_builtin_modes",
     "SQLiteStore",
     "DurableStore",
@@ -146,6 +163,7 @@ __all__ = [
     "AttachmentError",
     "AttachmentStore",
     "InboundMediaRef",
+    "ManagedImageOutputPublisher",
     "RuntimeMediaInput",
     "StoredAttachment",
     "WIRE_MEDIA_FIELDS",

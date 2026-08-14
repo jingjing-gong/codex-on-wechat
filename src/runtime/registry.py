@@ -81,12 +81,29 @@ class RegisteredAgent:
         return self.descriptor.agent_id
 
 
-def codex_profile(*, profile_version: int = 1, default_mode_id: str = "chat") -> AgentProfile:
+def codex_profile(
+    *,
+    profile_version: int = 1,
+    default_mode_id: str = "chat",
+    allow_dynamic_peers: bool = False,
+) -> AgentProfile:
     """Return the static MVP Codex profile.
 
-    Collaboration remains disabled until explicit peers and request types are
-    configured in a later phase.
+    Collaboration remains disabled unless trusted deployment wiring explicitly
+    enables ``allow_dynamic_peers``.  That option is intended for the v3
+    durable profile: it grants the narrow ``ask`` request type and uses the
+    policy engine's explicit wildcard peer selector.  Generic embedders and
+    historical v1/v2 snapshots therefore remain deny-by-default.
     """
+
+    if allow_dynamic_peers and int(profile_version) < 3:
+        raise ValueError(
+            "dynamic peer collaboration requires profile_version >= 3"
+        )
+    allowed_peers = frozenset({"*"}) if allow_dynamic_peers else frozenset()
+    allowed_request_types = (
+        frozenset({"ask"}) if allow_dynamic_peers else frozenset()
+    )
 
     return AgentProfile(
         agent_id="codex",
@@ -95,9 +112,9 @@ def codex_profile(*, profile_version: int = 1, default_mode_id: str = "chat") ->
         responsibilities=("answer questions", "inspect and modify the configured workspace"),
         constraints=("follow the selected mode and effective policy",),
         capabilities=frozenset({"read", "search", "list", "status", "diff", "write", "edit", "execute"}),
-        allowed_peers=frozenset(),
+        allowed_peers=allowed_peers,
         denied_peers=frozenset(),
-        allowed_request_types=frozenset(),
+        allowed_request_types=allowed_request_types,
         max_child_depth=0,
         max_children_per_task=0,
         enabled=True,

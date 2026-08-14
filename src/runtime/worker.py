@@ -612,9 +612,10 @@ class TaskWorker:
 
         Merely carrying source-item metadata is insufficient: command,
         reasoning, plan, and status items can contain diagnostic text.  Only
-        the normalized Codex ``agentMessage`` boundary may be projected while
-        a turn is still running.  A stable item identity is also required so
-        callback replay cannot allocate another logical reply.
+        the normalized Codex ``agentMessage`` boundary or an explicitly
+        promoted ``imageGeneration`` attachment may be projected while a turn
+        is still running.  A stable item identity is also required so callback
+        replay cannot allocate another logical reply.
         """
 
         source_type = "".join(
@@ -636,17 +637,27 @@ class TaskWorker:
         ).lower()
         source_item_id = str(getattr(event, "source_item_id", "") or "").strip()
         source_item_ordinal = getattr(event, "source_item_ordinal", None)
-        has_payload = bool(
-            str(getattr(event, "content", "") or "").strip()
-            or tuple(getattr(event, "attachments", ()) or ())
-        )
-        return bool(
+        content = str(getattr(event, "content", "") or "").strip()
+        attachments = tuple(getattr(event, "attachments", ()) or ())
+        stable_text = bool(
             source_type == "agentmessage"
             and event_type in {"agentmessage", "message"}
-            and visibility == EventVisibility.USER.value
+            and (content or attachments)
+        )
+        # Keep this deliberately specific. Generic tool/command paths must not
+        # become channel files; only the adapter's managed image event is an
+        # eligible attachment-only completed item.
+        stable_image = bool(
+            source_type == "imagegeneration"
+            and event_type == "imagegeneration"
+            and attachments
+            and not content
+        )
+        return bool(
+            visibility == EventVisibility.USER.value
             and not getattr(event, "destination_agent_id", None)
             and (source_item_id or source_item_ordinal is not None)
-            and has_payload
+            and (stable_text or stable_image)
         )
 
     async def _finish(self, task: AgentTask, result: AgentResult, claim_token: str | None) -> Any:

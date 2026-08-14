@@ -946,6 +946,21 @@ def _media_aes_key(value: Any) -> str:
     return key
 
 
+def _media_upload_metadata(uploaded: Any) -> dict[str, int] | None:
+    """Return retry-safe protocol metadata supplied by the CDN upload."""
+
+    value = _value(uploaded, "cipher_size", default=None)
+    if value is None:
+        return None
+    try:
+        cipher_size = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("outgoing media upload has an invalid cipher size") from exc
+    if cipher_size < 0:
+        raise ValueError("outgoing media upload has an invalid cipher size")
+    return {"cipher_size": cipher_size}
+
+
 def _media_message_item(record: Any, uploaded: Any = None) -> MessageItem:
     """Build one WeChat media item from durable metadata and upload state."""
 
@@ -1001,6 +1016,15 @@ def _media_message_item(record: Any, uploaded: Any = None) -> MessageItem:
         )
     except (TypeError, ValueError):
         size = 0
+    cipher_size_value = _value(uploaded, "cipher_size", default=None)
+    if cipher_size_value is None:
+        cipher_size_value = metadata.get("cipher_size")
+    if cipher_size_value is None:
+        cipher_size_value = size
+    try:
+        cipher_size = int(cipher_size_value)
+    except (TypeError, ValueError):
+        cipher_size = size
     media = MediaInfo(
         encrypt_query_param=remote_id,
         aes_key=encryption_key,
@@ -1009,7 +1033,10 @@ def _media_message_item(record: Any, uploaded: Any = None) -> MessageItem:
     if kind == "image" or mime_type.startswith("image/"):
         return MessageItem(
             type=ITEM_TYPE_IMAGE,
-            image_item=ImageItem(media=media, mid_size=max(0, size)),
+            # iLink's ``mid_size`` is the encrypted CDN object size, not the
+            # plaintext attachment size. Retain it at upload checkpoint so a
+            # restarted send uses the same protocol value.
+            image_item=ImageItem(media=media, mid_size=max(0, cipher_size)),
         )
     if kind == "video" or mime_type.startswith("video/"):
         return MessageItem(
@@ -5621,6 +5648,7 @@ class WeChatMediaDeliveryWorker:
                                     "aes_key_hex",
                                     default=None,
                                 ),
+                                metadata=_media_upload_metadata(uploaded),
                             )
                             if not changed:
                                 # Lease ownership was lost.  Never perform an
@@ -6001,6 +6029,7 @@ class WeChatMediaDeliveryWorker:
                     "aes_key_hex",
                     default=None,
                 ),
+                metadata=_media_upload_metadata(uploaded),
             )
             if not changed:
                 claim_lost.set()

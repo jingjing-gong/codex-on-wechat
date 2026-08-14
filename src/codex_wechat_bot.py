@@ -41,8 +41,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import CodexAgent  # noqa: E402
 from src.agents.codex_runtime import CodexRuntime, default_workspace  # noqa: E402
+from src.runtime.agent_bridge import (  # noqa: E402
+    AgentBridgeCapabilityAuthority,
+    AgentBridgeServer,
+)
 from src.runtime.manager import TaskManager  # noqa: E402
-from src.runtime.media import AttachmentStore  # noqa: E402
+from src.runtime.media import (  # noqa: E402
+    AttachmentStore,
+    ManagedImageOutputPublisher,
+)
 from src.runtime.registry import AgentRegistry, codex_profile  # noqa: E402
 from src.runtime.sqlite_store import SQLiteStore  # noqa: E402
 from src.runtime.shell import run_bounded_shell_process  # noqa: E402
@@ -140,7 +147,7 @@ _CODEX_TASK_TIMEOUT = None
 # The durable bot's operating mode is administrator-selected at startup.  A
 # new immutable profile version avoids conflicting with databases seeded by
 # earlier releases whose Codex profile defaulted to read-only ``chat``.
-_DURABLE_CODEX_PROFILE_VERSION = 2
+_DURABLE_CODEX_PROFILE_VERSION = 3
 
 
 def _format_shell_result(command: str, exit_code: int, output: str) -> str:
@@ -1237,7 +1244,13 @@ def _run_durable(wechat_client: Client) -> None:
             "CODEX_WECHAT_DB",
             str(Path.home() / ".codex-wechat-bot" / "runtime.sqlite3"),
         )
-    )
+    ).expanduser().resolve()
+    agent_socket = Path(
+        os.environ.get(
+            "CODEX_WECHAT_AGENT_SOCKET",
+            str(database.with_name(f"{database.name}.agent.sock")),
+        )
+    ).expanduser().resolve()
     workspace_path = _durable_workspace()
     managed_root = Path(
         os.environ.get(
@@ -1274,26 +1287,67 @@ def _run_durable(wechat_client: Client) -> None:
         WeChatDeliveryWorker,
         WeChatMediaDeliveryWorker,
         AgentMailboxSupervisor,
+        AgentBridgeServer,
     ]:
         # Keep SQLite attachment metadata and the managed filesystem under
         # the same canonical root.  Without this, ``register_attachment``
         # cannot enforce the configured path boundary after a restart.
         store = SQLiteStore(database, attachment_root=managed_root)
         manager: TaskManager | None = None
+        agent_bridge: AgentBridgeServer | None = None
         try:
+            await store.initialize()
+            # SQLite owns attachment references across process restarts.  The
+            # async cleanup boundary must consult that durable source before
+            # removing a file; a process-local AttachmentStore ref map is only
+            # a fast path and cannot protect rows restored after a crash.
+            attachment_store = AttachmentStore(
+                managed_root,
+                reference_checker=store.attachment_referenced,
+            )
+            # Restore SQLite's immutable checksums before any restarted task or
+            # media row can read bytes. Metadata-only compatibility rows are
+            # fenced by the ordinary claim/reconcile checks.
+            for attachment in await store.list_attachments(states="ready"):
+                try:
+                    attachment_store.remember(attachment)
+                except Exception:
+                    logger.warning(
+                        "could not hydrate managed attachment %s",
+                        attachment.attachment_id,
+                        exc_info=True,
+                    )
+            bridge_capabilities = AgentBridgeCapabilityAuthority()
             runtime = CodexRuntime(
                 cwd=str(workspace_path),
                 turn_timeout=turn_timeout,
                 managed_root=managed_root,
                 trusted_skill_roots=skill_roots,
+                image_output_publisher=ManagedImageOutputPublisher(
+                    attachment_store,
+                    store,
+                    workspace_root=workspace_path,
+                ),
+                agent_bridge_command=(
+                    sys.executable,
+                    "-m",
+                    "src.agent_cli",
+                    "--socket",
+                    str(agent_socket),
+                ),
+                agent_bridge_capability_issuer=bridge_capabilities.issue,
             )
             registry = AgentRegistry()
             # Keep the immutable v1 chat profile available for queued tasks
-            # created before the trusted execute deployment.  New ingress is
-            # attached to v2 below; retaining v1 lets restart recovery resolve
-            # the policy snapshot of older tasks without rewriting history.
+            # created before the trusted execute deployment. New ingress is
+            # attached to collaboration-capable v3 below; retaining v1/v2 lets
+            # restart recovery resolve older task snapshots without rewriting
+            # history.
             registry.register_profile(
                 codex_profile(profile_version=1, default_mode_id="chat")
+            )
+            registry.register_profile(
+                codex_profile(profile_version=2, default_mode_id="execute")
             )
             registry.register(
                 "codex",
@@ -1301,6 +1355,7 @@ def _run_durable(wechat_client: Client) -> None:
                 profile=codex_profile(
                     profile_version=_DURABLE_CODEX_PROFILE_VERSION,
                     default_mode_id="execute",
+                    allow_dynamic_peers=True,
                 ),
             )
             manager = TaskManager(
@@ -1315,29 +1370,16 @@ def _run_durable(wechat_client: Client) -> None:
                 # the static `codex` runtime remains the transport template.
                 allow_dynamic_agents=True,
             )
+            agent_bridge = AgentBridgeServer(
+                manager,
+                agent_socket,
+                capability_authority=bridge_capabilities,
+            )
+            # Listen before task workers can resume queued work. A task may use
+            # the bridge as soon as its Codex turn starts.
+            await agent_bridge.start()
             await manager.start()
             delivery_worker = WeChatDeliveryWorker(store, wechat_client)
-            # SQLite owns attachment references across process restarts.  The
-            # async cleanup boundary must consult that durable source before
-            # removing a file; a process-local AttachmentStore ref map is only
-            # a fast path and cannot protect rows restored after a crash.
-            attachment_store = AttachmentStore(
-                managed_root,
-                reference_checker=store.attachment_referenced,
-            )
-            # Restore SQLite's immutable checksums before any restarted media
-            # row can read bytes.  Metadata-only compatibility rows are not
-            # usable files and remain fenced by the normal claim/reconcile
-            # checks.
-            for attachment in await store.list_attachments(states="ready"):
-                try:
-                    attachment_store.remember(attachment)
-                except Exception:
-                    logger.warning(
-                        "could not hydrate managed attachment %s",
-                        attachment.attachment_id,
-                        exc_info=True,
-                    )
             media_worker = WeChatMediaDeliveryWorker(
                 store,
                 wechat_client,
@@ -1379,13 +1421,22 @@ def _run_durable(wechat_client: Client) -> None:
                 manager.registry,
                 reply_handler=reply_mailbox,
             )
-            return store, manager, delivery_worker, media_worker, mailbox_supervisor
+            return (
+                store,
+                manager,
+                delivery_worker,
+                media_worker,
+                mailbox_supervisor,
+                agent_bridge,
+            )
         except BaseException:
             # ``TaskManager.start`` rolls back workers, but a failure during
             # store initialization or registry startup can happen before its
             # normal started flag is set.  Close both lifecycle boundaries
             # here; their stop/close methods are idempotent.
             try:
+                if agent_bridge is not None:
+                    await agent_bridge.stop()
                 if manager is not None:
                     await manager.stop()
                 else:
@@ -1399,6 +1450,7 @@ def _run_durable(wechat_client: Client) -> None:
     delivery_worker: WeChatDeliveryWorker | None = None
     media_worker: WeChatMediaDeliveryWorker | None = None
     mailbox_supervisor: AgentMailboxSupervisor | None = None
+    agent_bridge: AgentBridgeServer | None = None
     delivery_future: Any | None = None
     media_future: Any | None = None
     mailbox_future: Any | None = None
@@ -1417,6 +1469,7 @@ def _run_durable(wechat_client: Client) -> None:
             delivery_worker,
             media_worker,
             mailbox_supervisor,
+            agent_bridge,
         ) = agent_loop.run_coro(setup(), timeout=60)
         gateway = WeChatGateway(
             manager,
@@ -1473,6 +1526,11 @@ def _run_durable(wechat_client: Client) -> None:
                 worker.stop()
         if mailbox_supervisor is not None:
             mailbox_supervisor.stop()
+        if agent_bridge is not None and loop_started:
+            try:
+                agent_loop.run_coro(agent_bridge.stop(), timeout=10)
+            except BaseException:
+                logger.debug("failed to stop Agent bridge during startup rollback", exc_info=True)
         if monitor is not None:
             monitor.close()
         auxiliary_futures = [
@@ -1549,6 +1607,8 @@ def _run_durable(wechat_client: Client) -> None:
                     pass
                 except Exception:
                     logger.debug("auxiliary worker exited with an error", exc_info=True)
+            assert agent_bridge is not None
+            await agent_bridge.stop()
             await manager.stop()
 
         try:

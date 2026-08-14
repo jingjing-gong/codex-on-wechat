@@ -10,14 +10,18 @@ runtime.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import inspect
 import json
 import mimetypes
 import os
 import secrets
+import stat
 import tempfile
 import threading
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -803,6 +807,315 @@ class AttachmentStore:
     cleanup_async = acleanup
 
 
+class ManagedImageOutputPublisher:
+    """Promote one trusted runtime image output into durable managed media.
+
+    Codex image-generation items contain either an absolute ``savedPath`` or a
+    ``data:image/...;base64`` result.  Neither value is a durable attachment:
+    paths can disappear after the turn and embedding the data URL in an Agent
+    event would put binary data in SQLite.  This publisher copies verified
+    image bytes into :class:`AttachmentStore`, registers their immutable
+    metadata, and returns only the managed attachment ID.
+
+    The attachment ID is derived from the immutable task execution and SDK
+    item identity.  A crash after filesystem publication but before SQLite
+    registration is therefore repaired idempotently on replay, while changed
+    bytes under the same item identity are rejected.
+    """
+
+    _IMAGE_MIME_TYPES = frozenset(
+        {"image/png", "image/jpeg", "image/gif", "image/webp"}
+    )
+
+    def __init__(
+        self,
+        attachment_store: AttachmentStore,
+        metadata_store: Any,
+        *,
+        workspace_root: str | os.PathLike[str],
+    ) -> None:
+        self.attachment_store = attachment_store
+        self.metadata_store = metadata_store
+        self.workspace_root = Path(workspace_root).expanduser().resolve()
+        try:
+            workspace_details = self.workspace_root.stat()
+        except OSError as exc:
+            raise AttachmentError("generated-image workspace is unavailable") from exc
+        if not stat.S_ISDIR(workspace_details.st_mode):
+            raise AttachmentError("generated-image workspace is not a directory")
+        self._workspace_identity = (
+            workspace_details.st_dev,
+            workspace_details.st_ino,
+        )
+
+    @staticmethod
+    def _field(value: Any, name: str, default: Any = None) -> Any:
+        if isinstance(value, Mapping):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    @classmethod
+    def attachment_id(
+        cls,
+        task: Any,
+        *,
+        source_item_id: str = "",
+        source_item_ordinal: int | None = None,
+    ) -> str:
+        """Return the stable managed identity for one completed SDK item."""
+
+        task_id = str(cls._field(task, "task_id", "") or "").strip()
+        execution_id = str(cls._field(task, "execution_id", "") or "").strip()
+        item_id = str(source_item_id or "").strip()
+        if not task_id or not execution_id:
+            raise AttachmentError(
+                "generated image requires a durable task execution identity"
+            )
+        if not item_id and source_item_ordinal is None:
+            raise AttachmentError(
+                "generated image requires an SDK item identity or ordinal"
+            )
+        item_identity = item_id or f"ordinal:{int(source_item_ordinal)}"
+        identity = "\x1f".join((task_id, execution_id, item_identity))
+        return "codex-image-" + uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "codex-wechat:generated-image:" + identity,
+        ).hex
+
+    def _decode_data_image(self, value: str) -> tuple[bytes, str] | None:
+        raw = str(value or "").strip()
+        if not raw.lower().startswith("data:image/"):
+            return None
+        header, separator, encoded = raw.partition(",")
+        if not separator or not header.lower().endswith(";base64"):
+            raise AttachmentError("generated image data URL must use base64 encoding")
+        mime_type = header[5:-7].strip().lower()
+        if mime_type == "image/jpg":
+            mime_type = "image/jpeg"
+        if mime_type not in self._IMAGE_MIME_TYPES:
+            raise AttachmentError(
+                f"unsupported generated image MIME type: {mime_type or 'unknown'}"
+            )
+        # Reject an oversized encoded value before allocating its decoded form.
+        encoded_limit = ((self.attachment_store.max_file_size + 2) // 3) * 4
+        if len(encoded) > encoded_limit + 4:
+            raise AttachmentError("attachment exceeds maximum file size")
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise AttachmentError("generated image data URL is invalid") from exc
+        if len(payload) > self.attachment_store.max_file_size:
+            raise AttachmentError("attachment exceeds maximum file size")
+        return payload, mime_type
+
+    def _read_saved_image(self, value: str) -> tuple[bytes, str]:
+        """Read a regular file beneath the workspace without following links.
+
+        Resolve-by-name followed by a second pathname ``open`` has a classic
+        check/use race: a writable intermediate directory can be swapped for
+        a symlink after containment validation.  Walk from an already-opened
+        workspace descriptor instead, applying ``O_NOFOLLOW`` to every path
+        component.  Holding each parent descriptor also keeps renames from
+        redirecting the next lookup.
+        """
+
+        raw = str(value or "").strip()
+        candidate = Path(raw).expanduser()
+        if not raw or not candidate.is_absolute():
+            raise AttachmentError(
+                "generated image savedPath must be an absolute workspace path"
+            )
+        try:
+            # ``abspath`` removes ``.``/``..`` without dereferencing a symlink;
+            # every actual lookup is performed through the descriptor walk.
+            normalized = Path(os.path.abspath(os.fspath(candidate)))
+            relative = normalized.relative_to(self.workspace_root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise AttachmentError(
+                "generated image savedPath is outside the configured workspace"
+            ) from exc
+        if not relative.parts:
+            raise AttachmentError("generated image output is not a regular file")
+
+        base_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory_only = getattr(os, "O_DIRECTORY", 0)
+        nonblocking = getattr(os, "O_NONBLOCK", 0)
+        if (
+            not nofollow
+            or not directory_only
+            or not nonblocking
+            or os.open not in getattr(os, "supports_dir_fd", set())
+        ):
+            raise AttachmentError(
+                "secure generated-image path traversal is unavailable"
+            )
+        directory_flags = (
+            base_flags | nofollow | directory_only | nonblocking
+        )
+        directory_descriptors: list[int] = []
+        descriptor: int | None = None
+        try:
+            root_descriptor = os.open(self.workspace_root, directory_flags)
+            directory_descriptors.append(root_descriptor)
+            root_details = os.fstat(root_descriptor)
+            if (
+                root_details.st_dev,
+                root_details.st_ino,
+            ) != self._workspace_identity:
+                raise AttachmentError("generated-image workspace changed")
+
+            parent_descriptor = root_descriptor
+            for component in relative.parts[:-1]:
+                next_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=parent_descriptor,
+                )
+                directory_descriptors.append(next_descriptor)
+                parent_descriptor = next_descriptor
+            descriptor = os.open(
+                relative.parts[-1],
+                base_flags | nofollow | nonblocking,
+                dir_fd=parent_descriptor,
+            )
+        except AttachmentError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise AttachmentError("generated image file is unavailable") from exc
+        finally:
+            for directory_descriptor in reversed(directory_descriptors):
+                os.close(directory_descriptor)
+        if descriptor is None:
+            raise AttachmentError("generated image file is unavailable")
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise AttachmentError("generated image output is not a regular file")
+            if before.st_size > self.attachment_store.max_file_size:
+                raise AttachmentError("attachment exceeds maximum file size")
+            chunks: list[bytes] = []
+            remaining = self.attachment_store.max_file_size + 1
+            while remaining > 0:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if len(payload) > self.attachment_store.max_file_size:
+            raise AttachmentError("attachment exceeds maximum file size")
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) or len(payload) != int(before.st_size):
+            raise AttachmentError("generated image changed while it was read")
+        return payload, normalized.name
+
+    async def __call__(
+        self,
+        task: Any,
+        *,
+        source_item_id: str = "",
+        source_item_ordinal: int | None = None,
+        saved_path: str = "",
+        result: str = "",
+    ) -> str:
+        attachment_id = self.attachment_id(
+            task,
+            source_item_id=source_item_id,
+            source_item_ordinal=source_item_ordinal,
+        )
+        target = self._field(task, "reply_target", None)
+        route = {
+            "channel": str(self._field(target, "channel", "") or ""),
+            "bot_id": str(self._field(target, "bot_id", "") or ""),
+            "external_user_id": str(
+                self._field(target, "external_user_id", "") or ""
+            ),
+            "session_id": str(
+                self._field(target, "session_id", "default") or "default"
+            ),
+        }
+        if not route["channel"] or not route["bot_id"] or not route["external_user_id"]:
+            raise AttachmentError("generated image reply target is incomplete")
+        agent_id = str(self._field(task, "agent_id", "") or "").strip()
+        if not agent_id:
+            raise AttachmentError("generated image has no owning Agent")
+        decoded = self._decode_data_image(result)
+        if decoded is not None:
+            payload, declared_mime = decoded
+            extension = {
+                "image/png": ".png",
+                "image/jpeg": ".jpg",
+                "image/gif": ".gif",
+                "image/webp": ".webp",
+            }[declared_mime]
+            filename = f"generated-{attachment_id[-12:]}{extension}"
+        else:
+            payload, filename = await asyncio.to_thread(
+                self._read_saved_image, saved_path
+            )
+            declared_mime = ""
+
+        actual_mime = sniff_mime(payload, filename, declared_mime).lower()
+        if actual_mime not in self._IMAGE_MIME_TYPES:
+            raise AttachmentError("generated output is not a supported image")
+        if declared_mime and actual_mime != declared_mime:
+            raise AttachmentError("generated image MIME does not match its bytes")
+
+        getter = getattr(self.metadata_store, "get_attachment", None)
+        existing = getter(attachment_id) if getter is not None else None
+        if inspect.isawaitable(existing):
+            existing = await existing
+        if existing is not None:
+            # SQLite metadata is authoritative after a restart.  Load it before
+            # verifying the replay bytes so a modified managed file cannot be
+            # blessed with a newly computed checksum.
+            self.attachment_store.remember(existing)
+        stored = await self.attachment_store.aput_bytes_idempotent(
+            payload,
+            filename=filename,
+            mime_type=actual_mime,
+            attachment_id=attachment_id,
+        )
+        if existing is not None:
+            return stored.attachment_id
+
+        metadata = {
+            "filename": stored.filename,
+            "owner_agent_id": agent_id,
+            **route,
+            "task_id": str(self._field(task, "task_id", "") or ""),
+            "execution_id": str(self._field(task, "execution_id", "") or ""),
+            "source_item_id": str(source_item_id or ""),
+            "source_item_ordinal": source_item_ordinal,
+        }
+        register = getattr(self.metadata_store, "register_attachment", None) or getattr(
+            self.metadata_store, "add_attachment", None
+        )
+        if register is None:
+            raise AttachmentError("runtime store cannot register managed attachments")
+        registration = register(
+            stored,
+            kind="image",
+            metadata=metadata,
+        )
+        if inspect.isawaitable(registration):
+            await registration
+        return stored.attachment_id
+
+
 # ``MediaStore`` is a useful compatibility name for callers that think in
 # terms of media rather than attachments.
 MediaStore = AttachmentStore
@@ -812,6 +1125,7 @@ __all__ = [
     "AttachmentError",
     "AttachmentStore",
     "InboundMediaRef",
+    "ManagedImageOutputPublisher",
     "MediaStore",
     "RuntimeMediaInput",
     "StoredAttachment",
