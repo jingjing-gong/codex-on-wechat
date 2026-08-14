@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import os
+import time
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -15,6 +17,14 @@ from .client import Client
 from .types import GetUploadURLRequest
 
 CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
+
+# Keep the protocol helper bounded even when a caller does not provide its
+# own attachment-store limit.  The channel adapter passes its configured
+# plaintext limit explicitly; this default protects standalone callers too.
+DEFAULT_MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024
+CDN_CONNECT_TIMEOUT_SECONDS = 10.0
+CDN_READ_TIMEOUT_SECONDS = 10.0
+CDN_TOTAL_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass
@@ -36,7 +46,9 @@ def _pkcs7_unpad(data: bytes) -> bytes:
     if not data:
         return data
     pad_len = data[-1]
-    if pad_len == 0 or pad_len > AES.block_size:
+    if pad_len == 0 or pad_len > AES.block_size or pad_len > len(data):
+        raise ValueError("invalid PKCS7 padding")
+    if data[-pad_len:] != bytes([pad_len]) * pad_len:
         raise ValueError("invalid PKCS7 padding")
     return data[:-pad_len]
 
@@ -55,6 +67,8 @@ def encrypt_aes_ecb(plaintext: bytes, key: bytes) -> bytes:
 
 def decrypt_aes_ecb(ciphertext: bytes, key: bytes) -> bytes:
     """Decrypt AES-128-ECB data and remove PKCS7 padding."""
+    if not ciphertext:
+        raise ValueError("ciphertext is empty")
     if len(ciphertext) % AES.block_size != 0:
         raise ValueError("ciphertext is not a multiple of block size")
     cipher = AES.new(key, AES.MODE_ECB)
@@ -66,6 +80,22 @@ def aes_key_to_base64(hex_key: str) -> str:
     return base64.b64encode(hex_key.encode()).decode()
 
 
+def _decode_aes_key(aes_key_base64: str) -> bytes:
+    """Decode and validate iLink's base64(hex(AES-128-key)) representation."""
+
+    try:
+        encoded_hex = base64.b64decode(aes_key_base64, validate=True)
+        hex_key = encoded_hex.decode("ascii")
+        if len(hex_key) != 32:
+            raise ValueError
+        key = bytes.fromhex(hex_key)
+    except (binascii.Error, TypeError, UnicodeError, ValueError) as exc:
+        raise ValueError("invalid AES-128 key") from exc
+    if len(key) != 16:
+        raise ValueError("invalid AES-128 key")
+    return key
+
+
 def upload_file_to_cdn(
     client: Client, data: bytes, to_user_id: str, media_type: int
 ) -> UploadedFile:
@@ -75,7 +105,9 @@ def upload_file_to_cdn(
     filekey_hex = filekey.hex()
     aeskey_hex = aeskey.hex()
 
-    raw_md5 = hashlib.md5(data).hexdigest()
+    # MD5 is mandated by the CDN wire protocol and is not used as a security
+    # primitive.  Mark that explicitly so uploads also work in FIPS builds.
+    raw_md5 = hashlib.md5(data, usedforsecurity=False).hexdigest()
     cipher_size = _aes_ecb_padded_size(len(data))
 
     upload_req = GetUploadURLRequest(
@@ -89,9 +121,13 @@ def upload_file_to_cdn(
         aeskey=aeskey_hex,
     )
     upload_resp = client.get_upload_url(upload_req)
-    if upload_resp.ret != 0:
+    upload_ret = int(getattr(upload_resp, "ret", 0) or 0)
+    upload_errcode = int(getattr(upload_resp, "errcode", 0) or 0)
+    if upload_ret != 0 or upload_errcode != 0:
         raise RuntimeError(
-            f"getuploadurl failed: ret={upload_resp.ret} errmsg={upload_resp.errmsg}"
+            "getuploadurl failed: "
+            f"ret={upload_ret} errcode={upload_errcode} "
+            f"errmsg={getattr(upload_resp, 'errmsg', '')}"
         )
 
     encrypted = encrypt_aes_ecb(data, aeskey)
@@ -117,16 +153,102 @@ def upload_file_to_cdn(
     )
 
 
-def download_file_from_cdn(encrypt_query_param: str, aes_key_base64: str) -> bytes:
-    """Download and decrypt a file from the WeChat CDN."""
-    # AES key is stored as: base64(hex-string) -> decode to hex string -> decode to raw bytes.
-    aes_key_hex_bytes = base64.b64decode(aes_key_base64)
-    aes_key = bytes.fromhex(aes_key_hex_bytes.decode())
+def download_file_from_cdn(
+    encrypt_query_param: str,
+    aes_key_base64: str,
+    *,
+    max_size: int = DEFAULT_MAX_DOWNLOAD_SIZE,
+) -> bytes:
+    """Download and decrypt a bounded file from the WeChat CDN.
+
+    ``requests.Response.content`` eagerly buffers an untrusted response.  CDN
+    references are channel-controlled input, so stream the ciphertext and
+    reject it before allocating more than the configured plaintext limit (plus
+    one PKCS#7 block).  A final plaintext check also covers a response whose
+    length is exactly on the ciphertext bound but has non-minimal padding.
+    """
+    try:
+        plaintext_limit = int(max_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_size must be a positive integer") from exc
+    if plaintext_limit <= 0:
+        raise ValueError("max_size must be a positive integer")
+
+    # Validate channel metadata before initiating a potentially large network
+    # transfer.  AES.new() would otherwise reject a malformed key only after
+    # the complete ciphertext had been downloaded.
+    aes_key = _decode_aes_key(aes_key_base64)
+    if not str(encrypt_query_param or ""):
+        raise ValueError("encrypted query parameter must not be empty")
 
     download_url = f"{CDN_BASE_URL}/download?encrypted_query_param={quote(encrypt_query_param, safe='')}"
-    resp = requests.get(download_url, timeout=60)
-    resp.raise_for_status()
-    return decrypt_aes_ecb(resp.content, aes_key)
+    # PKCS#7 adds between one and one full block of ciphertext bytes.  The
+    # response is rejected as soon as either its declared or observed size is
+    # beyond that upper bound.
+    max_cipher_size = _aes_ecb_padded_size(plaintext_limit)
+    started_at = time.monotonic()
+
+    def ensure_deadline() -> None:
+        if time.monotonic() - started_at >= CDN_TOTAL_TIMEOUT_SECONDS:
+            raise TimeoutError("CDN download exceeded total timeout")
+
+    resp = requests.get(
+        download_url,
+        timeout=(CDN_CONNECT_TIMEOUT_SECONDS, CDN_READ_TIMEOUT_SECONDS),
+        stream=True,
+    )
+    try:
+        ensure_deadline()
+        resp.raise_for_status()
+        headers = getattr(resp, "headers", {}) or {}
+        content_length = headers.get("Content-Length")
+        declared_length: int | None = None
+        if content_length not in (None, ""):
+            try:
+                declared_length = int(content_length)
+                if declared_length < 0:
+                    raise ValueError("invalid CDN Content-Length")
+                if declared_length > max_cipher_size:
+                    raise ValueError("CDN response exceeds attachment size limit")
+            except (TypeError, ValueError) as exc:
+                # Preserve our explicit limit error; malformed lengths are
+                # rejected rather than treated as an unbounded response.
+                if isinstance(exc, ValueError) and str(exc).startswith("CDN response"):
+                    raise
+                raise ValueError("invalid CDN Content-Length") from exc
+
+        chunks: list[bytes] = []
+        total = 0
+        iterator = getattr(resp, "iter_content", None)
+        if callable(iterator):
+            pieces = iterator(chunk_size=64 * 1024)
+        else:
+            # Compatibility for very small test doubles and non-requests
+            # adapters.  Real requests responses always expose iter_content;
+            # still enforce the bound before accepting a fallback body.
+            pieces = (getattr(resp, "content", b""),)
+        for piece in pieces:
+            ensure_deadline()
+            if not piece:
+                continue
+            chunk = bytes(piece)
+            total += len(chunk)
+            if total > max_cipher_size:
+                raise ValueError("CDN response exceeds attachment size limit")
+            chunks.append(chunk)
+        ensure_deadline()
+        if declared_length is not None and total != declared_length:
+            raise ValueError("CDN response length does not match Content-Length")
+        encrypted = b"".join(chunks)
+    finally:
+        close = getattr(resp, "close", None)
+        if callable(close):
+            close()
+
+    plaintext = decrypt_aes_ecb(encrypted, aes_key)
+    if len(plaintext) > plaintext_limit:
+        raise ValueError("CDN plaintext exceeds attachment size limit")
+    return plaintext
 
 
 def _upload_to_cdn(encrypted: bytes, cdn_url: str) -> str:
@@ -136,8 +258,13 @@ def _upload_to_cdn(encrypted: bytes, cdn_url: str) -> str:
         headers={"Content-Type": "application/octet-stream"},
         timeout=60,
     )
-    resp.raise_for_status()
-    download_param = resp.headers.get("X-Encrypted-Param")
-    if not download_param:
-        raise RuntimeError("CDN upload: missing X-Encrypted-Param header")
-    return download_param
+    try:
+        resp.raise_for_status()
+        download_param = resp.headers.get("X-Encrypted-Param")
+        if not download_param:
+            raise RuntimeError("CDN upload: missing X-Encrypted-Param header")
+        return download_param
+    finally:
+        close = getattr(resp, "close", None)
+        if callable(close):
+            close()

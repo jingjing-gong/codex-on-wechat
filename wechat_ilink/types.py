@@ -58,6 +58,9 @@ class Credentials(ILinkModel):
 class QRCodeResponse(ILinkModel):
     """Response from get_bot_qrcode."""
 
+    ret: int = 0
+    errcode: int = 0
+    errmsg: str = ""
     qrcode: str = ""
     qrcode_img_content: str = ""
 
@@ -65,6 +68,9 @@ class QRCodeResponse(ILinkModel):
 class QRStatusResponse(ILinkModel):
     """Response from get_qrcode_status."""
 
+    ret: int = 0
+    errcode: int = 0
+    errmsg: str = ""
     status: str = ""
     bot_token: str = ""
     ilink_bot_id: str = ""
@@ -161,6 +167,7 @@ class GetUploadURLRequest(ILinkModel):
 
 class GetUploadURLResponse(ILinkModel):
     ret: int = 0
+    errcode: int = 0
     errmsg: str = ""
     upload_param: str = ""
     upload_full_url: str = ""
@@ -185,6 +192,7 @@ class SendMessageRequest(ILinkModel):
 
 class SendMessageResponse(ILinkModel):
     ret: int = 0
+    errcode: int = 0
     errmsg: str = ""
 
 
@@ -196,6 +204,7 @@ class GetConfigRequest(ILinkModel):
 
 class GetConfigResponse(ILinkModel):
     ret: int = 0
+    errcode: int = 0
     errmsg: str = ""
     typing_ticket: str = ""
 
@@ -209,4 +218,5 @@ class SendTypingRequest(ILinkModel):
 
 class SendTypingResponse(ILinkModel):
     ret: int = 0
+    errcode: int = 0
     errmsg: str = ""

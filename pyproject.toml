@@ -12,7 +12,7 @@ dependencies = [
     "pydantic>=2.0",
     "pycryptodome>=3.19",
     "qrcode[pil]>=7.4",
-    "openai-codex>=0.144.4",
+    "openai-codex==0.144.4",
 ]
 
 [project.optional-dependencies]

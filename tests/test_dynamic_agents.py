@@ -1,0 +1,1118 @@
+"""Regression coverage for named Agents selected through ``/agent``."""
+
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from src.agents.base import AgentResult
+from src.channels.models import InboundEnvelope, parse_command
+from src.channels.wechat import MVPCommandRouter
+from src.runtime.manager import TaskManager
+from src.runtime.policy import AgentProfile
+from src.runtime.registry import AgentRegistry, codex_profile
+from src.runtime.sqlite_store import SQLiteStore
+
+
+class _Runtime:
+    agent_id = "codex"
+
+    def __init__(self) -> None:
+        self.started = 0
+        self.stopped = 0
+
+    async def start(self) -> None:
+        self.started += 1
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+    async def run(self, _task, _emit) -> AgentResult:
+        return AgentResult(content="ok")
+
+    async def interrupt(self, _task_id: str) -> bool:
+        return False
+
+
+def _envelope(text: str, *, message_id: str = "message-1") -> InboundEnvelope:
+    return InboundEnvelope(
+        channel="wechat",
+        bot_id="bot",
+        external_user_id="user",
+        external_message_id=message_id,
+        text=text,
+        agent_id="codex",
+        conversation_id="wechat:bot:user:default:codex",
+    )
+
+
+def _manager(store: SQLiteStore, runtime: _Runtime) -> TaskManager:
+    registry = AgentRegistry()
+    registry.register("codex", runtime, profile=codex_profile(default_mode_id="chat"))
+    return TaskManager(
+        store,
+        registry,
+        worker_count=0,
+        default_agent_id="codex",
+        default_mode_id="chat",
+        allow_dynamic_agents=True,
+    )
+
+
+def test_agent_command_switches_existing_registered_agent_without_replacing_it(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        codex = _Runtime()
+        planner = _Runtime()
+        registry = AgentRegistry()
+        registry.register("codex", codex, profile=codex_profile(default_mode_id="chat"))
+        registry.register(
+            "planner",
+            planner,
+            profile=AgentProfile(
+                agent_id="planner",
+                display_name="Planner",
+                capabilities=frozenset({"read"}),
+            ),
+        )
+        manager = TaskManager(
+            store,
+            registry,
+            worker_count=0,
+            allow_dynamic_agents=True,
+        )
+        await manager.start()
+        try:
+            response = await MVPCommandRouter(manager).handle_command(
+                parse_command("/agent planner"), _envelope("/agent planner")
+            )
+            assert str(response) == "switched to Agent: planner"
+            assert manager.registry.require("planner") is planner
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_agent_command_creates_named_agent_and_routes_new_work(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        try:
+            router = MVPCommandRouter(manager)
+            response = await router.handle_command(
+                parse_command("/agent planner"), _envelope("/agent planner")
+            )
+            assert str(response) == "switched to Agent: planner"
+            assert await manager.get_active_agent(
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            ) == "planner"
+            assert "planner" in {
+                descriptor.agent_id for descriptor in await manager.list_agents()
+            }
+
+            accepted = await manager.accept_inbound(
+                _envelope("work", message_id="message-2"),
+                create_task=True,
+            )
+            assert accepted.task.agent_id == "planner"
+            assert accepted.task.conversation_id.endswith(":planner")
+            assert await store.get_profile("planner", 1) is not None
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_named_agent_route_and_profile_restore_after_restart(tmp_path):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+        first = _manager(SQLiteStore(database), _Runtime())
+        await first.start()
+        await first.set_active_agent(
+            "researcher",
+            channel="wechat",
+            bot_id="bot",
+            external_user_id="user",
+            session_id="default",
+        )
+        # Simulate a route written by an older release before Agent IDs were
+        # canonicalized to lowercase.
+        await first.store.set_route(
+            channel="wechat",
+            bot_id="bot",
+            external_user_id="user",
+            session_id="default",
+            active_agent_id="Researcher",
+        )
+        await first.stop()
+
+        second = _manager(SQLiteStore(database), _Runtime())
+        await second.start()
+        try:
+            assert await second.get_active_agent(
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            ) == "researcher"
+            assert second.registry.require("researcher") is not None
+            assert "researcher" in {
+                descriptor.agent_id for descriptor in await second.list_agents()
+            }
+        finally:
+            await second.stop()
+
+    asyncio.run(scenario())
+
+
+def test_dynamic_creation_preserves_existing_mixed_case_registration(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        codex = _Runtime()
+        legacy = _Runtime()
+        registry = AgentRegistry()
+        registry.register("codex", codex, profile=codex_profile(default_mode_id="chat"))
+        registry.register(
+            "Planner",
+            legacy,
+            profile=AgentProfile(agent_id="Planner", display_name="Planner"),
+        )
+        manager = TaskManager(
+            store,
+            registry,
+            worker_count=0,
+            allow_dynamic_agents=True,
+        )
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "Planner",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            assert await manager.get_active_agent(
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            ) == "Planner"
+            assert manager.registry.require("Planner") is legacy
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_agent_command_rejects_unsafe_named_agent_id(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        try:
+            response = await MVPCommandRouter(manager).handle_command(
+                parse_command("/agent ../escape"),
+                _envelope("/agent ../escape"),
+            )
+            assert str(response).startswith("cannot switch Agent: Agent ID must start")
+            assert "../escape" not in manager.registry
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_named_agent_falls_back_to_read_only_profile_for_legacy_runtime(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        runtime = _Runtime()
+        registry = AgentRegistry()
+        # Older integrations registered a runtime without an AgentProfile.
+        registry.register("codex", runtime)
+        manager = TaskManager(
+            store,
+            registry,
+            worker_count=0,
+            allow_dynamic_agents=True,
+        )
+        await manager.start()
+        try:
+            assert await manager.ensure_agent("legacy")
+            profile = manager.registry.profile("legacy")
+            assert profile is not None
+            assert profile.default_mode_id == "chat"
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_delagent_removes_dynamic_alias_falls_back_route_and_survives_restart(tmp_path):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+        first = _manager(SQLiteStore(database), _Runtime())
+        await first.start()
+        try:
+            await first.set_active_agent(
+                "planner",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            task = await first.submit(
+                "preserve this snapshot",
+                _envelope("work").reply_target,
+                agent_id="planner",
+            )
+            # Retirement is allowed only after the Agent has no unfinished
+            # work.  Cancelling a queued task preserves its immutable history
+            # while making the live alias safe to remove.
+            assert await first.cancel(task.task_id)
+            assert await first.delete_agent("planner")
+            assert first.registry.registration("planner") is None
+            assert await first.get_active_agent(
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            ) == "codex"
+            assert await first.store.is_agent_deleted("planner")
+            stored = await first.store.get_task(task.task_id)
+            assert stored is not None and stored.agent_id == "planner"
+            assert stored.state.value == "cancelled"
+        finally:
+            await first.stop()
+
+        second = _manager(SQLiteStore(database), _Runtime())
+        await second.start()
+        try:
+            assert second.registry.registration("planner") is None
+            assert await second.store.is_agent_deleted("planner")
+        finally:
+            await second.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("restart_before_recreate", (False, True))
+def test_agent_command_recreates_retired_alias_without_rewriting_profile(
+    tmp_path, restart_before_recreate
+):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+
+        def manager_for() -> TaskManager:
+            registry = AgentRegistry()
+            registry.register(
+                "codex",
+                _Runtime(),
+                profile=codex_profile(
+                    profile_version=2,
+                    default_mode_id="execute",
+                ),
+            )
+            return TaskManager(
+                SQLiteStore(database),
+                registry,
+                worker_count=0,
+                default_agent_id="codex",
+                default_mode_id="execute",
+                allow_dynamic_agents=True,
+            )
+
+        manager = manager_for()
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "bb",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            original = await manager.store.get_profile("bb", 2)
+            assert original is not None and original.enabled
+            task = await manager.submit(
+                "preserve recreation history",
+                _envelope("work", message_id="bb-history").reply_target,
+                agent_id="bb",
+            )
+            assert await manager.cancel(task.task_id)
+            assert await manager.delete_agent("bb")
+            retired = await manager.store.get_profile("bb", 2)
+            assert retired is not None and not retired.enabled
+            assert await manager.store.is_agent_deleted("bb")
+        finally:
+            if restart_before_recreate:
+                await manager.stop()
+
+        if restart_before_recreate:
+            manager = manager_for()
+            await manager.start()
+
+        try:
+            response = await MVPCommandRouter(manager).handle_command(
+                parse_command("/agent bb"), _envelope("/agent bb")
+            )
+
+            assert response == "switched to Agent: bb"
+            restored = await manager.store.get_profile("bb", 2)
+            assert restored is not None and restored.enabled
+            assert restored == original
+            assert not await manager.store.is_agent_deleted("bb")
+            assert manager.registry.require("bb") is not None
+            assert await manager.get_active_agent(
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            ) == "bb"
+            retained = await manager.store.get_task(task.task_id)
+            assert retained is not None
+            assert retained.agent_id == "bb"
+            assert retained.profile_version == 2
+            assert retained.conversation_id == task.conversation_id
+            assert retained.state.value == "cancelled"
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_agent_recreation_rejects_genuine_retired_profile_conflict(tmp_path):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+        registry = AgentRegistry()
+        registry.register(
+            "codex",
+            _Runtime(),
+            profile=codex_profile(profile_version=2, default_mode_id="execute"),
+        )
+        manager = TaskManager(
+            SQLiteStore(database),
+            registry,
+            worker_count=0,
+            default_agent_id="codex",
+            default_mode_id="execute",
+            allow_dynamic_agents=True,
+        )
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "bb",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            assert await manager.delete_agent("bb")
+            await manager.store._call(
+                lambda conn: conn.execute(
+                    "UPDATE agent_profiles SET capabilities_json='[\"tampered\"]' "
+                    "WHERE agent_id='bb' AND profile_version=2"
+                ).rowcount
+            )
+
+            response = await MVPCommandRouter(manager).handle_command(
+                parse_command("/agent bb"), _envelope("/agent bb")
+            )
+
+            assert response == (
+                "cannot switch Agent: profile version metadata conflicts: bb@2"
+            )
+            assert manager.registry.registration("bb") is None
+            assert await manager.store.is_agent_deleted("bb")
+            persisted = await manager.store.get_profile("bb", 2)
+            assert persisted is not None and not persisted.enabled
+            assert persisted.capabilities == frozenset({"tampered"})
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_agent_recreation_restores_every_retained_profile_version(tmp_path):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+        registry = AgentRegistry()
+        registry.register(
+            "codex",
+            _Runtime(),
+            profile=codex_profile(profile_version=2, default_mode_id="execute"),
+        )
+        manager = TaskManager(
+            SQLiteStore(database),
+            registry,
+            worker_count=0,
+            default_agent_id="codex",
+            default_mode_id="execute",
+            allow_dynamic_agents=True,
+        )
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "bb",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            current = await manager.store.get_profile("bb", 2)
+            assert current is not None
+            older = replace(current, profile_version=1)
+            manager.registry.register_profile(older)
+            await manager.store.put_profile(older)
+
+            assert await manager.delete_agent("bb")
+            for version in (1, 2):
+                retired = await manager.store.get_profile("bb", version)
+                assert retired is not None and not retired.enabled
+
+            response = await MVPCommandRouter(manager).handle_command(
+                parse_command("/agent bb"), _envelope("/agent bb")
+            )
+
+            assert response == "switched to Agent: bb"
+            assert not await manager.store.is_agent_deleted("bb")
+            for version in (1, 2):
+                restored = await manager.store.get_profile("bb", version)
+                assert restored is not None and restored.enabled
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_second_manager_can_recreate_agent_retired_by_first_manager(tmp_path):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+        first = _manager(SQLiteStore(database), _Runtime())
+        await first.start()
+        second: TaskManager | None = None
+        try:
+            await first.set_active_agent(
+                "bb",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="owner",
+                session_id="default",
+            )
+
+            second = _manager(SQLiteStore(database), _Runtime())
+            await second.start()
+            assert second.registry.registration("bb") is not None
+
+            assert await first.delete_agent("bb")
+            # Runtime registries are process-local, so the other manager still
+            # holds its stale registration until durable revalidation.
+            assert second.registry.registration("bb") is not None
+            assert await second.store.is_agent_deleted("bb")
+
+            response = await MVPCommandRouter(second).handle_command(
+                parse_command("/agent bb"), _envelope("/agent bb")
+            )
+
+            assert response == "switched to Agent: bb"
+            assert not await second.store.is_agent_deleted("bb")
+            restored = await second.store.get_profile("bb", 1)
+            assert restored is not None and restored.enabled
+            assert await second.get_active_agent(
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            ) == "bb"
+        finally:
+            if second is not None:
+                await second.stop()
+            await first.stop()
+
+    asyncio.run(scenario())
+
+
+def test_interrupted_agent_recreation_stays_hidden_and_is_retryable(tmp_path):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+
+        def manager_for() -> TaskManager:
+            registry = AgentRegistry()
+            registry.register(
+                "codex", _Runtime(), profile=codex_profile(default_mode_id="chat")
+            )
+            return TaskManager(
+                SQLiteStore(database),
+                registry,
+                worker_count=0,
+                allow_dynamic_agents=True,
+            )
+
+        first = manager_for()
+        await first.start()
+        await first.set_active_agent(
+            "bb",
+            channel="wechat",
+            bot_id="bot",
+            external_user_id="user",
+            session_id="default",
+        )
+        assert await first.delete_agent("bb")
+
+        # Simulate interruption after Profile preparation but before the
+        # tombstone/route commit performed by set_active_agent().
+        assert await first.ensure_agent("bb", allow_deleted=True)
+        prepared = await first.store.get_profile("bb", 1)
+        assert prepared is not None and prepared.enabled
+        assert await first.store.is_agent_deleted("bb")
+        with pytest.raises(KeyError, match="Agent was deleted: bb"):
+            await first.ensure_agent("bb")
+        await first.stop()
+
+        second = manager_for()
+        await second.start()
+        try:
+            assert second.registry.registration("bb") is None
+            assert await second.store.is_agent_deleted("bb")
+
+            response = await MVPCommandRouter(second).handle_command(
+                parse_command("/agent bb"), _envelope("/agent bb")
+            )
+
+            assert response == "switched to Agent: bb"
+            assert second.registry.require("bb") is not None
+            assert not await second.store.is_agent_deleted("bb")
+        finally:
+            await second.stop()
+
+    asyncio.run(scenario())
+
+
+def test_agent_recreation_publication_failure_keeps_tombstone_across_restart(
+    tmp_path,
+):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+        first_store = SQLiteStore(database)
+        first = _manager(first_store, _Runtime())
+        await first.start()
+        await first.set_active_agent(
+            "bb",
+            channel="wechat",
+            bot_id="bot",
+            external_user_id="user",
+            session_id="default",
+        )
+        assert await first.delete_agent("bb")
+
+        original_put_mode = first_store.put_mode
+
+        async def fail_bb_mode(mode, *, agent_id="codex"):
+            if agent_id == "bb":
+                raise RuntimeError("mode publication failed")
+            return await original_put_mode(mode, agent_id=agent_id)
+
+        first_store.put_mode = fail_bb_mode  # type: ignore[method-assign]
+        response = await MVPCommandRouter(first).handle_command(
+            parse_command("/agent bb"), _envelope("/agent bb")
+        )
+
+        assert response == "cannot switch Agent: mode publication failed"
+        assert first.registry.registration("bb") is None
+        assert await first_store.is_agent_deleted("bb")
+        prepared = await first_store.get_profile("bb", 1)
+        assert prepared is not None and prepared.enabled
+        assert await first.get_active_agent(
+            channel="wechat",
+            bot_id="bot",
+            external_user_id="user",
+            session_id="default",
+        ) == "codex"
+        await first.stop()
+
+        second = _manager(SQLiteStore(database), _Runtime())
+        await second.start()
+        try:
+            assert second.registry.registration("bb") is None
+            assert await second.store.is_agent_deleted("bb")
+        finally:
+            await second.stop()
+
+    asyncio.run(scenario())
+
+
+def test_older_profile_conflict_after_prepare_remains_tombstoned(tmp_path):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+        registry = AgentRegistry()
+        registry.register(
+            "codex",
+            _Runtime(),
+            profile=codex_profile(profile_version=2, default_mode_id="execute"),
+        )
+        manager = TaskManager(
+            SQLiteStore(database),
+            registry,
+            worker_count=0,
+            default_agent_id="codex",
+            default_mode_id="execute",
+            allow_dynamic_agents=True,
+        )
+        await manager.start()
+        await manager.set_active_agent(
+            "bb",
+            channel="wechat",
+            bot_id="bot",
+            external_user_id="user",
+            session_id="default",
+        )
+        current = await manager.store.get_profile("bb", 2)
+        assert current is not None
+        older = replace(current, profile_version=1)
+        manager.registry.register_profile(older)
+        await manager.store.put_profile(older)
+        assert await manager.delete_agent("bb")
+        await manager.store._call(
+            lambda conn: conn.execute(
+                "UPDATE agent_profiles SET capabilities_json='[\"tampered\"]' "
+                "WHERE agent_id='bb' AND profile_version=1"
+            ).rowcount
+        )
+
+        response = await MVPCommandRouter(manager).handle_command(
+            parse_command("/agent bb"), _envelope("/agent bb")
+        )
+
+        assert response == (
+            "cannot switch Agent: profile version metadata conflicts: bb@1"
+        )
+        assert manager.registry.registration("bb") is None
+        assert await manager.store.is_agent_deleted("bb")
+        await manager.stop()
+
+        restarted_registry = AgentRegistry()
+        restarted_registry.register(
+            "codex",
+            _Runtime(),
+            profile=codex_profile(profile_version=2, default_mode_id="execute"),
+        )
+        restarted = TaskManager(
+            SQLiteStore(database),
+            restarted_registry,
+            worker_count=0,
+            default_agent_id="codex",
+            default_mode_id="execute",
+            allow_dynamic_agents=True,
+        )
+        # Supply the same current static template snapshot used by the first
+        # process; startup must still hide the prepared alias by tombstone.
+        await restarted.start()
+        try:
+            assert restarted.registry.registration("bb") is None
+            assert await restarted.store.is_agent_deleted("bb")
+        finally:
+            await restarted.stop()
+
+    asyncio.run(scenario())
+
+
+def test_agent_recreation_commit_rolls_back_tombstone_clear_with_route_failure(
+    tmp_path,
+):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "bb",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            assert await manager.delete_agent("bb")
+            await store._call(
+                lambda conn: conn.execute(
+                    """CREATE TRIGGER reject_bb_route
+                       BEFORE INSERT ON routes
+                       WHEN NEW.active_agent_id='bb'
+                       BEGIN
+                           SELECT RAISE(ABORT, 'route rejected');
+                       END"""
+                )
+            )
+
+            with pytest.raises(sqlite3.IntegrityError, match="route rejected"):
+                await manager.set_active_agent(
+                    "bb",
+                    channel="wechat",
+                    bot_id="bot",
+                    external_user_id="user",
+                    session_id="default",
+                )
+            assert await store.is_agent_deleted("bb")
+            assert manager.registry.registration("bb") is not None
+            assert "bb" not in {
+                descriptor.agent_id for descriptor in await manager.list_agents()
+            }
+            with pytest.raises(KeyError, match="Agent was deleted: bb"):
+                await manager.submit(
+                    "must stay rejected",
+                    _envelope("submit tombstone").reply_target,
+                    agent_id="bb",
+                )
+            with pytest.raises(KeyError, match="Agent was deleted: bb"):
+                await manager.accept_inbound(
+                    _envelope(
+                        "must stay rejected",
+                        message_id="accept-tombstoned-bb",
+                    ),
+                    create_task=True,
+                    agent_id="bb",
+                )
+            assert await store.list_tasks(limit=10) == []
+            assert await manager.get_active_agent(
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            ) == "codex"
+
+            await store._call(
+                lambda conn: conn.execute("DROP TRIGGER reject_bb_route")
+            )
+            retried = await MVPCommandRouter(manager).handle_command(
+                parse_command("/agent bb"),
+                _envelope("/agent bb", message_id="retry-bb"),
+            )
+            assert retried == "switched to Agent: bb"
+            assert not await store.is_agent_deleted("bb")
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_agent_recreation_commits_every_scope_route(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "bb",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="owner",
+                session_id="default",
+            )
+            assert await manager.delete_agent("bb")
+
+            original_ensure = manager.ensure_agent
+            both_observed_tombstone = asyncio.Event()
+            release_recreations = asyncio.Event()
+            arrivals = 0
+            creation_results: list[bool] = []
+
+            async def synchronized_ensure(
+                agent_id: str, *, allow_deleted: bool = False
+            ) -> bool:
+                nonlocal arrivals
+                if agent_id == "bb" and allow_deleted:
+                    arrivals += 1
+                    if arrivals == 2:
+                        both_observed_tombstone.set()
+                    await release_recreations.wait()
+                result = await original_ensure(
+                    agent_id, allow_deleted=allow_deleted
+                )
+                if agent_id == "bb" and allow_deleted:
+                    creation_results.append(result)
+                return result
+
+            manager.ensure_agent = synchronized_ensure  # type: ignore[method-assign]
+
+            first_switch = asyncio.create_task(
+                manager.set_active_agent(
+                    "bb",
+                    channel="wechat",
+                    bot_id="bot",
+                    external_user_id="user-1",
+                    session_id="default",
+                )
+            )
+            second_switch = asyncio.create_task(
+                manager.set_active_agent(
+                    "bb",
+                    channel="wechat",
+                    bot_id="bot",
+                    external_user_id="user-2",
+                    session_id="default",
+                )
+            )
+            await asyncio.wait_for(both_observed_tombstone.wait(), timeout=1)
+            release_recreations.set()
+            await asyncio.gather(first_switch, second_switch)
+
+            assert not await store.is_agent_deleted("bb")
+            assert sorted(creation_results) == [False, True]
+            for user_id in ("user-1", "user-2"):
+                assert await manager.get_active_agent(
+                    channel="wechat",
+                    bot_id="bot",
+                    external_user_id=user_id,
+                    session_id="default",
+                ) == "bb"
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_delete_racing_switch_cannot_route_to_a_disabled_agent(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        release_switch = asyncio.Event()
+        try:
+            await manager.set_active_agent(
+                "bb",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="owner",
+                session_id="default",
+            )
+
+            original_ensure = manager.ensure_agent
+            switch_resolved = asyncio.Event()
+
+            async def pause_after_ensure(
+                agent_id: str, *, allow_deleted: bool = False
+            ) -> bool:
+                result = await original_ensure(
+                    agent_id, allow_deleted=allow_deleted
+                )
+                if agent_id == "bb" and allow_deleted:
+                    switch_resolved.set()
+                    await release_switch.wait()
+                return result
+
+            manager.ensure_agent = pause_after_ensure  # type: ignore[method-assign]
+            switch = asyncio.create_task(
+                manager.set_active_agent(
+                    "bb",
+                    channel="wechat",
+                    bot_id="bot",
+                    external_user_id="racer",
+                    session_id="default",
+                )
+            )
+            await asyncio.wait_for(switch_resolved.wait(), timeout=1)
+            assert await manager.delete_agent("bb")
+            release_switch.set()
+
+            with pytest.raises(
+                RuntimeError, match="Agent changed while switching: bb"
+            ):
+                await switch
+
+            assert manager.registry.registration("bb") is None
+            assert await store.is_agent_deleted("bb")
+            profile = await store.get_profile("bb", 1)
+            assert profile is not None and not profile.enabled
+            for user_id in ("owner", "racer"):
+                assert await store.get_route(
+                    channel="wechat",
+                    bot_id="bot",
+                    external_user_id=user_id,
+                    session_id="default",
+                    default_agent_id="codex",
+                ) == "codex"
+        finally:
+            release_switch.set()
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_delete_after_route_commit_wins_over_switch_cache_update(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        release_commit = asyncio.Event()
+        try:
+            await manager.set_active_agent(
+                "bb",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="owner",
+                session_id="default",
+            )
+
+            original_commit = store.commit_agent_reactivation
+            route_committed = asyncio.Event()
+
+            async def pause_after_commit(profile, **kwargs):
+                result = await original_commit(profile, **kwargs)
+                if kwargs.get("external_user_id") == "racer":
+                    route_committed.set()
+                    await release_commit.wait()
+                return result
+
+            store.commit_agent_reactivation = (  # type: ignore[method-assign]
+                pause_after_commit
+            )
+            switch = asyncio.create_task(
+                manager.set_active_agent(
+                    "bb",
+                    channel="wechat",
+                    bot_id="bot",
+                    external_user_id="racer",
+                    session_id="default",
+                )
+            )
+            await asyncio.wait_for(route_committed.wait(), timeout=1)
+            deletion = asyncio.create_task(manager.delete_agent("bb"))
+            await asyncio.sleep(0)
+            assert not deletion.done()
+
+            release_commit.set()
+            assert await switch
+            assert await deletion
+
+            assert manager.registry.registration("bb") is None
+            assert await store.is_agent_deleted("bb")
+            profile = await store.get_profile("bb", 1)
+            assert profile is not None and not profile.enabled
+            assert manager.active_agent_for(
+                replace(
+                    _envelope("route check"), external_user_id="racer"
+                ).reply_target
+            ) == "codex"
+            assert await store.get_route(
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="racer",
+                session_id="default",
+                default_agent_id="codex",
+            ) == "codex"
+        finally:
+            release_commit.set()
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "task_state",
+    ("queued", "claimed", "running", "cancel_requested", "orphaned"),
+)
+def test_delagent_rejects_agent_with_unfinished_or_resumable_work(
+    tmp_path, task_state
+):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / f"{task_state}.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "planner",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            task = await manager.submit(
+                f"work in {task_state}",
+                _envelope("work").reply_target,
+                agent_id="planner",
+            )
+
+            claimed_at = datetime(2026, 8, 14, tzinfo=timezone.utc)
+            claim = None
+            if task_state != "queued":
+                claim = await store.claim_task_by_id(
+                    task.task_id,
+                    "worker",
+                    lease_seconds=1,
+                    now=claimed_at,
+                )
+                assert claim is not None
+            if task_state in {"running", "cancel_requested", "orphaned"}:
+                assert claim is not None
+                assert await store.mark_task_running(
+                    task.task_id,
+                    claim.claim_token,
+                    execution_id=claim.execution_id,
+                    now=claimed_at,
+                )
+            if task_state == "cancel_requested":
+                assert await store.cancel_task(task.task_id, actor="user")
+            elif task_state == "orphaned":
+                await store.reconcile(now=claimed_at + timedelta(seconds=2))
+
+            current = await store.get_task(task.task_id)
+            assert current is not None and current.state.value == task_state
+            with pytest.raises(
+                RuntimeError, match="unfinished tasks remain"
+            ):
+                await manager.delete_agent("planner")
+
+            # A rejected retirement has no partial tombstone, profile, route,
+            # or process-local registry effects.
+            assert manager.registry.registration("planner") is not None
+            assert not await store.is_agent_deleted("planner")
+            profile = await store.get_profile("planner", 1)
+            assert profile is not None and profile.enabled
+            assert await manager.get_active_agent(
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            ) == "planner"
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_delagent_rejects_static_and_explicit_agents(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        runtime = _Runtime()
+        registry = AgentRegistry()
+        registry.register("codex", runtime, profile=codex_profile())
+        registry.register(
+            "reviewer", runtime, profile=AgentProfile(agent_id="reviewer")
+        )
+        manager = TaskManager(
+            store, registry, worker_count=0, allow_dynamic_agents=True
+        )
+        await manager.start()
+        try:
+            for agent_id, expected in (
+                ("codex", "default Agent"),
+                ("reviewer", "only dynamically created Agents"),
+            ):
+                try:
+                    await manager.delete_agent(agent_id)
+                except ValueError as exc:
+                    assert expected in str(exc)
+                else:
+                    raise AssertionError("deletion unexpectedly succeeded")
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())

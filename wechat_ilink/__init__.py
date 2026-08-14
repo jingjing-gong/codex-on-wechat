@@ -29,7 +29,7 @@ from .cdn import (
 from .client import Client, ILinkError
 from .markdown import extract_image_urls, markdown_to_plain_text
 from .monitor import Monitor, format_message_summary
-from .sender import new_client_id, send_text_reply, send_typing_state
+from .sender import SendMessageError, new_client_id, send_text_reply, send_typing_state
 from .types import (
     Credentials,
     ImageItem,
@@ -63,6 +63,7 @@ __all__ = [
     "send_text_reply",
     "send_typing_state",
     "new_client_id",
+    "SendMessageError",
     "markdown_to_plain_text",
     "extract_image_urls",
     "upload_file_to_cdn",

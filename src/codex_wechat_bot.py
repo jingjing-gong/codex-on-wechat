@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import difflib
 import json
 import logging
@@ -39,6 +40,27 @@ import qrcode
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import CodexAgent  # noqa: E402
+from src.agents.codex_runtime import CodexRuntime, default_workspace  # noqa: E402
+from src.runtime.manager import TaskManager  # noqa: E402
+from src.runtime.media import AttachmentStore  # noqa: E402
+from src.runtime.registry import AgentRegistry, codex_profile  # noqa: E402
+from src.runtime.sqlite_store import SQLiteStore  # noqa: E402
+from src.runtime.shell import run_bounded_shell_process  # noqa: E402
+from src.runtime.worker import AgentMailboxSupervisor, _mailbox_result_content  # noqa: E402
+from src.channels.wechat import (  # noqa: E402
+    WeChatDeliveryWorker,
+    WeChatGateway,
+    WeChatMediaDeliveryWorker,
+    _format_shell_error as _format_bounded_shell_error,
+    _format_shell_markdown as _format_bounded_shell_markdown,
+    send_media_delivery,
+)
+from src.runtime.skills import (  # noqa: E402
+    SkillSyntaxError,
+    find_skill,
+    format_skills_markdown,
+    parse_skill_invocation,
+)
 from wechat_ilink import (  # noqa: E402
     Client,
     Monitor,
@@ -66,39 +88,72 @@ KNOWN_COMMANDS = [
     "/help",
     "/clear",
     "/reset",
-    "/interrupt",
     "/status",
+    "/tasks",
+    "/retry",
+    "/cancel",
+    "/recv",
     "/model",
     "/models",
     "/listmodel",
     "/listmodels",
+    "/skills",
+    "/listskill",
+    "/listskills",
     "/session",
     "/sessions",
     "/delsession",
     "/sh",
 ]
 
-HELP_TEXT = (
-    "commands:\n"
-    "\n/help - show this message\n"
-    "\n/clear - clear conversation context\n"
-    "\n/reset - clear conversation context\n"
-    "\n/interrupt - stop the current Codex turn\n"
-    "\n/status - show whether Codex is busy or idle\n"
-    "\n/model - show current model and reasoning level\n"
-    "\n/model <name> [level] - switch model and optionally set reasoning\n"
-    "\n/model effort <level|default> - set or reset reasoning level\n"
-    "\n/models - list available models and reasoning levels\n"
-    "\n/session [id] - switch to or create a session\n"
-    "\n/sessions - list your sessions\n"
-    "\n/delsession <id> - delete a session\n"
-    "\n/sh <command> - execute a shell command on the bot host\n"
-    "\n"
-)
+HELP_TEXT = """## Commands
+
+### Conversation
+- `/help` - Show this help
+- `/clear` - Clear conversation context
+- `/reset` - Clear conversation context
+- `/status` - Show whether Codex is busy or idle
+
+### Tasks
+- `/tasks [limit]` - List durable tasks
+- `/retry <task_id>` - Explicitly retry a failed or orphaned task
+- `/cancel [task_id]` - Cancel a task, or the current running task when omitted
+
+-### Models And Sessions
+- `/model [<model-id> <effort|default>|effort <effort|default>]` - Show or set the model and reasoning effort
+- `/models` - List available models and reasoning levels
+- `/session [id]` - Switch to or create a session
+- `/sessions` - List your sessions
+- `/delsession <id>` - Delete a session
+
+### Skills
+- `/skills` - List enabled skills
+- `$<skill> <task description>` - Run a task with a selected skill
+
+### Shell
+- `/sh <command>` - Execute a bounded shell command in the bot workspace
+"""
 
 _MAX_SHELL_OUTPUT = 6000
 _SHELL_TIMEOUT = 30
 _CODEX_TASK_TIMEOUT = None
+# The durable bot's operating mode is administrator-selected at startup.  A
+# new immutable profile version avoids conflicting with databases seeded by
+# earlier releases whose Codex profile defaulted to read-only ``chat``.
+_DURABLE_CODEX_PROFILE_VERSION = 2
+
+
+def _format_shell_result(command: str, exit_code: int, output: str) -> str:
+    """Format a completed legacy shell command as bounded safe Markdown."""
+    return _format_bounded_shell_markdown(
+        command,
+        f"exit code: {exit_code}\n{output}",
+    )
+
+
+def _format_shell_error(message: Any) -> str:
+    """Format a bounded shell failure without trusting exception text."""
+    return _format_bounded_shell_error(message)
 
 
 def run_shell_command(
@@ -109,23 +164,13 @@ def run_shell_command(
     max_output: int = _MAX_SHELL_OUTPUT,
 ) -> str:
     """Execute a shell command and format a bounded result for WeChat."""
-    completed = subprocess.run(
+    completed = run_bounded_shell_process(
         command,
-        shell=True,
-        executable="/bin/sh",
-        cwd=str(cwd or Path(__file__).resolve().parent.parent),
-        capture_output=True,
-        text=True,
+        cwd=cwd or Path(__file__).resolve().parent.parent,
         timeout=timeout,
-        check=False,
+        max_output=max_output,
     )
-    output = completed.stdout
-    if completed.stderr:
-        output += f"\nstderr:\n{completed.stderr}"
-    output = output.rstrip() or "(no output)"
-    if len(output) > max_output:
-        output = output[:max_output] + "\n... (output truncated)"
-    return f"exit code: {completed.returncode}\n{output}"
+    return _format_shell_result(command, completed.returncode, completed.output)
 
 
 def _is_codex_thread_id(value: str) -> bool:
@@ -144,11 +189,11 @@ def _parse_model_command(argument: str) -> tuple[str, str, str]:
         return "show", "", ""
     if parts[0].lower() == "effort":
         if len(parts) != 2:
-            raise ValueError("usage: /model effort <level|default>")
+            raise ValueError("usage: /model effort <effort|default>")
         return "set-effort", "", parts[1]
-    if len(parts) > 2:
-        raise ValueError("usage: /model <name> [level]")
-    return "set-model", parts[0], parts[1] if len(parts) == 2 else ""
+    if len(parts) != 2:
+        raise ValueError("usage: /model <model-id> <effort>")
+    return "set-model", parts[0], parts[1]
 
 
 def _is_command(text: str) -> bool:
@@ -219,7 +264,7 @@ def _format_models(
                 details.append(f"current: {effective_effort} ({source})")
         suffix = f" [{', '.join(details)}]" if details else ""
         lines.append(f"  reasoning: {efforts}{suffix}")
-    lines.append("use /model <id> [level] to switch")
+    lines.append("use /model <model-id> <effort> to switch")
     return "\n".join(lines)
 
 
@@ -447,32 +492,155 @@ class AsyncLoopThread:
     def __init__(self) -> None:
         self.loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._state_lock = threading.RLock()
+        self._started = False
+        self._stop_requested = False
+        self._closed = False
+        self._ready = threading.Event()
+        # Cancellation cleanup normally completes in one event-loop turn.  A
+        # bounded wait keeps a synchronous monitor callback from hanging
+        # forever when an SDK coroutine misbehaves, while the loop shutdown
+        # path still performs a final pending-task drain.
+        self._cancel_grace_seconds = 1.0
 
     def _run(self) -> None:
         asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
+        self._ready.set()
+        try:
+            self.loop.run_forever()
+        finally:
+            self._shutdown_loop()
+            with self._state_lock:
+                self._closed = True
+                self._stop_requested = True
+
+    def _shutdown_loop(self) -> None:
+        """Cancel and drain loop tasks before closing the event loop."""
+
+        if self.loop.is_closed():
+            return
+        try:
+            pending = asyncio.all_tasks(self.loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self.loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+            shutdown_executor = getattr(self.loop, "shutdown_default_executor", None)
+            if shutdown_executor is not None:
+                self.loop.run_until_complete(shutdown_executor())
+        except BaseException:
+            # Shutdown must not mask the exception that caused the monitor to
+            # exit.  Pending-task diagnostics remain useful for operators.
+            logger.debug("asyncio loop cleanup failed", exc_info=True)
+        finally:
+            self.loop.close()
 
     def start(self) -> None:
-        self._thread.start()
+        with self._state_lock:
+            if self._started:
+                if self._thread.is_alive():
+                    return
+                raise RuntimeError("AsyncLoopThread has already stopped")
+            if self._closed or self.loop.is_closed():
+                raise RuntimeError("AsyncLoopThread cannot be restarted")
+            self._started = True
+            try:
+                self._thread.start()
+            except BaseException:
+                self._started = False
+                raise
+        if not self._ready.wait(timeout=5):
+            self.stop()
+            raise RuntimeError("AsyncLoopThread failed to start")
+
+    @staticmethod
+    def _close_coro(value: Any) -> None:
+        close = getattr(value, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                logger.debug("could not close unsubmitted coroutine", exc_info=True)
+
+    def _ensure_submit_allowed(self, coro: Any) -> None:
+        with self._state_lock:
+            allowed = (
+                self._started
+                and not self._stop_requested
+                and not self._closed
+                and not self.loop.is_closed()
+                and self.loop.is_running()
+            )
+        if not allowed:
+            self._close_coro(coro)
+            raise RuntimeError("AsyncLoopThread event loop is not running")
+        if threading.current_thread() is self._thread:
+            self._close_coro(coro)
+            raise RuntimeError("cannot synchronously wait on the owning asyncio loop")
 
     def run_coro(self, coro, timeout: float | None = None) -> Any:
-        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        return future.result(timeout=timeout)
+        self._ensure_submit_allowed(coro)
+        settled = threading.Event()
+
+        async def invoke() -> Any:
+            try:
+                return await coro
+            finally:
+                settled.set()
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(invoke(), self.loop)
+        except BaseException:
+            self._close_coro(coro)
+            raise
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError:
+            # ``Future.result(timeout=...)`` does not cancel the coroutine.
+            # Cancel and give its ``finally`` blocks a bounded opportunity to
+            # finish before the caller unwinds (loop shutdown drains again).
+            if future.cancel():
+                settled.wait(self._cancel_grace_seconds)
+            raise
+        except BaseException:
+            # Propagate the original exception, but do not leave a submitted
+            # coroutine running when the synchronous bridge gives up on it.
+            if not future.done():
+                future.cancel()
+            if future.cancelled():
+                settled.wait(self._cancel_grace_seconds)
+            raise
 
     def run_stream(self, stream, on_item) -> None:
         async def consume() -> None:
             async for item in stream:
                 on_item(item)
 
-        future = asyncio.run_coroutine_threadsafe(consume(), self.loop)
-        future.result()
+        self.run_coro(consume())
 
     def stop(self) -> None:
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self._thread.join(timeout=5)
+        with self._state_lock:
+            if not self._started:
+                if not self._closed and not self.loop.is_closed():
+                    self._closed = True
+                    self._stop_requested = True
+                    self.loop.close()
+                return
+            self._stop_requested = True
+            thread = self._thread
+            if not self.loop.is_closed():
+                self.loop.call_soon_threadsafe(self.loop.stop)
+        if threading.current_thread() is thread:
+            return
+        thread.join(timeout=5)
+        if thread.is_alive():
+            logger.warning("asyncio loop thread did not stop within timeout")
 
 
-def main() -> None:
+def _legacy_main() -> None:
     args = set(sys.argv[1:])
 
     if "--logout" in args:
@@ -480,18 +648,52 @@ def main() -> None:
         return
 
     if "--login" in args:
-        login()
-        print("login complete")
+        wechat_client = login()
+        try:
+            print("login complete")
+        finally:
+            wechat_client.close()
         return
 
     wechat_client = login()
+    try:
+        _run_legacy(wechat_client)
+    finally:
+        # Monitor and Agent shutdown happen inside the runner.  Close the HTTP
+        # session last so no in-flight handler can lose its transport.
+        wechat_client.close()
+
+
+def _run_legacy(wechat_client: Client) -> None:
+    """Run the legacy bridge using an already authenticated client."""
 
     agent_loop = AsyncLoopThread()
-    agent_loop.start()
+    agent: CodexAgent | None = None
+    loop_started = False
+    try:
+        agent_loop.start()
+        loop_started = True
+        agent = CodexAgent(turn_timeout=_CODEX_TASK_TIMEOUT)
+        agent_loop.run_coro(agent.start(), timeout=30)
+        logger.info("codex agent ready: %s", agent.info())
+        _serve_legacy(wechat_client, agent_loop, agent)
+    finally:
+        if agent is not None and loop_started:
+            try:
+                agent_loop.run_coro(agent.stop(), timeout=10)
+            except Exception:
+                pass
+        if loop_started:
+            agent_loop.stop()
 
-    agent = CodexAgent(turn_timeout=_CODEX_TASK_TIMEOUT)
-    agent_loop.run_coro(agent.start(), timeout=30)
-    logger.info("codex agent ready: %s", agent.info())
+
+def _serve_legacy(
+    wechat_client: Client,
+    agent_loop: AsyncLoopThread,
+    agent: CodexAgent,
+) -> None:
+    """Serve legacy messages after the Agent lifecycle is established."""
+
     sessions = SessionManager()
 
     def conversation_id(user_id: str) -> str:
@@ -606,9 +808,17 @@ def main() -> None:
                         try:
                             reply = run_shell_command(command)
                         except subprocess.TimeoutExpired:
-                            reply = f"shell command timed out after {_SHELL_TIMEOUT} seconds"
+                            reply = _format_shell_error(
+                                f"shell command timed out after {_SHELL_TIMEOUT} seconds"
+                            )
                         except OSError as exc:
-                            reply = f"shell command failed to start: {exc}"
+                            reply = _format_shell_error(
+                                f"shell command failed to start: {exc}"
+                            )
+                        except Exception as exc:
+                            reply = _format_shell_error(
+                                f"shell command failed: {exc}"
+                            )
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     logger.info(
                         "executed shell command for %s: %r", msg.from_user_id, command
@@ -666,16 +876,34 @@ def main() -> None:
                     logger.info("cleared session for %s", msg.from_user_id)
                     continue
 
-                if lower == "/interrupt":
-                    conversation = conversation_id(msg.from_user_id)
+                if lower == "/cancel" or lower.startswith("/cancel "):
+                    cancel_args = stripped[len("/cancel") :].split()
+                    if len(cancel_args) > 1:
+                        reply = "usage: /cancel [task_id]"
+                        send_text_reply(
+                            client, msg.from_user_id, reply, msg.context_token
+                        )
+                        continue
+                    identifier = (
+                        cancel_args[0]
+                        if cancel_args
+                        else conversation_id(msg.from_user_id)
+                    )
                     interrupted = agent_loop.run_coro(
-                        agent.interrupt(conversation), timeout=10
+                        agent.interrupt(identifier), timeout=10
                     )
-                    reply = (
-                        "Codex turn interrupted"
-                        if interrupted
-                        else "no Codex turn is currently running"
-                    )
+                    if cancel_args:
+                        reply = (
+                            f"cancel requested: {identifier}"
+                            if interrupted
+                            else f"cannot cancel task {identifier}"
+                        )
+                    else:
+                        reply = (
+                            "Codex turn interrupted"
+                            if interrupted
+                            else "no Codex turn is currently running"
+                        )
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     continue
 
@@ -777,44 +1005,30 @@ def main() -> None:
                                 )
                             else:
                                 effort = ""
-                                if requested_effort:
-                                    if requested_effort.lower() != "default":
-                                        effort = (
-                                            _matching_reasoning_effort(
-                                                model, requested_effort
-                                            )
-                                            or ""
+                                if requested_effort.lower() != "default":
+                                    effort = (
+                                        _matching_reasoning_effort(
+                                            model, requested_effort
                                         )
-                                        if not effort:
-                                            available = (
-                                                ", ".join(_reasoning_efforts(model))
-                                                or "(none)"
-                                            )
-                                            reply = (
-                                                f"model {requested_model} does not support "
-                                                f"reasoning level: {requested_effort}\n"
-                                                f"available: {available}"
-                                            )
-                                            send_text_reply(
-                                                client,
-                                                msg.from_user_id,
-                                                reply,
-                                                msg.context_token,
-                                            )
-                                            continue
-                                else:
-                                    previous_effort = agent.get_reasoning_effort(
-                                        current_conversation
+                                        or ""
                                     )
-                                    if (
-                                        previous_effort
-                                        and not _matching_reasoning_effort(
-                                            model, previous_effort
+                                    if not effort:
+                                        available = (
+                                            ", ".join(_reasoning_efforts(model))
+                                            or "(none)"
                                         )
-                                    ):
-                                        effort = ""
-                                    else:
-                                        effort = previous_effort
+                                        reply = (
+                                            f"model {requested_model} does not support "
+                                            f"reasoning level: {requested_effort}\n"
+                                            f"available: {available}"
+                                        )
+                                        send_text_reply(
+                                            client,
+                                            msg.from_user_id,
+                                            reply,
+                                            msg.context_token,
+                                        )
+                                        continue
 
                                 agent.set_model(current_conversation, requested_model)
                                 agent.set_reasoning_effort(current_conversation, effort)
@@ -855,6 +1069,28 @@ def main() -> None:
                     logger.info("listed models for %s", msg.from_user_id)
                     continue
 
+                if (
+                    lower == "/skills"
+                    or lower.startswith("/skills ")
+                    or lower == "/listskill"
+                    or lower.startswith("/listskill ")
+                    or lower == "/listskills"
+                    or lower.startswith("/listskills ")
+                ):
+                    command_name = lower.split(maxsplit=1)[0]
+                    if len(stripped.split()) > 1:
+                        reply = f"usage: {command_name}"
+                    else:
+                        try:
+                            skills = agent_loop.run_coro(agent.list_skills(), timeout=30)
+                            reply = format_skills_markdown(skills)
+                        except Exception:
+                            logger.warning("skill listing unavailable", exc_info=True)
+                            reply = "skills unavailable; try again later"
+                    send_text_reply(client, msg.from_user_id, reply, msg.context_token)
+                    logger.info("listed skills for %s", msg.from_user_id)
+                    continue
+
                 if lower.startswith("/"):
                     first_token = lower.split()[0] if lower.split() else lower
                     suggestion = difflib.get_close_matches(
@@ -874,6 +1110,39 @@ def main() -> None:
                 if _is_command(text):
                     logger.warning("ignoring unhandled command: %r", stripped)
                     continue
+
+                agent_input: Any = text
+                if stripped.startswith("$"):
+                    try:
+                        invocation = parse_skill_invocation(stripped)
+                    except SkillSyntaxError as exc:
+                        send_text_reply(
+                            client, msg.from_user_id, str(exc), msg.context_token
+                        )
+                        continue
+                    if invocation is not None:
+                        try:
+                            skills = agent_loop.run_coro(agent.list_skills(), timeout=30)
+                            definition = find_skill(
+                                skills,
+                                invocation.name,
+                                rehash_local_bundles=True,
+                            )
+                        except Exception as exc:
+                            logger.warning("could not resolve skill: %s", exc)
+                            definition = None
+                        if definition is None:
+                            send_text_reply(
+                                client,
+                                msg.from_user_id,
+                                f"unknown skill: ${invocation.skill_id}. use /skills to see available skills",
+                                msg.context_token,
+                            )
+                            continue
+                        agent_input = {
+                            "text": invocation.description,
+                            "skill": definition.snapshot(),
+                        }
 
                 # The Codex turn can take a while to complete.  Notify the
                 # user before starting it, but keep this best-effort so a
@@ -899,7 +1168,7 @@ def main() -> None:
                         )
 
                     agent_loop.run_stream(
-                        agent.chat_stream(current_conversation, text), send_partial
+                        agent.chat_stream(current_conversation, agent_input), send_partial
                     )
                     save_current_thread(msg.from_user_id, current_conversation)
                 except Exception as exc:
@@ -915,11 +1184,390 @@ def main() -> None:
         pass
     finally:
         stop_event.set()
+        monitor.close()
+
+
+def _durable_main() -> None:
+    """Run the restart-aware SQLite task runtime and WeChat gateway.
+
+    The low-level Monitor remains blocking and thread-based, so all runtime
+    state is created and operated on ``AsyncLoopThread.loop``.  The monitor
+    callback only waits for durable ingress acceptance; Codex turns and user
+    outbox delivery continue as loop-owned background tasks.
+    """
+    args = set(sys.argv[1:])
+    if "--logout" in args:
+        logout()
+        return
+    if "--login" in args:
+        wechat_client = login()
         try:
-            agent_loop.run_coro(agent.stop(), timeout=10)
-        except Exception:
+            print("login complete")
+        finally:
+            wechat_client.close()
+        return
+
+    wechat_client = login()
+    try:
+        _run_durable(wechat_client)
+    finally:
+        # Startup rollback and ordinary shutdown both drain channel workers in
+        # the runner before this shared HTTP transport is released.
+        wechat_client.close()
+
+
+def _durable_workspace() -> Path:
+    """Resolve the one workspace shared by Codex tasks and `/sh`."""
+
+    configured = os.environ.get("CODEX_WECHAT_WORKSPACE", "").strip()
+    workspace = (
+        Path(configured).expanduser().resolve()
+        if configured
+        else Path(default_workspace())
+    )
+    workspace.mkdir(parents=True, exist_ok=True)
+    return workspace
+
+
+def _run_durable(wechat_client: Client) -> None:
+    """Run the durable bridge using an already authenticated client."""
+
+    database = Path(
+        os.environ.get(
+            "CODEX_WECHAT_DB",
+            str(Path.home() / ".codex-wechat-bot" / "runtime.sqlite3"),
+        )
+    )
+    workspace_path = _durable_workspace()
+    managed_root = Path(
+        os.environ.get(
+            "CODEX_WECHAT_ATTACHMENTS",
+            str(Path.home() / ".codex-wechat-bot" / "attachments"),
+        )
+    ).expanduser().resolve()
+    skill_roots = tuple(
+        Path(value).expanduser().resolve()
+        for value in os.environ.get("CODEX_WECHAT_SKILL_ROOTS", "").split(os.pathsep)
+        if value.strip()
+    )
+    turn_timeout_text = os.environ.get("CODEX_WECHAT_TURN_TIMEOUT", "")
+    try:
+        turn_timeout = float(turn_timeout_text) if turn_timeout_text else None
+    except ValueError:
+        turn_timeout = None
+    try:
+        worker_count = max(1, int(os.environ.get("CODEX_WECHAT_WORKERS", "1")))
+    except ValueError:
+        worker_count = 1
+
+    # Validate/create local configuration before starting the loop.  If this
+    # fails (for example, an unwritable attachment directory), there is no
+    # background thread to leak.
+    managed_root.mkdir(parents=True, exist_ok=True)
+
+    agent_loop = AsyncLoopThread()
+    loop_started = False
+
+    async def setup() -> tuple[
+        SQLiteStore,
+        TaskManager,
+        WeChatDeliveryWorker,
+        WeChatMediaDeliveryWorker,
+        AgentMailboxSupervisor,
+    ]:
+        # Keep SQLite attachment metadata and the managed filesystem under
+        # the same canonical root.  Without this, ``register_attachment``
+        # cannot enforce the configured path boundary after a restart.
+        store = SQLiteStore(database, attachment_root=managed_root)
+        manager: TaskManager | None = None
+        try:
+            runtime = CodexRuntime(
+                cwd=str(workspace_path),
+                turn_timeout=turn_timeout,
+                managed_root=managed_root,
+                trusted_skill_roots=skill_roots,
+            )
+            registry = AgentRegistry()
+            # Keep the immutable v1 chat profile available for queued tasks
+            # created before the trusted execute deployment.  New ingress is
+            # attached to v2 below; retaining v1 lets restart recovery resolve
+            # the policy snapshot of older tasks without rewriting history.
+            registry.register_profile(
+                codex_profile(profile_version=1, default_mode_id="chat")
+            )
+            registry.register(
+                "codex",
+                runtime,
+                profile=codex_profile(
+                    profile_version=_DURABLE_CODEX_PROFILE_VERSION,
+                    default_mode_id="execute",
+                ),
+            )
+            manager = TaskManager(
+                store,
+                registry,
+                worker_count=worker_count,
+                default_agent_id="codex",
+                default_mode_id="execute",
+                trusted_default_execute=True,
+                # `/agent <name>` can create a named Codex context on demand;
+                # the manager persists/restores its immutable profile while
+                # the static `codex` runtime remains the transport template.
+                allow_dynamic_agents=True,
+            )
+            await manager.start()
+            delivery_worker = WeChatDeliveryWorker(store, wechat_client)
+            # SQLite owns attachment references across process restarts.  The
+            # async cleanup boundary must consult that durable source before
+            # removing a file; a process-local AttachmentStore ref map is only
+            # a fast path and cannot protect rows restored after a crash.
+            attachment_store = AttachmentStore(
+                managed_root,
+                reference_checker=store.attachment_referenced,
+            )
+            # Restore SQLite's immutable checksums before any restarted media
+            # row can read bytes.  Metadata-only compatibility rows are not
+            # usable files and remain fenced by the normal claim/reconcile
+            # checks.
+            for attachment in await store.list_attachments(states="ready"):
+                try:
+                    attachment_store.remember(attachment)
+                except Exception:
+                    logger.warning(
+                        "could not hydrate managed attachment %s",
+                        attachment.attachment_id,
+                        exc_info=True,
+                    )
+            media_worker = WeChatMediaDeliveryWorker(
+                store,
+                wechat_client,
+                attachment_store=attachment_store,
+                # The worker invokes senders as ``(row, upload, client)`` so
+                # the channel helper can remain directly callable in tests.
+                sender=lambda row, upload, client: send_media_delivery(
+                    client, row, upload
+                ),
+            )
+
+            async def reply_mailbox(
+                item: Any, result: Any, *, claim_token: str | None = None
+            ) -> None:
+                reply_to_id = getattr(item, "reply_to_id", None)
+                if reply_to_id is None and isinstance(item, dict):
+                    reply_to_id = item.get("reply_to_id")
+                if reply_to_id:
+                    return
+                content = _mailbox_result_content(result)
+                if not content:
+                    return
+                mailbox_id = getattr(item, "mailbox_id", None)
+                if mailbox_id is None and isinstance(item, dict):
+                    mailbox_id = item.get("mailbox_id")
+                source_agent_id = getattr(item, "destination_agent_id", None)
+                if source_agent_id is None and isinstance(item, dict):
+                    source_agent_id = item.get("destination_agent_id")
+                await manager.reply_agent_message(
+                    str(mailbox_id or ""),
+                    content,
+                    source_agent_id=str(source_agent_id or ""),
+                    original_mailbox_id=str(mailbox_id or ""),
+                    original_claim_token=claim_token,
+                )
+
+            mailbox_supervisor = AgentMailboxSupervisor(
+                store,
+                manager.registry,
+                reply_handler=reply_mailbox,
+            )
+            return store, manager, delivery_worker, media_worker, mailbox_supervisor
+        except BaseException:
+            # ``TaskManager.start`` rolls back workers, but a failure during
+            # store initialization or registry startup can happen before its
+            # normal started flag is set.  Close both lifecycle boundaries
+            # here; their stop/close methods are idempotent.
+            try:
+                if manager is not None:
+                    await manager.stop()
+                else:
+                    await store.close()
+            except BaseException:
+                logger.debug("failed to clean up runtime after startup error", exc_info=True)
+            raise
+
+    store: SQLiteStore | None = None
+    manager: TaskManager | None = None
+    delivery_worker: WeChatDeliveryWorker | None = None
+    media_worker: WeChatMediaDeliveryWorker | None = None
+    mailbox_supervisor: AgentMailboxSupervisor | None = None
+    delivery_future: Any | None = None
+    media_future: Any | None = None
+    mailbox_future: Any | None = None
+    monitor: Monitor | None = None
+
+    try:
+        agent_loop.start()
+        loop_started = True
+
+        # Keep construction separate from Monitor.run: an exception in a
+        # gateway/worker constructor needs runtime cleanup, while an ordinary
+        # monitor exception should still take the normal drain path below.
+        (
+            store,
+            manager,
+            delivery_worker,
+            media_worker,
+            mailbox_supervisor,
+        ) = agent_loop.run_coro(setup(), timeout=60)
+        gateway = WeChatGateway(
+            manager,
+            bot_id=wechat_client.bot_id,
+            attachment_store=media_worker.attachment_store,
+            shell_cwd=workspace_path,
+        )
+        # SQLite owns the durable channel checkpoint. Restore it before the
+        # first long-poll request; the JSON monitor buffer remains a legacy
+        # compatibility fallback, not a second source of truth.
+        initial_cursor = agent_loop.run_coro(
+            store.get_cursor(channel="wechat", bot_id=wechat_client.bot_id),
+            timeout=15,
+        )
+        monitor = Monitor(
+            wechat_client,
+            # Inbound media promotion may spend up to 60 seconds in the CDN
+            # downloader before SQLite can accept the message.  Keep the
+            # blocking monitor bridge above that bound so it does not cancel
+            # acceptance while the downloader thread is still running.
+            gateway.monitor_handler(agent_loop.loop, timeout=75),
+            durable_acceptance=True,
+            initial_cursor=initial_cursor,
+            durable_cursor_callback=lambda cursor: agent_loop.run_coro(
+                store.save_cursor(
+                    channel="wechat",
+                    bot_id=wechat_client.bot_id,
+                    cursor=cursor,
+                ),
+                timeout=15,
+            ),
+            durable_cursor_reset_callback=lambda: agent_loop.run_coro(
+                store.clear_cursor(
+                    channel="wechat",
+                    bot_id=wechat_client.bot_id,
+                ),
+                timeout=15,
+            ),
+        )
+        delivery_future = asyncio.run_coroutine_threadsafe(
+            delivery_worker.run(), agent_loop.loop
+        )
+        media_future = asyncio.run_coroutine_threadsafe(
+            media_worker.run(), agent_loop.loop
+        )
+        mailbox_future = asyncio.run_coroutine_threadsafe(
+            mailbox_supervisor.run(), agent_loop.loop
+        )
+    except BaseException:
+        # ``setup`` handles failures inside manager.start.  This path covers
+        # loop, gateway, monitor, and delivery-task startup.
+        for worker in (delivery_worker, media_worker):
+            if worker is not None:
+                worker.stop()
+        if mailbox_supervisor is not None:
+            mailbox_supervisor.stop()
+        if monitor is not None:
+            monitor.close()
+        auxiliary_futures = [
+            future
+            for future in (delivery_future, media_future, mailbox_future)
+            if future is not None
+        ]
+        for future in auxiliary_futures:
+            future.cancel()
+        if auxiliary_futures and loop_started:
+            async def drain_auxiliary() -> None:
+                for future in auxiliary_futures:
+                    try:
+                        await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        if not future.done():
+                            future.cancel()
+                    except Exception:
+                        logger.debug("auxiliary worker exited during startup rollback", exc_info=True)
+            try:
+                agent_loop.run_coro(drain_auxiliary(), timeout=15)
+            except BaseException:
+                logger.debug("failed to drain auxiliary workers during startup rollback", exc_info=True)
+        if manager is not None and loop_started:
+            try:
+                agent_loop.run_coro(manager.stop(), timeout=20)
+            except BaseException:
+                logger.debug("failed to stop runtime after startup error", exc_info=True)
+        elif store is not None and loop_started:
+            try:
+                agent_loop.run_coro(store.close(), timeout=20)
+            except BaseException:
+                logger.debug("failed to close store after startup error", exc_info=True)
+        if loop_started:
+            agent_loop.stop()
+            loop_started = False
+        raise
+
+    stop_event = threading.Event()
+    try:
+        try:
+            monitor.run(stop_event)
+        except KeyboardInterrupt:
             pass
-        agent_loop.stop()
+    finally:
+        stop_event.set()
+        assert monitor is not None
+        monitor.close()
+
+        async def shutdown() -> None:
+            assert manager is not None
+            assert delivery_worker is not None
+            assert media_worker is not None
+            assert delivery_future is not None
+            delivery_worker.stop()
+            media_worker.stop()
+            assert mailbox_supervisor is not None
+            mailbox_supervisor.stop()
+            # Drain every channel/Agent worker before TaskManager closes
+            # SQLite.  A worker may already have claimed a row; closing the
+            # store first would strand its lease transition and lose the
+            # durable failure/sent state.
+            auxiliary_futures = [
+                future
+                for future in (delivery_future, media_future, mailbox_future)
+                if future is not None
+            ]
+            for future in auxiliary_futures:
+                try:
+                    await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
+                except asyncio.TimeoutError:
+                    future.cancel()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.debug("auxiliary worker exited with an error", exc_info=True)
+            await manager.stop()
+
+        try:
+            agent_loop.run_coro(shutdown(), timeout=20)
+        except BaseException:
+            logger.exception("durable runtime shutdown failed")
+        if loop_started:
+            agent_loop.stop()
+
+
+def main() -> None:
+    """Start the durable runtime on every public launch path."""
+
+    if "--legacy" in set(sys.argv[1:]):
+        # Keep old launch scripts working without exposing a second command
+        # router that lacks durable tasks, dynamic Agents, and current command
+        # semantics. The flag is now only a deprecated durable-runtime alias.
+        logger.warning("--legacy is deprecated; starting the durable runtime")
+    _durable_main()
 
 
 if __name__ == "__main__":
