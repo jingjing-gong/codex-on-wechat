@@ -15,7 +15,7 @@ from src.channels.wechat import MVPCommandRouter
 from src.runtime.manager import TaskManager
 from src.runtime.policy import AgentProfile
 from src.runtime.registry import AgentRegistry, codex_profile
-from src.runtime.sqlite_store import SQLiteStore
+from src.runtime.sqlite_store import SQLiteStore, StoreError
 
 
 class _Runtime:
@@ -305,6 +305,142 @@ def test_delagent_removes_dynamic_alias_falls_back_route_and_survives_restart(tm
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("restart_before_create", (False, True))
+def test_creating_new_agent_does_not_republish_retired_profile_history(
+    tmp_path, restart_before_create
+):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+
+        def manager_for(registry: AgentRegistry | None = None) -> TaskManager:
+            if registry is None:
+                registry = AgentRegistry()
+                registry.register(
+                    "codex",
+                    _Runtime(),
+                    profile=codex_profile(
+                        profile_version=2,
+                        default_mode_id="execute",
+                    ),
+                )
+            return TaskManager(
+                SQLiteStore(database),
+                registry,
+                worker_count=0,
+                default_agent_id="codex",
+                default_mode_id="execute",
+                allow_dynamic_agents=True,
+            )
+
+        manager = manager_for()
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "writer",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            assert await manager.delete_agent("writer")
+            retired = await manager.store.get_profile("writer", 2)
+            assert retired is not None and not retired.enabled
+
+            # AgentRegistry deliberately retains immutable Profile history
+            # after unregistering a runtime. Creating another alias must not
+            # republish that stale enabled=True snapshot over the lifecycle-
+            # disabled durable row.
+            assert manager.registry.registration("writer") is None
+            retained = manager.registry.profile("writer", 2)
+            assert retained is not None and retained.enabled
+
+            if restart_before_create:
+                retained_registry = manager.registry
+                await manager.stop()
+                manager = manager_for(retained_registry)
+                await manager.start()
+                assert manager.registry.registration("writer") is None
+                retained = manager.registry.profile("writer", 2)
+                assert retained is not None and retained.enabled
+
+            response = await MVPCommandRouter(manager).handle_command(
+                parse_command("/agent misc"), _envelope("/agent misc")
+            )
+
+            assert response == "switched to Agent: misc"
+            assert manager.registry.registration("misc") is not None
+            assert await manager.store.is_agent_deleted("writer")
+            unchanged = await manager.store.get_profile("writer", 2)
+            assert unchanged is not None and not unchanged.enabled
+            assert await manager.store.get_mode("misc", "chat", 2) == (
+                manager.mode_registry.get("chat", 2)
+            )
+            assert await manager.store.get_mode("misc", "execute", 2) == (
+                manager.mode_registry.get("execute", 2)
+            )
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_startup_does_not_hide_registered_retired_profile_conflict(tmp_path):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+        registry = AgentRegistry()
+        registry.register(
+            "codex",
+            _Runtime(),
+            profile=codex_profile(
+                profile_version=2,
+                default_mode_id="execute",
+            ),
+        )
+        first = TaskManager(
+            SQLiteStore(database),
+            registry,
+            worker_count=0,
+            default_agent_id="codex",
+            default_mode_id="execute",
+            allow_dynamic_agents=True,
+        )
+        await first.start()
+        await first.set_active_agent(
+            "writer",
+            channel="wechat",
+            bot_id="bot",
+            external_user_id="user",
+            session_id="default",
+        )
+        assert await first.delete_agent("writer")
+        retained = registry.profile("writer", 2)
+        assert retained is not None and retained.enabled
+        await first.stop()
+
+        # Only detached historical Profiles are omitted from global startup
+        # publication. An explicit runtime registration is authoritative and
+        # must still expose its enabled-bit conflict with the tombstoned row.
+        registry.register("writer", _Runtime(), profile=retained)
+        restarted = TaskManager(
+            SQLiteStore(database),
+            registry,
+            worker_count=0,
+            default_agent_id="codex",
+            default_mode_id="execute",
+            allow_dynamic_agents=True,
+        )
+        try:
+            with pytest.raises(
+                StoreError,
+                match="profile version metadata conflicts: writer@2",
+            ):
+                await restarted.start()
+        finally:
+            await restarted.stop()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("restart_before_recreate", (False, True))
 def test_agent_command_recreates_retired_alias_without_rewriting_profile(
     tmp_path, restart_before_recreate
@@ -436,6 +572,62 @@ def test_agent_recreation_rejects_genuine_retired_profile_conflict(tmp_path):
             persisted = await manager.store.get_profile("bb", 2)
             assert persisted is not None and not persisted.enabled
             assert persisted.capabilities == frozenset({"tampered"})
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_agent_recreation_accepts_legacy_profile_set_order(tmp_path):
+    async def scenario() -> None:
+        database = tmp_path / "runtime.sqlite"
+        registry = AgentRegistry()
+        registry.register(
+            "codex",
+            _Runtime(),
+            profile=codex_profile(profile_version=2, default_mode_id="execute"),
+        )
+        manager = TaskManager(
+            SQLiteStore(database),
+            registry,
+            worker_count=0,
+            default_agent_id="codex",
+            default_mode_id="execute",
+            allow_dynamic_agents=True,
+        )
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "writer",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            original = await manager.store.get_profile("writer", 2)
+            assert original is not None
+            assert await manager.delete_agent("writer")
+            await manager.store._call(
+                lambda conn: conn.execute(
+                    """UPDATE agent_profiles
+                       SET capabilities_json=?
+                       WHERE agent_id='writer' AND profile_version=2""",
+                    (
+                        '["write","status","search","read","list",'
+                        '"execute","edit","diff"]',
+                    ),
+                ).rowcount
+            )
+
+            response = await MVPCommandRouter(manager).handle_command(
+                parse_command("/agent writer"), _envelope("/agent writer")
+            )
+
+            assert response == "switched to Agent: writer"
+            restored = await manager.store.get_profile("writer", 2)
+            assert restored == original
+            assert restored is not None and restored.enabled
+            assert not await manager.store.is_agent_deleted("writer")
         finally:
             await manager.stop()
 

@@ -130,6 +130,11 @@ class InboundState(StrEnum):
 
 class TaskState(StrEnum):
     QUEUED = "queued"
+    DISPATCHING = "dispatching"
+    # Public compatibility adapters historically called the pre-runtime
+    # dispatch state ``claimed``.  Schema v26 stores the canonical
+    # ``dispatching`` spelling and the SQLite row converter maps it back for
+    # those adapters until the in-process executor is removed.
     CLAIMED = "claimed"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -141,8 +146,11 @@ class TaskState(StrEnum):
 
 
 class ExecutionState(StrEnum):
+    QUEUED = "queued"
+    DISPATCHING = "dispatching"
     CLAIMED = "claimed"
     RUNNING = "running"
+    CANCEL_REQUESTED = "cancel_requested"
     COMPLETED = "completed"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
@@ -195,11 +203,121 @@ class PresentationState(StrEnum):
 
 class MailboxState(StrEnum):
     PENDING = "pending"
+    DISPATCHING = "dispatching"
     CLAIMED = "claimed"
     PROCESSING = "processing"
     PROCESSED = "processed"
     REJECTED = "rejected"
     DEAD_LETTER = "dead_letter"
+    EXPIRED = "expired"
+    ORPHANED_MAILBOX = "orphaned_mailbox"
+
+
+class MailboxOrphanReviewAction(StrEnum):
+    """Administrator action for one exact orphaned mailbox invocation."""
+
+    RETRY = "retry"
+    DEAD_LETTER = "dead_letter"
+
+
+class MailboxOrphanReviewOutcome(StrEnum):
+    """Durable result of an authenticated mailbox-orphan review."""
+
+    RETRIED = "retried"
+    DEAD_LETTERED = "dead_lettered"
+    REJECTED_EXPIRED = "rejected_expired"
+    REJECTED_AGENT_UNAVAILABLE = "rejected_agent_unavailable"
+    REJECTED_QUEUE_FULL = "rejected_queue_full"
+
+
+class InvocationState(StrEnum):
+    """Authoritative state shared by task and mailbox runtime work."""
+
+    QUEUED = "queued"
+    DISPATCHING = "dispatching"
+    RUNNING = "running"
+    CANCEL_REQUESTED = "cancel_requested"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    CANCELLED = "cancelled"
+    ORPHANED = "orphaned"
+
+
+class InvocationWorkKind(StrEnum):
+    TASK = "task"
+    MAILBOX = "mailbox"
+
+
+class DispatchBackend(StrEnum):
+    COMPATIBILITY = "compatibility"
+    CHILD = "child"
+
+
+class DispatchDecisionKind(StrEnum):
+    GRANT = "grant"
+    ABORT = "abort"
+    REJECTION = "rejection"
+
+
+class DispatchSourceState(StrEnum):
+    """Concrete aggregate state produced by an immutable dispatch decision.
+
+    Invocation state alone cannot distinguish a rejected mailbox from one
+    whose absolute lifetime elapsed while it was reserved.  Persisting the
+    actual task/mailbox projection keeps that distinction typed and replayable
+    without interpreting an operator-facing ``decision_code``.
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    PENDING = "pending"
+    PROCESSING = "processing"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
+class ExecutionSlotState(StrEnum):
+    ACTIVE = "active"
+    RELEASED = "released"
+
+
+class ExecutionSlotKind(StrEnum):
+    """Kind of work holding an Agent's single shared execution slot."""
+
+    INVOCATION = "invocation"
+    CONTROL = "control"
+
+
+class AgentLifecycleState(StrEnum):
+    """Durable registration state for one Agent incarnation."""
+
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    RETIRING = "retiring"
+    TOMBSTONED = "tombstoned"
+
+
+class AgentDesiredProcessState(StrEnum):
+    """Supervisor reconciliation target for one Agent incarnation."""
+
+    RUNNING = "running"
+    STOPPED = "stopped"
+
+
+class AgentProcessState(StrEnum):
+    """Durable observation of one child-process generation."""
+
+    STARTING = "starting"
+    READY = "ready"
+    BUSY = "busy"
+    CONTROL_BUSY = "control_busy"
+    BACKOFF = "backoff"
+    QUIESCING = "quiescing"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
 
 
 class MediaDeliveryState(StrEnum):
@@ -497,6 +615,7 @@ class TaskRecord:
     task_id: str
     state: TaskState
     agent_id: str
+    agent_incarnation: int
     conversation_id: str
     mode_id: str
     profile_version: int
@@ -512,7 +631,7 @@ class TaskRecord:
     reply_target: ReplyTarget = field(default_factory=ReplyTarget)
     inputs: Mapping[str, Any] = field(default_factory=dict)
     claimed_by: str | None = None
-    claim_token: str | None = None
+    claim_token: str | None = field(default=None, repr=False)
     lease_expires_at: datetime | None = None
     attempts: int = 0
     next_attempt_at: datetime | None = None
@@ -553,6 +672,9 @@ class TaskExecution:
     task_id: str
     attempt: int
     state: ExecutionState
+    agent_id: str = "codex"
+    agent_incarnation: int = 1
+    dispatch_backend: DispatchBackend = DispatchBackend.COMPATIBILITY
     worker_id: str | None = None
     claim_token: str | None = None
     lease_expires_at: datetime | None = None
@@ -699,7 +821,18 @@ class ReplyCandidateRecord:
     delivery_mode: DeliveryMode = DeliveryMode.PUSH_ELIGIBLE
     notify_enabled: bool = True
     foreground: bool = False
+    # Inbox presentation belongs to the stable completed item, not to a
+    # transport outbox row: notification-suppressed items deliberately have
+    # no allocated SendMsg/outbox until a later inbound presents them.
+    presentation: PresentationState = PresentationState.UNSEEN
     created_at: datetime | None = None
+    presented_at: datetime | None = None
+
+    @property
+    def presentation_id(self) -> str:
+        """Return the durable identity accepted by command presentation."""
+
+        return self.reply_candidate_id
 
 
 @dataclass(frozen=True)
@@ -765,7 +898,7 @@ class AgentMailboxItem:
     destination_agent_id: str
     content: str
     state: MailboxState = MailboxState.PENDING
-    claim_token: str | None = None
+    claim_token: str | None = field(default=None, repr=False)
     claimed_by: str | None = None
     lease_expires_at: datetime | None = None
     attempts: int = 0
@@ -780,6 +913,9 @@ class AgentMailboxItem:
     # payloads are Agent data, while this snapshot controls runtime identity
     # and policy and must not be writable by the destination Agent.
     execution_snapshot: Mapping[str, Any] = field(default_factory=dict)
+    destination_agent_incarnation: int = 1
+    current_invocation_id: str | None = None
+    expires_at: datetime | None = None
 
     @property
     def destination(self) -> str:
@@ -790,6 +926,171 @@ class AgentMailboxItem:
         """Compatibility alias used by older mailbox adapters."""
 
         return self.execution_snapshot
+
+
+@dataclass(frozen=True)
+class AgentInvocationRecord:
+    """One durable, generic unit of task or mailbox runtime work."""
+
+    invocation_id: str
+    work_kind: InvocationWorkKind
+    work_id: str
+    agent_id: str
+    agent_incarnation: int
+    state: InvocationState
+    dispatch_backend: DispatchBackend
+    ready_sequence: int
+    task_id: str | None = None
+    execution_id: str | None = None
+    mailbox_id: str | None = None
+    claimed_by: str | None = None
+    claim_token: str | None = field(default=None, repr=False)
+    lease_expires_at: datetime | None = None
+    next_attempt_at: datetime | None = None
+    admission_released_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    terminal_at: datetime | None = None
+    last_error: str | None = None
+    expires_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AgentInvocationEventRecord:
+    """Append-only history for a generic task or mailbox invocation."""
+
+    invocation_event_id: str
+    invocation_id: str
+    event_sequence: int
+    event_kind: str
+    previous_state: InvocationState | None
+    new_state: InvocationState
+    source_kind: str
+    source_id: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class MailboxOrphanReviewRecord:
+    """Immutable authorization, decision, and effect for one orphan review."""
+
+    mailbox_maintenance_id: str
+    payload_hash: str
+    authorization_scheme: str
+    authorization_grant_digest: str
+    mailbox_id: str
+    mailbox_message_id: str
+    expected_current_invocation_id: str
+    action: MailboxOrphanReviewAction
+    actor: str
+    reason: str
+    authorized_at: datetime
+    authorization_source: str
+    administrator_authorized: bool
+    outcome: MailboxOrphanReviewOutcome
+    replacement_invocation_id: str | None = None
+    reviewed_at: datetime | None = None
+    replayed: bool = False
+
+    @property
+    def accepted(self) -> bool:
+        return self.outcome in {
+            MailboxOrphanReviewOutcome.RETRIED,
+            MailboxOrphanReviewOutcome.DEAD_LETTERED,
+        }
+
+
+@dataclass(frozen=True)
+class AgentAdmissionCounterRecord:
+    agent_id: str
+    agent_incarnation: int
+    unfinished_count: int
+    next_ready_sequence: int
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class GlobalAgentAdmissionCounterRecord:
+    """Account-wide unfinished Agent invocation debit."""
+
+    singleton: int
+    unfinished_count: int
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AgentExecutionSlotRecord:
+    slot_id: str
+    agent_id: str
+    agent_incarnation: int
+    slot_sequence: int
+    slot_kind: ExecutionSlotKind
+    state: ExecutionSlotState
+    dispatch_backend: DispatchBackend
+    worker_generation: int
+    invocation_id: str | None = None
+    acquired_at: datetime | None = None
+    released_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AgentDispatchAttemptRecord:
+    dispatch_attempt_id: str
+    invocation_id: str
+    slot_id: str
+    agent_id: str
+    agent_incarnation: int
+    worker_generation: int
+    supervisor_epoch: int
+    dispatch_backend: DispatchBackend
+    claim_token_hash: str
+    lease_identity: str
+    lease_expires_at: datetime | None
+    invocation_job_identity: str
+    grant_issued_at: datetime | None = None
+    abort_committed_at: datetime | None = None
+    rejection_committed_at: datetime | None = None
+    decision_code: str | None = None
+    decision_outcome_state: InvocationState | None = None
+    decision_source_state: DispatchSourceState | None = None
+    decision_next_attempt_at: datetime | None = None
+    decision_metadata_legacy: bool = False
+    runtime_stopped_at: datetime | None = None
+    invocation_job_empty_at: datetime | None = None
+    cleanup_proof_hash: str | None = None
+    created_at: datetime | None = None
+
+    @property
+    def decision_kind(self) -> DispatchDecisionKind | None:
+        if self.grant_issued_at is not None:
+            return DispatchDecisionKind.GRANT
+        if self.abort_committed_at is not None:
+            return DispatchDecisionKind.ABORT
+        if self.rejection_committed_at is not None:
+            return DispatchDecisionKind.REJECTION
+        return None
+
+    @property
+    def cleanup_proven(self) -> bool:
+        return (
+            self.runtime_stopped_at is not None
+            and self.invocation_job_empty_at is not None
+            and self.cleanup_proof_hash is not None
+        )
+
+
+@dataclass(frozen=True)
+class AgentDispatchReservation:
+    """Atomic pre-grant assignment snapshot returned to the supervisor."""
+
+    invocation: AgentInvocationRecord
+    slot: AgentExecutionSlotRecord
+    attempt: AgentDispatchAttemptRecord
+    claim_token: str = field(repr=False)
+    task: TaskRecord | None = None
+    mailbox: AgentMailboxItem | None = None
+    replayed: bool = False
 
 
 @dataclass(frozen=True)
@@ -846,6 +1147,128 @@ class AgentResult:
 
 
 @dataclass(frozen=True)
+class AgentLifecycleRecord:
+    """One retained Agent incarnation and its durable desired process state."""
+
+    agent_id: str
+    agent_incarnation: int
+    profile_version: int
+    lifecycle_state: AgentLifecycleState
+    desired_process_state: AgentDesiredProcessState
+    provenance_kind: str
+    provenance_profile_version: int | None = None
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    retiring_at: datetime | None = None
+    tombstoned_at: datetime | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.lifecycle_state is AgentLifecycleState.ENABLED
+
+    @property
+    def wants_process(self) -> bool:
+        return self.desired_process_state is AgentDesiredProcessState.RUNNING
+
+
+@dataclass(frozen=True)
+class AgentLifecycleEventRecord:
+    """One append-only lifecycle projection transition or migration seed."""
+
+    lifecycle_event_id: str
+    idempotency_key: str
+    agent_id: str
+    agent_incarnation: int
+    event_sequence: int
+    event_kind: str
+    previous_profile_version: int | None
+    previous_lifecycle_state: AgentLifecycleState | None
+    previous_desired_process_state: AgentDesiredProcessState | None
+    new_profile_version: int
+    new_lifecycle_state: AgentLifecycleState
+    new_desired_process_state: AgentDesiredProcessState
+    actor_kind: str
+    actor_id: str | None
+    source_kind: str
+    source_id: str
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AgentProcessRecord:
+    """Durable evidence for one child-process generation.
+
+    Generation rows are retained after stop.  PID and process-group values are
+    diagnostics only; epoch, incarnation, generation, lease, lifetime-lock,
+    handshake, and cleanup evidence are the ownership fences.
+    """
+
+    agent_id: str
+    agent_incarnation: int
+    worker_generation: int
+    supervisor_epoch: int
+    observed_state: AgentProcessState
+    generation_capability_hash: str
+    lifetime_lock_identity: str
+    lifetime_lock_acquired_at: datetime | None
+    process_lease_identity: str
+    process_lease_token_hash: str
+    lease_expires_at: datetime | None
+    lease_ended_at: datetime | None
+    started_at: datetime | None
+    pid: int | None = None
+    process_group_id: int | None = None
+    kernel_process_birth_id: str | None = None
+    hello_frame_id: str | None = None
+    hello_payload_hash: str | None = None
+    capabilities_frame_id: str | None = None
+    capabilities_payload_hash: str | None = None
+    capability_snapshot_hash: str | None = None
+    handshake_committed_at: datetime | None = None
+    ready_frame_id: str | None = None
+    ready_payload_hash: str | None = None
+    ready_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    stopped_by_supervisor_epoch: int | None = None
+    cleanup_proof: Mapping[str, Any] = field(default_factory=dict)
+    cleanup_proof_hash: str | None = None
+    cleanup_proved_at: datetime | None = None
+    stopped_at: datetime | None = None
+    stop_reason: str | None = None
+    last_exit_code: int | None = None
+    last_error: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.observed_state is not AgentProcessState.STOPPED
+
+    @property
+    def ready_handshake_committed(self) -> bool:
+        """Whether this row contains READY evidence, not scheduling authority."""
+
+        return self.ready_at is not None
+
+
+@dataclass(frozen=True)
+class SupervisorEpochRecord:
+    """One durable supervisor ownership generation for a runtime database."""
+
+    epoch: int
+    owner_instance_id: str
+    channel: str
+    bot_id: str
+    started_at: datetime | None = None
+    stopped_at: datetime | None = None
+    stop_reason: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.stopped_at is None
+
+
+@dataclass(frozen=True)
 class RecoveryReport:
     tasks_orphaned: int = 0
     outbox_requeued: int = 0
@@ -857,6 +1280,10 @@ class RecoveryReport:
     # unknown text delivery from an upload that is safe to retry by its
     # idempotency key.
     media_requeued: int = 0
+    # Pending mailbox expiry is terminal, unlike lease recovery which orphans
+    # a possibly-started invocation.  Keep its count distinct and append this
+    # field so positional compatibility with older callers is preserved.
+    mailbox_expired: int = 0
 
     @property
     def orphaned_tasks(self) -> int:

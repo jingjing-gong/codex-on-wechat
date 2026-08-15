@@ -14,6 +14,8 @@ import stat
 import time
 from typing import Any, Mapping
 
+from .store import QueueFullError
+
 
 logger = logging.getLogger(__name__)
 
@@ -317,7 +319,9 @@ class AgentBridgeServer:
 
     @staticmethod
     def _error_response(exc: BaseException) -> dict[str, Any]:
-        if isinstance(exc, PermissionError):
+        if isinstance(exc, QueueFullError):
+            code = "queue_full"
+        elif isinstance(exc, PermissionError):
             code = "permission_denied"
         elif isinstance(exc, KeyError):
             code = "not_found"

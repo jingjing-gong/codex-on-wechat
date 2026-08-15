@@ -359,12 +359,18 @@ class AgentRegistry:
                 try:
                     await self._agents[agent_id].runtime.stop()
                 except BaseException:
+                    # A failed process stop is an ownership uncertainty, not
+                    # evidence that the runtime is gone.  Retain the started
+                    # marker so an outer lifecycle owner can retry cleanup;
+                    # otherwise ``stop()`` would skip the only remaining
+                    # handle capable of reaping the child.
+                    self._started.add(agent_id)
                     logger.debug(
                         "failed to roll back Agent runtime startup for %s",
                         agent_id,
                         exc_info=True,
                     )
-                finally:
+                else:
                     self._started.discard(agent_id)
             raise
 
@@ -378,7 +384,7 @@ class AgentRegistry:
                 await self._agents[agent_id].runtime.stop()
             except BaseException as exc:  # stop every runtime before propagating
                 error = error or exc
-            finally:
+            else:
                 self._started.discard(agent_id)
         if error is not None:
             raise error

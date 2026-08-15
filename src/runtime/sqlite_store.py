@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -26,19 +27,50 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from .maintenance_authority import (
+    MailboxMaintenanceAuthority,
+    MailboxMaintenanceGrant,
+    MaintenanceAuthorizationError,
+    canonical_mailbox_review_authorization_digest,
+    canonical_mailbox_review_payload_hash,
+)
+from .store import InvalidTransition, NotFoundError, QueueFullError, StoreError
 from .models import (
     AgentEvent,
+    AgentAdmissionCounterRecord,
+    AgentDispatchReservation,
+    AgentDispatchAttemptRecord,
+    AgentDesiredProcessState,
+    AgentExecutionSlotRecord,
+    AgentInvocationRecord,
+    AgentInvocationEventRecord,
+    AgentLifecycleRecord,
+    AgentLifecycleEventRecord,
+    AgentLifecycleState,
     AgentMailboxItem,
+    AgentProcessRecord,
+    AgentProcessState,
     AgentResult,
     AgentTask,
     DeliveryMode,
+    DispatchBackend,
+    DispatchDecisionKind,
+    DispatchSourceState,
     EventPriority,
     EventVisibility,
     ExecutionState,
+    ExecutionSlotKind,
+    ExecutionSlotState,
+    GlobalAgentAdmissionCounterRecord,
     InboundAcceptance,
     InboundMessage,
     InboundState,
+    InvocationState,
+    InvocationWorkKind,
     MailboxState,
+    MailboxOrphanReviewAction,
+    MailboxOrphanReviewOutcome,
+    MailboxOrphanReviewRecord,
     MediaDeliveryState,
     OutgoingMediaRecord,
     OutboxState,
@@ -51,6 +83,7 @@ from .models import (
     ReplyScopeRecord,
     ReplySlotRecord,
     ReplyTarget,
+    SupervisorEpochRecord,
     TaskClaim,
     TaskEvent,
     TaskExecution,
@@ -65,6 +98,16 @@ from .models import (
     utcnow,
 )
 from .media import StoredAttachment, canonical_media_inputs, wire_media_fingerprint
+from .roles import (
+    ROLE_PERSONA_COMPOSITION_VERSION,
+    RoleValidationError,
+    build_role_snapshot,
+    implicit_default_role,
+    is_default_role_token,
+    normalize_role_text,
+    role_binding_key,
+    validate_role_snapshot,
+)
 from .identity import (
     compound_id,
     conversation_id as canonical_conversation_id,
@@ -83,6 +126,16 @@ logger = logging.getLogger(__name__)
 # live connection.
 _LIVE_DATABASES_LOCK = threading.RLock()
 _LIVE_DATABASES: dict[tuple[int, str], int] = {}
+# A deferred process-boundary recovery fence belongs to the database, not to
+# whichever adapter happened to open it first.  Every process-local connection
+# joins this gate and remains unusable until one epoch/recovery transaction has
+# committed successfully.
+_DEFERRED_DATABASES: set[tuple[int, str]] = set()
+# Explicitly finishing an epoch is a shutdown boundary, not an invitation for
+# another process-local adapter to keep using the old live-connection count.
+# Retain this marker until the epoch-owning adapter performs the final close so
+# a joined adapter cannot activate a replacement beneath that owner either.
+_FINISHED_DATABASES: set[tuple[int, str]] = set()
 
 
 _TASK_STATES = tuple(state.value for state in TaskState)
@@ -97,7 +150,7 @@ _MAILBOX_STATES = tuple(state.value for state in MailboxState)
 # history and therefore do not prevent retirement.
 _AGENT_RETIREMENT_BLOCKING_TASK_STATES = (
     TaskState.QUEUED.value,
-    TaskState.CLAIMED.value,
+    TaskState.DISPATCHING.value,
     TaskState.RUNNING.value,
     TaskState.CANCEL_REQUESTED.value,
     TaskState.ORPHANED.value,
@@ -112,6 +165,17 @@ _UNSET = object()
 # Keep the default aligned with ``AudioConfirmationManager`` while allowing a
 # deployment to choose a shorter/longer policy at the durable store boundary.
 DEFAULT_TRANSCRIPTION_TTL_SECONDS = 300.0
+
+# A collaboration request must not remain schedulable forever when its source
+# turn disappears.  The absolute expiry is persisted on both the mailbox
+# aggregate and every one of its invocation attempts.
+DEFAULT_MAILBOX_TTL_SECONDS = 86_400.0
+
+# Admission is enforced at the durable invocation boundary.  These defaults
+# match the deployment contract in ``plan.md``; callers may lower them for a
+# constrained deployment or focused tests, but neither limit may be disabled.
+DEFAULT_MAX_AGENT_QUEUE = 256
+DEFAULT_MAX_GLOBAL_AGENT_QUEUE = 2048
 
 # Keep each finished WeChat plain-text reply within 3,000 Unicode characters.
 # Ordinal ten always reserves this deterministic prompt before allocation so
@@ -986,20 +1050,2118 @@ CREATE INDEX IF NOT EXISTS idx_reply_slot_scope
     ON reply_slots(reply_scope_id, reply_ordinal);
 """
 
-_LATEST_SCHEMA_VERSION = 19
+
+_IMPLICIT_DEFAULT_ROLE = implicit_default_role()
 
 
+# Session roles are immutable values selected independently for each
+# channel/bot/user/session/Agent scope.  The selection row owns the next
+# version counter so concurrent writers never allocate with an unlocked
+# ``MAX(version) + 1`` query.  Thread bindings are rebuilt to include the
+# complete role/persona identity; pre-v20 bindings belong to the canonical
+# implicit-default role.
+_MIGRATION_20 = f"""
+CREATE TABLE IF NOT EXISTS session_agent_roles (
+    channel TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    external_user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT 'default',
+    agent_id TEXT NOT NULL,
+    role_version INTEGER NOT NULL CHECK (role_version >= 0),
+    normalization_version TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('default','custom')),
+    normalized_content TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL,
+    persona_composition_version TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    created_by TEXT,
+    created_at TEXT,
+    CHECK (
+        (role_version = 0 AND kind = 'default'
+            AND normalized_content = '' AND created_by IS NULL
+            AND created_at IS NULL)
+        OR (role_version > 0 AND created_at IS NOT NULL)
+    ),
+    PRIMARY KEY (
+        channel, bot_id, external_user_id, session_id, agent_id, role_version
+    )
+);
 
-class StoreError(RuntimeError):
-    """Base exception for durable store errors."""
+CREATE TABLE IF NOT EXISTS session_agent_role_selections (
+    channel TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    external_user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT 'default',
+    agent_id TEXT NOT NULL,
+    current_role_version INTEGER NOT NULL CHECK (current_role_version > 0),
+    next_role_version INTEGER NOT NULL CHECK (
+        next_role_version > current_role_version
+    ),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (channel, bot_id, external_user_id, session_id, agent_id),
+    FOREIGN KEY (
+        channel, bot_id, external_user_id, session_id, agent_id,
+        current_role_version
+    ) REFERENCES session_agent_roles(
+        channel, bot_id, external_user_id, session_id, agent_id, role_version
+    ) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_agent_roles_scope
+    ON session_agent_roles(
+        channel, bot_id, external_user_id, session_id, agent_id, role_version
+    );
+"""
 
 
-class NotFoundError(StoreError):
-    pass
+_MIGRATION_20_THREAD_BINDINGS = f"""
+DROP TABLE IF EXISTS thread_bindings_new;
+CREATE TABLE thread_bindings_new (
+    conversation_id TEXT NOT NULL,
+    mode_id TEXT NOT NULL,
+    profile_version INTEGER NOT NULL CHECK (profile_version > 0),
+    policy_version INTEGER NOT NULL CHECK (policy_version > 0),
+    role_version INTEGER NOT NULL DEFAULT 0 CHECK (role_version >= 0),
+    role_snapshot_hash TEXT NOT NULL,
+    persona_composition_version TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (
+        conversation_id, mode_id, profile_version, policy_version,
+        role_version, role_snapshot_hash, persona_composition_version
+    ),
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+        ON DELETE CASCADE
+);
+INSERT INTO thread_bindings_new (
+    conversation_id, mode_id, profile_version, policy_version,
+    role_version, role_snapshot_hash, persona_composition_version,
+    thread_id, updated_at
+)
+SELECT conversation_id, mode_id, profile_version, policy_version,
+       0, '{_IMPLICIT_DEFAULT_ROLE["snapshot_hash"]}',
+       '{ROLE_PERSONA_COMPOSITION_VERSION}', thread_id, updated_at
+FROM thread_bindings;
+DROP TABLE thread_bindings;
+ALTER TABLE thread_bindings_new RENAME TO thread_bindings;
+CREATE INDEX IF NOT EXISTS idx_thread_bindings_thread
+    ON thread_bindings(thread_id);
+"""
 
 
-class InvalidTransition(StoreError):
-    pass
+_MIGRATION_21 = """
+DROP INDEX IF EXISTS idx_thread_bindings_thread;
+CREATE UNIQUE INDEX idx_thread_bindings_thread
+    ON thread_bindings(thread_id);
+"""
+
+
+_MIGRATION_22 = """
+ALTER TABLE command_receipts
+    ADD COLUMN outcome_json TEXT NOT NULL DEFAULT '{}';
+"""
+
+
+_MIGRATION_23 = """
+CREATE TABLE IF NOT EXISTS supervisor_epochs (
+    epoch INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_instance_id TEXT NOT NULL UNIQUE
+        CHECK (length(trim(owner_instance_id)) > 0),
+    channel TEXT NOT NULL CHECK (length(trim(channel)) > 0),
+    bot_id TEXT NOT NULL CHECK (length(trim(bot_id)) > 0),
+    started_at TEXT NOT NULL,
+    stopped_at TEXT,
+    stop_reason TEXT,
+    CHECK (
+        (stopped_at IS NULL AND stop_reason IS NULL)
+        OR (
+            stopped_at IS NOT NULL
+            AND stop_reason IS NOT NULL
+            AND length(trim(stop_reason)) > 0
+        )
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_supervisor_epochs_one_active
+    ON supervisor_epochs ((1))
+    WHERE stopped_at IS NULL;
+"""
+
+
+_MIGRATION_24 = """
+CREATE TABLE IF NOT EXISTS agent_lifecycle (
+    agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    profile_version INTEGER NOT NULL CHECK (
+        typeof(profile_version) = 'integer' AND profile_version > 0
+    ),
+    lifecycle_state TEXT NOT NULL CHECK (
+        lifecycle_state IN ('enabled','disabled','retiring','tombstoned')
+    ),
+    desired_process_state TEXT NOT NULL CHECK (
+        desired_process_state IN ('running','stopped')
+    ),
+    provenance_kind TEXT NOT NULL CHECK (length(trim(provenance_kind)) > 0),
+    provenance_profile_version INTEGER CHECK (
+        provenance_profile_version IS NULL OR (
+            typeof(provenance_profile_version) = 'integer'
+            AND provenance_profile_version > 0
+        )
+    ),
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    retiring_at TEXT,
+    tombstoned_at TEXT,
+    PRIMARY KEY (agent_id, agent_incarnation),
+    FOREIGN KEY (agent_id, profile_version)
+        REFERENCES agent_profiles(agent_id, profile_version) ON DELETE RESTRICT,
+    FOREIGN KEY (agent_id, provenance_profile_version)
+        REFERENCES agent_profiles(agent_id, profile_version) ON DELETE RESTRICT,
+    CHECK (
+        lifecycle_state = 'enabled' OR desired_process_state = 'stopped'
+    ),
+    CHECK (
+        (lifecycle_state IN ('retiring','tombstoned') AND retiring_at IS NOT NULL)
+        OR (lifecycle_state NOT IN ('retiring','tombstoned') AND retiring_at IS NULL)
+    ),
+    CHECK (
+        (lifecycle_state = 'tombstoned' AND tombstoned_at IS NOT NULL)
+        OR (lifecycle_state != 'tombstoned' AND tombstoned_at IS NULL)
+    ),
+    CHECK (
+        provenance_kind != 'legacy_profile'
+        OR provenance_profile_version IS NOT NULL
+    ),
+    CHECK (
+        json_valid(provenance_json) = 1
+        AND json_type(provenance_json) = 'object'
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_lifecycle_one_current
+    ON agent_lifecycle(agent_id)
+    WHERE lifecycle_state != 'tombstoned';
+CREATE INDEX IF NOT EXISTS idx_agent_lifecycle_reconcile
+    ON agent_lifecycle(lifecycle_state, desired_process_state, agent_id);
+
+CREATE TABLE IF NOT EXISTS agent_processes (
+    agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    worker_generation INTEGER NOT NULL CHECK (
+        typeof(worker_generation) = 'integer' AND worker_generation > 0
+    ),
+    supervisor_epoch INTEGER NOT NULL,
+    observed_state TEXT NOT NULL CHECK (
+        observed_state IN (
+            'starting','ready','busy','control_busy','backoff',
+            'quiescing','stopping','stopped'
+        )
+    ),
+    generation_capability_hash TEXT NOT NULL CHECK (
+        length(generation_capability_hash) = 64
+        AND generation_capability_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    lifetime_lock_identity TEXT NOT NULL
+        CHECK (length(trim(lifetime_lock_identity)) > 0),
+    lifetime_lock_acquired_at TEXT NOT NULL,
+    process_lease_identity TEXT NOT NULL
+        CHECK (length(trim(process_lease_identity)) > 0),
+    process_lease_token_hash TEXT NOT NULL CHECK (
+        length(process_lease_token_hash) = 64
+        AND process_lease_token_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    lease_expires_at TEXT NOT NULL,
+    lease_ended_at TEXT,
+    pid INTEGER CHECK (
+        pid IS NULL OR (typeof(pid) = 'integer' AND pid > 0)
+    ),
+    process_group_id INTEGER CHECK (
+        process_group_id IS NULL OR (
+            typeof(process_group_id) = 'integer' AND process_group_id > 0
+        )
+    ),
+    kernel_process_birth_id TEXT,
+    started_at TEXT NOT NULL,
+    hello_frame_id TEXT,
+    hello_payload_hash TEXT,
+    capabilities_frame_id TEXT,
+    capabilities_payload_hash TEXT,
+    capability_snapshot_hash TEXT,
+    handshake_committed_at TEXT,
+    ready_frame_id TEXT,
+    ready_payload_hash TEXT,
+    ready_at TEXT,
+    last_heartbeat_at TEXT,
+    stopped_by_supervisor_epoch INTEGER,
+    cleanup_proof_json TEXT,
+    cleanup_proof_hash TEXT,
+    cleanup_proved_at TEXT,
+    stopped_at TEXT,
+    stop_reason TEXT,
+    last_exit_code INTEGER,
+    last_error TEXT,
+    PRIMARY KEY (agent_id, agent_incarnation, worker_generation),
+    UNIQUE (
+        agent_id, agent_incarnation, worker_generation, supervisor_epoch
+    ),
+    UNIQUE (agent_id, worker_generation),
+    UNIQUE (process_lease_identity),
+    FOREIGN KEY (agent_id, agent_incarnation)
+        REFERENCES agent_lifecycle(agent_id, agent_incarnation)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (supervisor_epoch)
+        REFERENCES supervisor_epochs(epoch) ON DELETE RESTRICT,
+    FOREIGN KEY (stopped_by_supervisor_epoch)
+        REFERENCES supervisor_epochs(epoch) ON DELETE RESTRICT,
+    CHECK (
+        kernel_process_birth_id IS NULL
+        OR length(trim(kernel_process_birth_id)) > 0
+    ),
+    CHECK (
+        hello_payload_hash IS NULL OR (
+            length(hello_payload_hash) = 64
+            AND hello_payload_hash NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    CHECK (
+        capabilities_payload_hash IS NULL OR (
+            length(capabilities_payload_hash) = 64
+            AND capabilities_payload_hash NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    CHECK (
+        capability_snapshot_hash IS NULL OR (
+            length(capability_snapshot_hash) = 64
+            AND capability_snapshot_hash NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    CHECK (
+        ready_payload_hash IS NULL OR (
+            length(ready_payload_hash) = 64
+            AND ready_payload_hash NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    CHECK (
+        cleanup_proof_hash IS NULL OR (
+            length(cleanup_proof_hash) = 64
+            AND cleanup_proof_hash NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    CHECK (
+        (
+            hello_frame_id IS NULL AND hello_payload_hash IS NULL
+            AND capabilities_frame_id IS NULL
+            AND capabilities_payload_hash IS NULL
+            AND capability_snapshot_hash IS NULL
+            AND handshake_committed_at IS NULL
+        ) OR (
+            hello_frame_id IS NOT NULL AND length(trim(hello_frame_id)) > 0
+            AND hello_payload_hash IS NOT NULL
+            AND length(trim(hello_payload_hash)) > 0
+            AND capabilities_frame_id IS NOT NULL
+            AND length(trim(capabilities_frame_id)) > 0
+            AND capabilities_payload_hash IS NOT NULL
+            AND length(trim(capabilities_payload_hash)) > 0
+            AND capability_snapshot_hash IS NOT NULL
+            AND length(trim(capability_snapshot_hash)) > 0
+            AND handshake_committed_at IS NOT NULL
+        )
+    ),
+    CHECK (
+        (
+            ready_frame_id IS NULL AND ready_payload_hash IS NULL
+            AND ready_at IS NULL
+        ) OR (
+            ready_frame_id IS NOT NULL AND length(trim(ready_frame_id)) > 0
+            AND ready_payload_hash IS NOT NULL
+            AND length(trim(ready_payload_hash)) > 0
+            AND ready_at IS NOT NULL
+        )
+    ),
+    CHECK (
+        ready_at IS NULL OR handshake_committed_at IS NOT NULL
+    ),
+    CHECK (
+        observed_state NOT IN ('ready','busy','control_busy')
+        OR (
+            handshake_committed_at IS NOT NULL AND ready_at IS NOT NULL
+            AND pid IS NOT NULL AND process_group_id IS NOT NULL
+            AND kernel_process_birth_id IS NOT NULL
+        )
+    ),
+    CHECK (
+        (
+            observed_state = 'stopped'
+            AND stopped_by_supervisor_epoch IS NOT NULL
+            AND cleanup_proof_json IS NOT NULL
+            AND json_valid(cleanup_proof_json) = 1
+            AND json_type(cleanup_proof_json) = 'object'
+            AND json_extract(cleanup_proof_json, '$.proof_kind')
+                IN ('verified_empty_v1','never_spawned_v1')
+            AND json_extract(cleanup_proof_json, '$.runtime_stopped') = 1
+            AND json_extract(cleanup_proof_json, '$.process_group_empty') = 1
+            AND json_extract(cleanup_proof_json, '$.invocation_jobs_empty') = 1
+            AND json_extract(cleanup_proof_json, '$.lifetime_lock_released') = 1
+            AND cleanup_proof_hash IS NOT NULL
+            AND length(trim(cleanup_proof_hash)) > 0
+            AND cleanup_proved_at IS NOT NULL
+            AND stopped_at IS NOT NULL
+            AND lease_ended_at IS NOT NULL
+            AND stop_reason IS NOT NULL AND length(trim(stop_reason)) > 0
+        ) OR (
+            observed_state != 'stopped'
+            AND stopped_by_supervisor_epoch IS NULL
+            AND cleanup_proof_json IS NULL
+            AND cleanup_proof_hash IS NULL
+            AND cleanup_proved_at IS NULL
+            AND stopped_at IS NULL
+            AND lease_ended_at IS NULL
+            AND stop_reason IS NULL
+        )
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_processes_one_live_agent
+    ON agent_processes(agent_id)
+    WHERE observed_state != 'stopped';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_processes_one_live_lifetime_lock
+    ON agent_processes(lifetime_lock_identity)
+    WHERE observed_state != 'stopped';
+CREATE INDEX IF NOT EXISTS idx_agent_processes_reconcile
+    ON agent_processes(observed_state, lease_expires_at, agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_processes_epoch
+    ON agent_processes(supervisor_epoch, observed_state);
+"""
+
+
+_MIGRATION_25 = """
+CREATE TABLE IF NOT EXISTS agent_lifecycle_events (
+    lifecycle_event_id TEXT PRIMARY KEY
+        CHECK (length(trim(lifecycle_event_id)) > 0),
+    idempotency_key TEXT NOT NULL UNIQUE
+        CHECK (length(trim(idempotency_key)) > 0),
+    agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    event_sequence INTEGER NOT NULL CHECK (
+        typeof(event_sequence) = 'integer' AND event_sequence > 0
+    ),
+    event_kind TEXT NOT NULL CHECK (
+        event_kind IN (
+            'migration_seed','compatibility_reconciled',
+            'profile_published','profile_prepared','retired','deleted',
+            'reactivated','deletion_cleared'
+        )
+    ),
+    previous_profile_version INTEGER CHECK (
+        previous_profile_version IS NULL OR (
+            typeof(previous_profile_version) = 'integer'
+            AND previous_profile_version > 0
+        )
+    ),
+    previous_lifecycle_state TEXT CHECK (
+        previous_lifecycle_state IS NULL OR previous_lifecycle_state IN (
+            'enabled','disabled','retiring','tombstoned'
+        )
+    ),
+    previous_desired_process_state TEXT CHECK (
+        previous_desired_process_state IS NULL
+        OR previous_desired_process_state IN ('running','stopped')
+    ),
+    new_profile_version INTEGER NOT NULL CHECK (
+        typeof(new_profile_version) = 'integer' AND new_profile_version > 0
+    ),
+    new_lifecycle_state TEXT NOT NULL CHECK (
+        new_lifecycle_state IN ('enabled','disabled','retiring','tombstoned')
+    ),
+    new_desired_process_state TEXT NOT NULL CHECK (
+        new_desired_process_state IN ('running','stopped')
+    ),
+    actor_kind TEXT NOT NULL CHECK (
+        actor_kind IN (
+            'migration','system','compatibility_actor',
+            'compatibility_unattributed'
+        )
+    ),
+    actor_id TEXT,
+    source_kind TEXT NOT NULL CHECK (length(trim(source_kind)) > 0),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) > 0),
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE (agent_id, agent_incarnation, event_sequence),
+    FOREIGN KEY (agent_id, agent_incarnation)
+        REFERENCES agent_lifecycle(agent_id, agent_incarnation)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (agent_id, previous_profile_version)
+        REFERENCES agent_profiles(agent_id, profile_version)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (agent_id, new_profile_version)
+        REFERENCES agent_profiles(agent_id, profile_version)
+        ON DELETE RESTRICT,
+    CHECK (
+        (
+            previous_profile_version IS NULL
+            AND previous_lifecycle_state IS NULL
+            AND previous_desired_process_state IS NULL
+        ) OR (
+            previous_profile_version IS NOT NULL
+            AND previous_lifecycle_state IS NOT NULL
+            AND previous_desired_process_state IS NOT NULL
+        )
+    ),
+    CHECK (
+        new_lifecycle_state = 'enabled'
+        OR new_desired_process_state = 'stopped'
+    ),
+    CHECK (
+        (
+            actor_kind = 'compatibility_unattributed'
+            AND actor_id IS NULL
+        ) OR (
+            actor_kind != 'compatibility_unattributed'
+            AND actor_id IS NOT NULL
+            AND length(trim(actor_id)) > 0
+        )
+    ),
+    CHECK (
+        json_valid(provenance_json) = 1
+        AND json_type(provenance_json) = 'object'
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_lifecycle_events_agent
+    ON agent_lifecycle_events(
+        agent_id, agent_incarnation, event_sequence
+    );
+CREATE INDEX IF NOT EXISTS idx_agent_lifecycle_events_source
+    ON agent_lifecycle_events(source_kind, source_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_lifecycle_events_no_update
+BEFORE UPDATE ON agent_lifecycle_events
+BEGIN
+    SELECT RAISE(ABORT, 'agent lifecycle events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_lifecycle_events_no_delete
+BEFORE DELETE ON agent_lifecycle_events
+BEGIN
+    SELECT RAISE(ABORT, 'agent lifecycle events are append-only');
+END;
+"""
+
+
+_MIGRATION_26_TABLES = """
+CREATE TABLE tasks_v26 (
+    task_id TEXT PRIMARY KEY,
+    dedupe_key TEXT UNIQUE,
+    inbound_message_id TEXT,
+    channel TEXT NOT NULL DEFAULT '',
+    bot_id TEXT NOT NULL DEFAULT '',
+    external_user_id TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT 'default',
+    agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    conversation_id TEXT NOT NULL,
+    thread_id TEXT,
+    mode_id TEXT NOT NULL,
+    profile_version INTEGER NOT NULL,
+    policy_version INTEGER NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    reasoning_effort TEXT NOT NULL DEFAULT '',
+    reply_target_json TEXT NOT NULL DEFAULT '{}',
+    inputs_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN (
+        'queued','dispatching','running','cancel_requested','completed',
+        'failed','interrupted','cancelled','orphaned'
+    )),
+    current_execution_id TEXT,
+    claimed_by TEXT,
+    claim_token TEXT,
+    lease_expires_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at TEXT,
+    last_error TEXT,
+    result_json TEXT,
+    parent_task_id TEXT,
+    child_depth INTEGER NOT NULL DEFAULT 0 CHECK (child_depth >= 0),
+    request_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    terminal_at TEXT,
+    cancel_requested_at TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    pending_delivery_reply_scope_id TEXT,
+    UNIQUE (inbound_message_id),
+    UNIQUE (task_id, agent_id, agent_incarnation),
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id),
+    FOREIGN KEY (agent_id, profile_version)
+      REFERENCES agent_profiles(agent_id, profile_version),
+    FOREIGN KEY (agent_id, mode_id, policy_version)
+      REFERENCES agent_modes(agent_id, mode_id, policy_version),
+    FOREIGN KEY (agent_id, agent_incarnation)
+      REFERENCES agent_lifecycle(agent_id, agent_incarnation) ON DELETE RESTRICT,
+    FOREIGN KEY (current_execution_id)
+      REFERENCES task_executions(execution_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (
+        current_execution_id, task_id, agent_id, agent_incarnation
+    ) REFERENCES task_executions(
+        execution_id, task_id, agent_id, agent_incarnation
+    ) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (pending_delivery_reply_scope_id)
+      REFERENCES reply_scopes(reply_scope_id) ON DELETE SET NULL,
+    CHECK (
+        (state IN ('queued','completed','failed','interrupted','cancelled','orphaned')
+         AND claimed_by IS NULL AND claim_token IS NULL
+         AND lease_expires_at IS NULL)
+        OR
+        (state IN ('dispatching','running','cancel_requested')
+         AND claimed_by IS NOT NULL AND length(trim(claimed_by)) > 0
+         AND claim_token IS NOT NULL AND length(trim(claim_token)) > 0
+         AND lease_expires_at IS NOT NULL)
+    )
+);
+
+CREATE TABLE task_executions_v26 (
+    execution_id TEXT PRIMARY KEY CHECK (length(trim(execution_id)) > 0),
+    task_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt > 0),
+    agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    state TEXT NOT NULL CHECK (state IN (
+        'queued','dispatching','running','cancel_requested','completed',
+        'failed','interrupted','cancelled','orphaned'
+    )),
+    dispatch_backend TEXT NOT NULL CHECK (
+        dispatch_backend IN ('compatibility','child')
+    ),
+    worker_id TEXT,
+    claim_token TEXT,
+    lease_expires_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    last_error TEXT,
+    external_turn_id TEXT,
+    created_at TEXT NOT NULL,
+    delivery_reply_scope_id TEXT,
+    UNIQUE (task_id, attempt),
+    UNIQUE (execution_id, task_id, agent_id, agent_incarnation),
+    UNIQUE (
+        execution_id, task_id, agent_id, agent_incarnation, dispatch_backend
+    ),
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id, agent_id, agent_incarnation)
+      REFERENCES tasks(task_id, agent_id, agent_incarnation) ON DELETE CASCADE,
+    FOREIGN KEY (agent_id, agent_incarnation)
+      REFERENCES agent_lifecycle(agent_id, agent_incarnation) ON DELETE RESTRICT,
+    FOREIGN KEY (execution_id)
+      REFERENCES agent_invocations(invocation_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (
+        execution_id, task_id, agent_id, agent_incarnation, dispatch_backend
+    ) REFERENCES agent_invocations(
+        invocation_id, task_id, agent_id, agent_incarnation, dispatch_backend
+    ) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (delivery_reply_scope_id)
+      REFERENCES reply_scopes(reply_scope_id) ON DELETE SET NULL,
+    CHECK (
+        (state = 'queued' AND worker_id IS NULL AND claim_token IS NULL
+         AND lease_expires_at IS NULL AND finished_at IS NULL)
+        OR
+        (state IN ('dispatching','running','cancel_requested')
+         AND worker_id IS NOT NULL AND length(trim(worker_id)) > 0
+         AND claim_token IS NOT NULL AND length(trim(claim_token)) > 0
+         AND lease_expires_at IS NOT NULL AND finished_at IS NULL)
+        OR
+        (state IN ('completed','failed','interrupted','cancelled','orphaned')
+         AND lease_expires_at IS NULL AND finished_at IS NOT NULL)
+    )
+);
+
+CREATE TABLE agent_mailbox_v26 (
+    mailbox_id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL UNIQUE,
+    request_id TEXT NOT NULL,
+    reply_to_id TEXT,
+    causation_id TEXT,
+    source_agent_id TEXT NOT NULL,
+    destination_agent_id TEXT NOT NULL,
+    destination_agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(destination_agent_incarnation) = 'integer'
+        AND destination_agent_incarnation > 0
+    ),
+    task_id TEXT,
+    content TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    execution_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN (
+        'pending','dispatching','processing','processed','rejected',
+        'dead_letter','expired','orphaned_mailbox'
+    )),
+    current_invocation_id TEXT,
+    claimed_by TEXT,
+    claim_token TEXT,
+    lease_expires_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    processed_at TEXT,
+    UNIQUE (
+        mailbox_id, message_id, destination_agent_id,
+        destination_agent_incarnation
+    ),
+    FOREIGN KEY (message_id) REFERENCES messages(message_id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE SET NULL,
+    FOREIGN KEY (destination_agent_id, destination_agent_incarnation)
+      REFERENCES agent_lifecycle(agent_id, agent_incarnation) ON DELETE RESTRICT,
+    FOREIGN KEY (current_invocation_id)
+      REFERENCES agent_invocations(invocation_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (
+        current_invocation_id, mailbox_id, message_id,
+        destination_agent_id, destination_agent_incarnation
+    ) REFERENCES agent_invocations(
+        invocation_id, mailbox_id, work_id, agent_id, agent_incarnation
+    ) DEFERRABLE INITIALLY DEFERRED,
+    CHECK (
+        (state IN ('pending','processed','rejected','dead_letter','expired','orphaned_mailbox')
+         AND claimed_by IS NULL AND claim_token IS NULL
+         AND lease_expires_at IS NULL)
+        OR
+        (state IN ('dispatching','processing')
+         AND claimed_by IS NOT NULL AND length(trim(claimed_by)) > 0
+         AND claim_token IS NOT NULL AND length(trim(claim_token)) > 0
+         AND lease_expires_at IS NOT NULL)
+    )
+);
+
+CREATE TABLE agent_invocations (
+    invocation_id TEXT PRIMARY KEY CHECK (length(trim(invocation_id)) > 0),
+    work_kind TEXT NOT NULL CHECK (work_kind IN ('task','mailbox')),
+    work_id TEXT NOT NULL CHECK (length(trim(work_id)) > 0),
+    agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    state TEXT NOT NULL CHECK (state IN (
+        'queued','dispatching','running','cancel_requested','completed',
+        'failed','interrupted','cancelled','orphaned'
+    )),
+    dispatch_backend TEXT NOT NULL CHECK (
+        dispatch_backend IN ('compatibility','child')
+    ),
+    ready_sequence INTEGER NOT NULL CHECK (
+        typeof(ready_sequence) = 'integer' AND ready_sequence > 0
+    ),
+    task_id TEXT,
+    execution_id TEXT,
+    mailbox_id TEXT,
+    claimed_by TEXT,
+    claim_token TEXT,
+    lease_expires_at TEXT,
+    next_attempt_at TEXT,
+    admission_released_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    terminal_at TEXT,
+    last_error TEXT,
+    UNIQUE (agent_id, agent_incarnation, ready_sequence),
+    UNIQUE (execution_id),
+    UNIQUE (invocation_id, agent_id, agent_incarnation, dispatch_backend),
+    UNIQUE (
+        invocation_id, task_id, agent_id, agent_incarnation, dispatch_backend
+    ),
+    UNIQUE (
+        invocation_id, mailbox_id, work_id, agent_id, agent_incarnation
+    ),
+    FOREIGN KEY (agent_id, agent_incarnation)
+      REFERENCES agent_lifecycle(agent_id, agent_incarnation) ON DELETE RESTRICT,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id, agent_id, agent_incarnation)
+      REFERENCES tasks(task_id, agent_id, agent_incarnation) ON DELETE CASCADE,
+    FOREIGN KEY (execution_id)
+      REFERENCES task_executions(execution_id) ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (
+        execution_id, task_id, agent_id, agent_incarnation, dispatch_backend
+    ) REFERENCES task_executions(
+        execution_id, task_id, agent_id, agent_incarnation, dispatch_backend
+    ) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (mailbox_id)
+      REFERENCES agent_mailbox(mailbox_id) ON DELETE CASCADE
+      DEFERRABLE INITIALLY DEFERRED,
+    CHECK (
+        (work_kind = 'task' AND task_id IS NOT NULL
+         AND execution_id = invocation_id AND work_id = invocation_id
+         AND mailbox_id IS NULL)
+        OR
+        (work_kind = 'mailbox' AND task_id IS NULL AND execution_id IS NULL
+         AND mailbox_id IS NOT NULL)
+    ),
+    CHECK (
+        (state = 'queued' AND claimed_by IS NULL AND claim_token IS NULL
+         AND lease_expires_at IS NULL AND admission_released_at IS NULL
+         AND terminal_at IS NULL)
+        OR
+        (state IN ('dispatching','running','cancel_requested')
+         AND claimed_by IS NOT NULL AND length(trim(claimed_by)) > 0
+         AND claim_token IS NOT NULL AND length(trim(claim_token)) > 0
+         AND lease_expires_at IS NOT NULL
+         AND admission_released_at IS NULL AND terminal_at IS NULL)
+        OR
+        (state IN ('completed','failed','interrupted','cancelled','orphaned')
+         AND lease_expires_at IS NULL AND admission_released_at IS NOT NULL
+         AND terminal_at IS NOT NULL)
+    )
+);
+
+CREATE TABLE agent_admission_counters (
+    agent_id TEXT NOT NULL,
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    unfinished_count INTEGER NOT NULL DEFAULT 0 CHECK (unfinished_count >= 0),
+    next_ready_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_ready_sequence > 0),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (agent_id, agent_incarnation),
+    FOREIGN KEY (agent_id, agent_incarnation)
+      REFERENCES agent_lifecycle(agent_id, agent_incarnation) ON DELETE RESTRICT
+);
+
+CREATE TABLE global_agent_admission_counter (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    unfinished_count INTEGER NOT NULL DEFAULT 0 CHECK (unfinished_count >= 0),
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE agent_execution_slots (
+    slot_id TEXT PRIMARY KEY CHECK (length(trim(slot_id)) > 0),
+    agent_id TEXT NOT NULL,
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    slot_sequence INTEGER NOT NULL CHECK (slot_sequence > 0),
+    slot_kind TEXT NOT NULL DEFAULT 'invocation' CHECK (
+        slot_kind IN ('invocation','control')
+    ),
+    state TEXT NOT NULL CHECK (state IN ('active','released')),
+    dispatch_backend TEXT NOT NULL CHECK (dispatch_backend = 'child'),
+    invocation_id TEXT,
+    worker_generation INTEGER NOT NULL CHECK (worker_generation > 0),
+    acquired_at TEXT NOT NULL,
+    released_at TEXT,
+    UNIQUE (agent_id, agent_incarnation, slot_sequence),
+    UNIQUE (
+        slot_id, invocation_id, agent_id, agent_incarnation,
+        worker_generation, dispatch_backend
+    ),
+    FOREIGN KEY (agent_id, agent_incarnation)
+      REFERENCES agent_lifecycle(agent_id, agent_incarnation) ON DELETE RESTRICT,
+    FOREIGN KEY (agent_id, agent_incarnation, worker_generation)
+      REFERENCES agent_processes(agent_id, agent_incarnation, worker_generation)
+      ON DELETE RESTRICT,
+    FOREIGN KEY (invocation_id)
+      REFERENCES agent_invocations(invocation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (
+        invocation_id, agent_id, agent_incarnation, dispatch_backend
+    ) REFERENCES agent_invocations(
+        invocation_id, agent_id, agent_incarnation, dispatch_backend
+    ) ON DELETE RESTRICT,
+    CHECK (
+        (slot_kind = 'invocation' AND invocation_id IS NOT NULL)
+        OR (slot_kind = 'control' AND invocation_id IS NULL)
+    ),
+    CHECK (
+        (state = 'active' AND released_at IS NULL)
+        OR (state = 'released' AND released_at IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX idx_agent_execution_slots_one_active
+    ON agent_execution_slots(agent_id, agent_incarnation)
+    WHERE state = 'active';
+
+CREATE TABLE agent_dispatch_attempts (
+    dispatch_attempt_id TEXT PRIMARY KEY
+      CHECK (length(trim(dispatch_attempt_id)) > 0),
+    invocation_id TEXT NOT NULL,
+    slot_id TEXT NOT NULL UNIQUE,
+    agent_id TEXT NOT NULL,
+    agent_incarnation INTEGER NOT NULL CHECK (agent_incarnation > 0),
+    worker_generation INTEGER NOT NULL CHECK (worker_generation > 0),
+    supervisor_epoch INTEGER NOT NULL,
+    dispatch_backend TEXT NOT NULL CHECK (dispatch_backend = 'child'),
+    claim_token_hash TEXT NOT NULL CHECK (
+        length(claim_token_hash) = 64
+        AND claim_token_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    lease_identity TEXT NOT NULL UNIQUE CHECK (length(trim(lease_identity)) > 0),
+    lease_expires_at TEXT NOT NULL,
+    invocation_job_identity TEXT NOT NULL UNIQUE
+      CHECK (length(trim(invocation_job_identity)) > 0),
+    grant_issued_at TEXT,
+    abort_committed_at TEXT,
+    rejection_committed_at TEXT,
+    runtime_stopped_at TEXT,
+    invocation_job_empty_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (invocation_id)
+      REFERENCES agent_invocations(invocation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (
+        invocation_id, agent_id, agent_incarnation, dispatch_backend
+    ) REFERENCES agent_invocations(
+        invocation_id, agent_id, agent_incarnation, dispatch_backend
+    ) ON DELETE RESTRICT,
+    FOREIGN KEY (slot_id)
+      REFERENCES agent_execution_slots(slot_id) ON DELETE RESTRICT,
+    FOREIGN KEY (
+        slot_id, invocation_id, agent_id, agent_incarnation,
+        worker_generation, dispatch_backend
+    ) REFERENCES agent_execution_slots(
+        slot_id, invocation_id, agent_id, agent_incarnation,
+        worker_generation, dispatch_backend
+    ) ON DELETE RESTRICT,
+    FOREIGN KEY (agent_id, agent_incarnation, worker_generation)
+      REFERENCES agent_processes(agent_id, agent_incarnation, worker_generation)
+      ON DELETE RESTRICT,
+    FOREIGN KEY (
+        agent_id, agent_incarnation, worker_generation, supervisor_epoch
+    ) REFERENCES agent_processes(
+        agent_id, agent_incarnation, worker_generation, supervisor_epoch
+    ) ON DELETE RESTRICT,
+    FOREIGN KEY (supervisor_epoch)
+      REFERENCES supervisor_epochs(epoch) ON DELETE RESTRICT,
+    CHECK (
+        (grant_issued_at IS NOT NULL) + (abort_committed_at IS NOT NULL)
+        + (rejection_committed_at IS NOT NULL) <= 1
+    ),
+    CHECK (
+        (runtime_stopped_at IS NULL AND invocation_job_empty_at IS NULL)
+        OR (runtime_stopped_at IS NOT NULL AND invocation_job_empty_at IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_agent_dispatch_attempts_invocation
+    ON agent_dispatch_attempts(invocation_id, created_at);
+"""
+
+
+_MIGRATION_26_INDEXES = """
+CREATE INDEX idx_tasks_queue
+    ON tasks(agent_id, agent_incarnation, state, next_attempt_at, created_at);
+CREATE INDEX idx_tasks_conversation
+    ON tasks(channel, bot_id, external_user_id, session_id, agent_id, state);
+CREATE INDEX idx_tasks_request ON tasks(request_id);
+CREATE INDEX idx_executions_task ON task_executions(task_id, attempt);
+CREATE INDEX idx_executions_state
+    ON task_executions(agent_id, agent_incarnation, state, created_at);
+CREATE INDEX idx_mailbox_destination
+    ON agent_mailbox(destination_agent_id, destination_agent_incarnation,
+                     state, next_attempt_at, created_at);
+CREATE INDEX idx_mailbox_request ON agent_mailbox(request_id);
+CREATE UNIQUE INDEX idx_mailbox_destination_request
+    ON agent_mailbox(destination_agent_id, request_id);
+CREATE INDEX idx_agent_invocations_ready
+    ON agent_invocations(agent_id, agent_incarnation, state,
+                         next_attempt_at, ready_sequence);
+CREATE INDEX idx_agent_invocations_work
+    ON agent_invocations(work_kind, work_id, created_at);
+CREATE INDEX idx_agent_invocations_mailbox
+    ON agent_invocations(mailbox_id, created_at);
+"""
+
+
+_MIGRATION_27_DISPATCH_ATTEMPT_TRIGGERS = """
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_insert_valid;
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_update_valid;
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_immutable;
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_no_delete;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_insert_valid
+BEFORE INSERT ON agent_dispatch_attempts
+WHEN
+    (
+        (NEW.grant_issued_at IS NOT NULL)
+        + (NEW.abort_committed_at IS NOT NULL)
+        + (NEW.rejection_committed_at IS NOT NULL)
+    ) = 0
+    AND (
+        NEW.decision_code IS NOT NULL
+        OR NEW.decision_outcome_state IS NOT NULL
+        OR NEW.cleanup_proof_hash IS NOT NULL
+    )
+    OR
+    (
+        (NEW.grant_issued_at IS NOT NULL)
+        + (NEW.abort_committed_at IS NOT NULL)
+        + (NEW.rejection_committed_at IS NOT NULL)
+    ) = 1
+    AND (
+        NEW.decision_code IS NULL
+        OR NEW.decision_outcome_state IS NULL
+    )
+    OR (NEW.grant_issued_at IS NOT NULL
+        AND NEW.decision_outcome_state != 'running')
+    OR (NEW.abort_committed_at IS NOT NULL
+        AND NEW.decision_outcome_state NOT IN ('queued','cancelled','failed'))
+    OR (NEW.rejection_committed_at IS NOT NULL
+        AND NEW.decision_outcome_state NOT IN ('queued','failed'))
+    OR NOT (
+        (
+            NEW.runtime_stopped_at IS NULL
+            AND NEW.invocation_job_empty_at IS NULL
+            AND NEW.cleanup_proof_hash IS NULL
+        )
+        OR (
+            NEW.runtime_stopped_at IS NOT NULL
+            AND NEW.invocation_job_empty_at IS NOT NULL
+            AND NEW.cleanup_proof_hash IS NOT NULL
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid dispatch attempt decision metadata');
+END;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_update_valid
+BEFORE UPDATE ON agent_dispatch_attempts
+WHEN
+    (
+        (NEW.grant_issued_at IS NOT NULL)
+        + (NEW.abort_committed_at IS NOT NULL)
+        + (NEW.rejection_committed_at IS NOT NULL)
+    ) = 0
+    AND (
+        NEW.decision_code IS NOT NULL
+        OR NEW.decision_outcome_state IS NOT NULL
+        OR NEW.cleanup_proof_hash IS NOT NULL
+    )
+    OR
+    (
+        (NEW.grant_issued_at IS NOT NULL)
+        + (NEW.abort_committed_at IS NOT NULL)
+        + (NEW.rejection_committed_at IS NOT NULL)
+    ) = 1
+    AND (
+        NEW.decision_code IS NULL
+        OR NEW.decision_outcome_state IS NULL
+    )
+    OR (NEW.grant_issued_at IS NOT NULL
+        AND NEW.decision_outcome_state != 'running')
+    OR (NEW.abort_committed_at IS NOT NULL
+        AND NEW.decision_outcome_state NOT IN ('queued','cancelled','failed'))
+    OR (NEW.rejection_committed_at IS NOT NULL
+        AND NEW.decision_outcome_state NOT IN ('queued','failed'))
+    OR NOT (
+        (
+            NEW.runtime_stopped_at IS NULL
+            AND NEW.invocation_job_empty_at IS NULL
+            AND NEW.cleanup_proof_hash IS NULL
+        )
+        OR (
+            NEW.runtime_stopped_at IS NOT NULL
+            AND NEW.invocation_job_empty_at IS NOT NULL
+            AND NEW.cleanup_proof_hash IS NOT NULL
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid dispatch attempt decision metadata');
+END;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_immutable
+BEFORE UPDATE ON agent_dispatch_attempts
+WHEN
+    NEW.dispatch_attempt_id IS NOT OLD.dispatch_attempt_id
+    OR NEW.invocation_id IS NOT OLD.invocation_id
+    OR NEW.slot_id IS NOT OLD.slot_id
+    OR NEW.agent_id IS NOT OLD.agent_id
+    OR NEW.agent_incarnation IS NOT OLD.agent_incarnation
+    OR NEW.worker_generation IS NOT OLD.worker_generation
+    OR NEW.supervisor_epoch IS NOT OLD.supervisor_epoch
+    OR NEW.dispatch_backend IS NOT OLD.dispatch_backend
+    OR NEW.claim_token_hash IS NOT OLD.claim_token_hash
+    OR NEW.lease_identity IS NOT OLD.lease_identity
+    OR NEW.lease_expires_at IS NOT OLD.lease_expires_at
+    OR NEW.invocation_job_identity IS NOT OLD.invocation_job_identity
+    OR NEW.created_at IS NOT OLD.created_at
+    OR (OLD.grant_issued_at IS NOT NULL
+        AND NEW.grant_issued_at IS NOT OLD.grant_issued_at)
+    OR (OLD.abort_committed_at IS NOT NULL
+        AND NEW.abort_committed_at IS NOT OLD.abort_committed_at)
+    OR (OLD.rejection_committed_at IS NOT NULL
+        AND NEW.rejection_committed_at IS NOT OLD.rejection_committed_at)
+    OR (OLD.decision_code IS NOT NULL
+        AND NEW.decision_code IS NOT OLD.decision_code)
+    OR (OLD.decision_outcome_state IS NOT NULL
+        AND NEW.decision_outcome_state IS NOT OLD.decision_outcome_state)
+    OR (OLD.runtime_stopped_at IS NOT NULL
+        AND NEW.runtime_stopped_at IS NOT OLD.runtime_stopped_at)
+    OR (OLD.invocation_job_empty_at IS NOT NULL
+        AND NEW.invocation_job_empty_at IS NOT OLD.invocation_job_empty_at)
+    OR (OLD.cleanup_proof_hash IS NOT NULL
+        AND NEW.cleanup_proof_hash IS NOT OLD.cleanup_proof_hash)
+BEGIN
+    SELECT RAISE(ABORT, 'dispatch attempt identity is immutable');
+END;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_no_delete
+BEFORE DELETE ON agent_dispatch_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'dispatch attempts are append-only');
+END;
+"""
+
+
+_MIGRATION_28_MAILBOX_LIFECYCLE = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_mailbox_identity_v28
+    ON agent_mailbox(mailbox_id, message_id);
+
+CREATE TABLE IF NOT EXISTS agent_invocation_events (
+    invocation_event_id TEXT PRIMARY KEY
+        CHECK (length(trim(invocation_event_id)) > 0),
+    invocation_id TEXT NOT NULL,
+    event_sequence INTEGER NOT NULL CHECK (
+        typeof(event_sequence) = 'integer' AND event_sequence > 0
+    ),
+    event_kind TEXT NOT NULL CHECK (event_kind IN (
+        'migration_snapshot','invocation_created','state_transition',
+        'orphan_review_resolved'
+    )),
+    previous_state TEXT CHECK (
+        previous_state IS NULL OR previous_state IN (
+            'queued','dispatching','running','cancel_requested','completed',
+            'failed','interrupted','cancelled','orphaned'
+        )
+    ),
+    new_state TEXT NOT NULL CHECK (new_state IN (
+        'queued','dispatching','running','cancel_requested','completed',
+        'failed','interrupted','cancelled','orphaned'
+    )),
+    source_kind TEXT NOT NULL CHECK (length(trim(source_kind)) > 0),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) > 0),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE (invocation_id, event_sequence),
+    FOREIGN KEY (invocation_id)
+        REFERENCES agent_invocations(invocation_id) ON DELETE RESTRICT,
+    CHECK (json_valid(metadata_json) = 1
+           AND json_type(metadata_json) = 'object'),
+    CHECK (
+        (event_kind IN ('migration_snapshot','invocation_created')
+         AND previous_state IS NULL)
+        OR
+        (event_kind = 'state_transition'
+         AND previous_state IS NOT NULL AND previous_state != new_state)
+        OR
+        (event_kind = 'orphan_review_resolved'
+         AND previous_state = 'orphaned' AND new_state = 'orphaned')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_invocation_events_invocation
+    ON agent_invocation_events(invocation_id, event_sequence);
+
+CREATE TABLE IF NOT EXISTS mailbox_orphan_reviews (
+    mailbox_maintenance_id TEXT PRIMARY KEY CHECK (
+        length(trim(mailbox_maintenance_id)) BETWEEN 1 AND 128
+    ),
+    payload_hash TEXT NOT NULL CHECK (
+        length(payload_hash) = 64
+        AND payload_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    mailbox_id TEXT NOT NULL,
+    mailbox_message_id TEXT NOT NULL,
+    expected_current_invocation_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('retry','dead_letter')),
+    actor TEXT NOT NULL CHECK (length(trim(actor)) > 0),
+    reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    authorized_at TEXT NOT NULL,
+    authorization_source TEXT NOT NULL CHECK (
+        length(trim(authorization_source)) > 0
+    ),
+    administrator_authorized INTEGER NOT NULL CHECK (
+        typeof(administrator_authorized) = 'integer'
+        AND administrator_authorized = 1
+    ),
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'retried','dead_lettered','rejected_expired',
+        'rejected_agent_unavailable','rejected_queue_full'
+    )),
+    replacement_invocation_id TEXT,
+    reviewed_at TEXT NOT NULL,
+    FOREIGN KEY (mailbox_id, mailbox_message_id)
+        REFERENCES agent_mailbox(mailbox_id, message_id) ON DELETE RESTRICT,
+    FOREIGN KEY (expected_current_invocation_id)
+        REFERENCES agent_invocations(invocation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (replacement_invocation_id)
+        REFERENCES agent_invocations(invocation_id) ON DELETE RESTRICT,
+    CHECK (
+        (action = 'dead_letter' AND outcome = 'dead_lettered'
+         AND replacement_invocation_id IS NULL)
+        OR
+        (action = 'retry' AND outcome = 'retried'
+         AND replacement_invocation_id IS NOT NULL
+         AND replacement_invocation_id != expected_current_invocation_id)
+        OR
+        (action = 'retry' AND outcome IN (
+            'rejected_expired','rejected_agent_unavailable',
+            'rejected_queue_full'
+         ) AND replacement_invocation_id IS NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_mailbox_orphan_reviews_mailbox
+    ON mailbox_orphan_reviews(mailbox_id, reviewed_at);
+
+INSERT OR IGNORE INTO agent_invocation_events (
+    invocation_event_id, invocation_id, event_sequence, event_kind,
+    previous_state, new_state, source_kind, source_id, metadata_json, created_at
+)
+SELECT
+    'invocation-event:migration-v28:' || invocation_id,
+    invocation_id,
+    1,
+    'migration_snapshot',
+    NULL,
+    state,
+    'migration',
+    'schema-v28',
+    '{"schema_version":28}',
+    updated_at
+FROM agent_invocations;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_mailbox_expiry_insert_valid
+BEFORE INSERT ON agent_mailbox
+WHEN NEW.expires_at IS NULL OR length(trim(NEW.expires_at)) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox expiry is required');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_mailbox_expiry_immutable
+BEFORE UPDATE ON agent_mailbox
+WHEN NEW.expires_at IS NOT OLD.expires_at
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox expiry is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_invocation_expiry_insert_valid
+BEFORE INSERT ON agent_invocations
+WHEN
+    (NEW.work_kind = 'task' AND NEW.expires_at IS NOT NULL)
+    OR
+    (NEW.work_kind = 'mailbox' AND (
+        NEW.expires_at IS NULL
+        OR NOT EXISTS (
+            SELECT 1 FROM agent_mailbox AS mailbox
+             WHERE mailbox.mailbox_id = NEW.mailbox_id
+               AND mailbox.message_id = NEW.work_id
+               AND mailbox.destination_agent_id = NEW.agent_id
+               AND mailbox.destination_agent_incarnation = NEW.agent_incarnation
+               AND mailbox.expires_at IS NEW.expires_at
+        )
+    ))
+BEGIN
+    SELECT RAISE(ABORT, 'invocation expiry conflicts with work identity');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_invocation_expiry_update_valid
+BEFORE UPDATE ON agent_invocations
+WHEN
+    NEW.expires_at IS NOT OLD.expires_at
+    OR (NEW.work_kind = 'task' AND NEW.expires_at IS NOT NULL)
+    OR (NEW.work_kind = 'mailbox' AND (
+        NEW.expires_at IS NULL
+        OR NOT EXISTS (
+            SELECT 1 FROM agent_mailbox AS mailbox
+             WHERE mailbox.mailbox_id = NEW.mailbox_id
+               AND mailbox.message_id = NEW.work_id
+               AND mailbox.destination_agent_id = NEW.agent_id
+               AND mailbox.destination_agent_incarnation = NEW.agent_incarnation
+               AND mailbox.expires_at IS NEW.expires_at
+        )
+    ) AND NOT EXISTS (
+        SELECT 1 FROM agent_mailbox AS current_mailbox
+         WHERE current_mailbox.current_invocation_id = NEW.invocation_id
+    ))
+BEGIN
+    SELECT RAISE(ABORT, 'invocation expiry is immutable or conflicts');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_invocation_events_no_update
+BEFORE UPDATE ON agent_invocation_events
+BEGIN
+    SELECT RAISE(ABORT, 'Agent invocation events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_invocation_events_no_delete
+BEFORE DELETE ON agent_invocation_events
+BEGIN
+    SELECT RAISE(ABORT, 'Agent invocation events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_invocations_event_after_insert
+AFTER INSERT ON agent_invocations
+BEGIN
+    INSERT INTO agent_invocation_events (
+        invocation_event_id, invocation_id, event_sequence, event_kind,
+        previous_state, new_state, source_kind, source_id, metadata_json,
+        created_at
+    ) VALUES (
+        'invocation-event:' || NEW.invocation_id || ':00000000000000000001',
+        NEW.invocation_id, 1, 'invocation_created', NULL, NEW.state,
+        'store', NEW.invocation_id, '{}', NEW.created_at
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_invocations_event_after_state_update
+AFTER UPDATE OF state ON agent_invocations
+WHEN NEW.state IS NOT OLD.state
+BEGIN
+    INSERT INTO agent_invocation_events (
+        invocation_event_id, invocation_id, event_sequence, event_kind,
+        previous_state, new_state, source_kind, source_id, metadata_json,
+        created_at
+    )
+    SELECT
+        'invocation-event:' || NEW.invocation_id || ':' ||
+            printf('%020d', COALESCE(MAX(event_sequence), 0) + 1),
+        NEW.invocation_id,
+        COALESCE(MAX(event_sequence), 0) + 1,
+        'state_transition', OLD.state, NEW.state, 'store', NEW.invocation_id,
+        '{}', NEW.updated_at
+    FROM agent_invocation_events
+    WHERE invocation_id = NEW.invocation_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_orphan_reviews_insert_valid
+BEFORE INSERT ON mailbox_orphan_reviews
+WHEN NOT EXISTS (
+    SELECT 1
+      FROM agent_mailbox AS mailbox
+      JOIN agent_invocations AS old_invocation
+        ON old_invocation.invocation_id =
+           NEW.expected_current_invocation_id
+       AND old_invocation.work_kind = 'mailbox'
+       AND old_invocation.work_id = mailbox.message_id
+       AND old_invocation.mailbox_id = mailbox.mailbox_id
+       AND old_invocation.agent_id = mailbox.destination_agent_id
+       AND old_invocation.agent_incarnation =
+           mailbox.destination_agent_incarnation
+       AND old_invocation.expires_at IS mailbox.expires_at
+       AND old_invocation.state = 'orphaned'
+     WHERE mailbox.mailbox_id = NEW.mailbox_id
+       AND mailbox.message_id = NEW.mailbox_message_id
+       AND mailbox.current_invocation_id =
+           NEW.expected_current_invocation_id
+       AND mailbox.state = 'orphaned_mailbox'
+       AND (
+           NEW.replacement_invocation_id IS NULL
+           OR EXISTS (
+               SELECT 1 FROM agent_invocations AS replacement
+                WHERE replacement.invocation_id =
+                      NEW.replacement_invocation_id
+                  AND replacement.work_kind = 'mailbox'
+                  AND replacement.work_id = mailbox.message_id
+                  AND replacement.mailbox_id = mailbox.mailbox_id
+                  AND replacement.agent_id = mailbox.destination_agent_id
+                  AND replacement.agent_incarnation =
+                      mailbox.destination_agent_incarnation
+                  AND replacement.expires_at IS mailbox.expires_at
+                  AND replacement.state = 'queued'
+                  AND replacement.admission_released_at IS NULL
+           )
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox orphan review identity conflicts');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_orphan_reviews_no_update
+BEFORE UPDATE ON mailbox_orphan_reviews
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox orphan reviews are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_orphan_reviews_no_delete
+BEFORE DELETE ON mailbox_orphan_reviews
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox orphan reviews are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_orphan_reviews_resolution_event
+AFTER INSERT ON mailbox_orphan_reviews
+WHEN NEW.outcome IN ('retried','dead_lettered')
+BEGIN
+    INSERT INTO agent_invocation_events (
+        invocation_event_id, invocation_id, event_sequence, event_kind,
+        previous_state, new_state, source_kind, source_id, metadata_json,
+        created_at
+    )
+    SELECT
+        'invocation-event:' || NEW.expected_current_invocation_id || ':' ||
+            printf('%020d', COALESCE(MAX(event_sequence), 0) + 1),
+        NEW.expected_current_invocation_id,
+        COALESCE(MAX(event_sequence), 0) + 1,
+        'orphan_review_resolved', 'orphaned', 'orphaned',
+        'mailbox_orphan_review', NEW.mailbox_maintenance_id,
+        json_object(
+            'action', NEW.action,
+            'outcome', NEW.outcome,
+            'replacement_invocation_id', NEW.replacement_invocation_id
+        ),
+        NEW.reviewed_at
+    FROM agent_invocation_events
+    WHERE invocation_id = NEW.expected_current_invocation_id;
+END;
+"""
+
+
+_MIGRATION_29_DISPATCH_DECISION_TRIGGERS = """
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_insert_valid;
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_update_valid;
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_immutable;
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_no_delete;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_insert_valid
+BEFORE INSERT ON agent_dispatch_attempts
+WHEN
+    (
+        (NEW.grant_issued_at IS NOT NULL)
+        + (NEW.abort_committed_at IS NOT NULL)
+        + (NEW.rejection_committed_at IS NOT NULL)
+    ) = 0
+    AND (
+        NEW.decision_code IS NOT NULL
+        OR NEW.decision_outcome_state IS NOT NULL
+        OR NEW.decision_source_state IS NOT NULL
+        OR NEW.cleanup_proof_hash IS NOT NULL
+    )
+    OR
+    (
+        (NEW.grant_issued_at IS NOT NULL)
+        + (NEW.abort_committed_at IS NOT NULL)
+        + (NEW.rejection_committed_at IS NOT NULL)
+    ) = 1
+    AND NOT (
+        (
+            NEW.decision_code IS NULL
+            AND NEW.decision_outcome_state IS NULL
+            AND NEW.decision_source_state IS NULL
+        )
+        OR (
+            NEW.decision_code IS NOT NULL
+            AND NEW.decision_outcome_state IS NOT NULL
+            AND NEW.decision_source_state IS NOT NULL
+        )
+    )
+    OR (
+        NEW.decision_source_state IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM agent_invocations AS invocation
+             WHERE invocation.invocation_id = NEW.invocation_id
+               AND (
+                   (
+                       invocation.work_kind = 'task'
+                       AND (
+                           (NEW.grant_issued_at IS NOT NULL
+                            AND NEW.decision_outcome_state = 'running'
+                            AND NEW.decision_source_state = 'running')
+                           OR (NEW.abort_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'queued')
+                               OR (NEW.decision_outcome_state = 'cancelled'
+                                   AND NEW.decision_source_state = 'cancelled')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'failed')
+                           ))
+                           OR (NEW.rejection_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'queued')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'failed')
+                           ))
+                       )
+                   )
+                   OR (
+                       invocation.work_kind = 'mailbox'
+                       AND (
+                           (NEW.grant_issued_at IS NOT NULL
+                            AND NEW.decision_outcome_state = 'running'
+                            AND NEW.decision_source_state = 'processing')
+                           OR (NEW.abort_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'pending')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'expired')
+                           ))
+                           OR (NEW.rejection_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'pending')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'rejected')
+                           ))
+                       )
+                   )
+               )
+        )
+    )
+    OR NOT (
+        (
+            NEW.runtime_stopped_at IS NULL
+            AND NEW.invocation_job_empty_at IS NULL
+            AND NEW.cleanup_proof_hash IS NULL
+        )
+        OR (
+            NEW.runtime_stopped_at IS NOT NULL
+            AND NEW.invocation_job_empty_at IS NOT NULL
+            AND NEW.cleanup_proof_hash IS NOT NULL
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid dispatch attempt decision metadata');
+END;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_update_valid
+BEFORE UPDATE ON agent_dispatch_attempts
+WHEN
+    (
+        (NEW.grant_issued_at IS NOT NULL)
+        + (NEW.abort_committed_at IS NOT NULL)
+        + (NEW.rejection_committed_at IS NOT NULL)
+    ) = 0
+    AND (
+        NEW.decision_code IS NOT NULL
+        OR NEW.decision_outcome_state IS NOT NULL
+        OR NEW.decision_source_state IS NOT NULL
+        OR NEW.cleanup_proof_hash IS NOT NULL
+    )
+    OR
+    (
+        (NEW.grant_issued_at IS NOT NULL)
+        + (NEW.abort_committed_at IS NOT NULL)
+        + (NEW.rejection_committed_at IS NOT NULL)
+    ) = 1
+    AND NOT (
+        (
+            NEW.decision_code IS NULL
+            AND NEW.decision_outcome_state IS NULL
+            AND NEW.decision_source_state IS NULL
+        )
+        OR (
+            NEW.decision_code IS NOT NULL
+            AND NEW.decision_outcome_state IS NOT NULL
+            AND NEW.decision_source_state IS NOT NULL
+        )
+    )
+    OR (
+        NEW.decision_source_state IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM agent_invocations AS invocation
+             WHERE invocation.invocation_id = NEW.invocation_id
+               AND (
+                   (
+                       invocation.work_kind = 'task'
+                       AND (
+                           (NEW.grant_issued_at IS NOT NULL
+                            AND NEW.decision_outcome_state = 'running'
+                            AND NEW.decision_source_state = 'running')
+                           OR (NEW.abort_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'queued')
+                               OR (NEW.decision_outcome_state = 'cancelled'
+                                   AND NEW.decision_source_state = 'cancelled')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'failed')
+                           ))
+                           OR (NEW.rejection_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'queued')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'failed')
+                           ))
+                       )
+                   )
+                   OR (
+                       invocation.work_kind = 'mailbox'
+                       AND (
+                           (NEW.grant_issued_at IS NOT NULL
+                            AND NEW.decision_outcome_state = 'running'
+                            AND NEW.decision_source_state = 'processing')
+                           OR (NEW.abort_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'pending')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'expired')
+                           ))
+                           OR (NEW.rejection_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'pending')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'rejected')
+                           ))
+                       )
+                   )
+               )
+        )
+    )
+    OR NOT (
+        (
+            NEW.runtime_stopped_at IS NULL
+            AND NEW.invocation_job_empty_at IS NULL
+            AND NEW.cleanup_proof_hash IS NULL
+        )
+        OR (
+            NEW.runtime_stopped_at IS NOT NULL
+            AND NEW.invocation_job_empty_at IS NOT NULL
+            AND NEW.cleanup_proof_hash IS NOT NULL
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid dispatch attempt decision metadata');
+END;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_immutable
+BEFORE UPDATE ON agent_dispatch_attempts
+WHEN
+    NEW.dispatch_attempt_id IS NOT OLD.dispatch_attempt_id
+    OR NEW.invocation_id IS NOT OLD.invocation_id
+    OR NEW.slot_id IS NOT OLD.slot_id
+    OR NEW.agent_id IS NOT OLD.agent_id
+    OR NEW.agent_incarnation IS NOT OLD.agent_incarnation
+    OR NEW.worker_generation IS NOT OLD.worker_generation
+    OR NEW.supervisor_epoch IS NOT OLD.supervisor_epoch
+    OR NEW.dispatch_backend IS NOT OLD.dispatch_backend
+    OR NEW.claim_token_hash IS NOT OLD.claim_token_hash
+    OR NEW.lease_identity IS NOT OLD.lease_identity
+    OR NEW.lease_expires_at IS NOT OLD.lease_expires_at
+    OR NEW.invocation_job_identity IS NOT OLD.invocation_job_identity
+    OR NEW.created_at IS NOT OLD.created_at
+    OR (
+        (
+            (OLD.grant_issued_at IS NOT NULL)
+            + (OLD.abort_committed_at IS NOT NULL)
+            + (OLD.rejection_committed_at IS NOT NULL)
+        ) = 1
+        AND (
+            NEW.grant_issued_at IS NOT OLD.grant_issued_at
+            OR NEW.abort_committed_at IS NOT OLD.abort_committed_at
+            OR NEW.rejection_committed_at IS NOT OLD.rejection_committed_at
+            OR NEW.decision_code IS NOT OLD.decision_code
+            OR NEW.decision_outcome_state IS NOT OLD.decision_outcome_state
+            OR NEW.decision_source_state IS NOT OLD.decision_source_state
+        )
+    )
+    OR (OLD.runtime_stopped_at IS NOT NULL
+        AND NEW.runtime_stopped_at IS NOT OLD.runtime_stopped_at)
+    OR (OLD.invocation_job_empty_at IS NOT NULL
+        AND NEW.invocation_job_empty_at IS NOT OLD.invocation_job_empty_at)
+    OR (OLD.cleanup_proof_hash IS NOT NULL
+        AND NEW.cleanup_proof_hash IS NOT OLD.cleanup_proof_hash)
+BEGIN
+    SELECT RAISE(ABORT, 'dispatch attempt identity is immutable');
+END;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_no_delete
+BEFORE DELETE ON agent_dispatch_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'dispatch attempts are append-only');
+END;
+"""
+
+
+_MIGRATION_31_DISPATCH_DECISION_TRIGGERS = """
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_insert_valid;
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_update_valid;
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_immutable;
+DROP TRIGGER IF EXISTS trg_agent_dispatch_attempts_no_delete;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_insert_valid
+BEFORE INSERT ON agent_dispatch_attempts
+WHEN
+    NEW.decision_metadata_legacy != 0
+    OR (
+        (
+            (NEW.grant_issued_at IS NOT NULL)
+            + (NEW.abort_committed_at IS NOT NULL)
+            + (NEW.rejection_committed_at IS NOT NULL)
+        ) = 0
+        AND (
+            NEW.decision_code IS NOT NULL
+            OR NEW.decision_outcome_state IS NOT NULL
+            OR NEW.decision_source_state IS NOT NULL
+            OR NEW.decision_next_attempt_at IS NOT NULL
+            OR NEW.cleanup_proof_hash IS NOT NULL
+        )
+    )
+    OR (
+        (
+            (NEW.grant_issued_at IS NOT NULL)
+            + (NEW.abort_committed_at IS NOT NULL)
+            + (NEW.rejection_committed_at IS NOT NULL)
+        ) = 1
+        AND (
+            NEW.decision_code IS NULL
+            OR NEW.decision_outcome_state IS NULL
+            OR NEW.decision_source_state IS NULL
+            OR (
+                NEW.decision_outcome_state != 'queued'
+                AND NEW.decision_next_attempt_at IS NOT NULL
+            )
+        )
+    )
+    OR (
+        NEW.decision_source_state IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM agent_invocations AS invocation
+             WHERE invocation.invocation_id = NEW.invocation_id
+               AND (
+                   (
+                       invocation.work_kind = 'task'
+                       AND (
+                           (NEW.grant_issued_at IS NOT NULL
+                            AND NEW.decision_outcome_state = 'running'
+                            AND NEW.decision_source_state = 'running')
+                           OR (NEW.abort_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'queued')
+                               OR (NEW.decision_outcome_state = 'cancelled'
+                                   AND NEW.decision_source_state = 'cancelled')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'failed')
+                           ))
+                           OR (NEW.rejection_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'queued')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'failed')
+                           ))
+                       )
+                   )
+                   OR (
+                       invocation.work_kind = 'mailbox'
+                       AND (
+                           (NEW.grant_issued_at IS NOT NULL
+                            AND NEW.decision_outcome_state = 'running'
+                            AND NEW.decision_source_state = 'processing')
+                           OR (NEW.abort_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'pending')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state IN
+                                       ('rejected','expired'))
+                           ))
+                           OR (NEW.rejection_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'pending')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'rejected')
+                           ))
+                       )
+                   )
+               )
+        )
+    )
+    OR NOT (
+        (
+            NEW.runtime_stopped_at IS NULL
+            AND NEW.invocation_job_empty_at IS NULL
+            AND NEW.cleanup_proof_hash IS NULL
+        )
+        OR (
+            NEW.runtime_stopped_at IS NOT NULL
+            AND NEW.invocation_job_empty_at IS NOT NULL
+            AND NEW.cleanup_proof_hash IS NOT NULL
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid dispatch attempt decision metadata');
+END;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_update_valid
+BEFORE UPDATE ON agent_dispatch_attempts
+WHEN
+    (
+        (
+            (NEW.grant_issued_at IS NOT NULL)
+            + (NEW.abort_committed_at IS NOT NULL)
+            + (NEW.rejection_committed_at IS NOT NULL)
+        ) = 0
+        AND (
+            NEW.decision_metadata_legacy != 0
+            OR NEW.decision_code IS NOT NULL
+            OR NEW.decision_outcome_state IS NOT NULL
+            OR NEW.decision_source_state IS NOT NULL
+            OR NEW.decision_next_attempt_at IS NOT NULL
+            OR NEW.cleanup_proof_hash IS NOT NULL
+        )
+    )
+    OR (
+        (
+            (NEW.grant_issued_at IS NOT NULL)
+            + (NEW.abort_committed_at IS NOT NULL)
+            + (NEW.rejection_committed_at IS NOT NULL)
+        ) = 1
+        AND (
+            (
+                NEW.decision_metadata_legacy = 0
+                AND (
+                    NEW.decision_code IS NULL
+                    OR NEW.decision_outcome_state IS NULL
+                    OR NEW.decision_source_state IS NULL
+                )
+            )
+            OR (
+                NEW.decision_metadata_legacy = 1
+                AND (
+                    NEW.decision_next_attempt_at IS NOT NULL
+                    OR NOT (
+                        (
+                            NEW.decision_code IS NULL
+                            AND NEW.decision_outcome_state IS NULL
+                            AND NEW.decision_source_state IS NULL
+                        )
+                        OR (
+                            NEW.decision_code IS NOT NULL
+                            AND NEW.decision_outcome_state IS NOT NULL
+                            AND NEW.decision_source_state IS NOT NULL
+                        )
+                    )
+                )
+            )
+            OR (
+                NEW.decision_outcome_state != 'queued'
+                AND NEW.decision_next_attempt_at IS NOT NULL
+            )
+        )
+    )
+    OR (
+        NEW.decision_source_state IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM agent_invocations AS invocation
+             WHERE invocation.invocation_id = NEW.invocation_id
+               AND (
+                   (
+                       invocation.work_kind = 'task'
+                       AND (
+                           (NEW.grant_issued_at IS NOT NULL
+                            AND NEW.decision_outcome_state = 'running'
+                            AND NEW.decision_source_state = 'running')
+                           OR (NEW.abort_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'queued')
+                               OR (NEW.decision_outcome_state = 'cancelled'
+                                   AND NEW.decision_source_state = 'cancelled')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'failed')
+                           ))
+                           OR (NEW.rejection_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'queued')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'failed')
+                           ))
+                       )
+                   )
+                   OR (
+                       invocation.work_kind = 'mailbox'
+                       AND (
+                           (NEW.grant_issued_at IS NOT NULL
+                            AND NEW.decision_outcome_state = 'running'
+                            AND NEW.decision_source_state = 'processing')
+                           OR (NEW.abort_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'pending')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state IN
+                                       ('rejected','expired'))
+                           ))
+                           OR (NEW.rejection_committed_at IS NOT NULL AND (
+                               (NEW.decision_outcome_state = 'queued'
+                                AND NEW.decision_source_state = 'pending')
+                               OR (NEW.decision_outcome_state = 'failed'
+                                   AND NEW.decision_source_state = 'rejected')
+                           ))
+                       )
+                   )
+               )
+        )
+    )
+    OR NOT (
+        (
+            NEW.runtime_stopped_at IS NULL
+            AND NEW.invocation_job_empty_at IS NULL
+            AND NEW.cleanup_proof_hash IS NULL
+        )
+        OR (
+            NEW.runtime_stopped_at IS NOT NULL
+            AND NEW.invocation_job_empty_at IS NOT NULL
+            AND NEW.cleanup_proof_hash IS NOT NULL
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid dispatch attempt decision metadata');
+END;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_immutable
+BEFORE UPDATE ON agent_dispatch_attempts
+WHEN
+    NEW.dispatch_attempt_id IS NOT OLD.dispatch_attempt_id
+    OR NEW.invocation_id IS NOT OLD.invocation_id
+    OR NEW.slot_id IS NOT OLD.slot_id
+    OR NEW.agent_id IS NOT OLD.agent_id
+    OR NEW.agent_incarnation IS NOT OLD.agent_incarnation
+    OR NEW.worker_generation IS NOT OLD.worker_generation
+    OR NEW.supervisor_epoch IS NOT OLD.supervisor_epoch
+    OR NEW.dispatch_backend IS NOT OLD.dispatch_backend
+    OR NEW.claim_token_hash IS NOT OLD.claim_token_hash
+    OR NEW.lease_identity IS NOT OLD.lease_identity
+    OR NEW.lease_expires_at IS NOT OLD.lease_expires_at
+    OR NEW.invocation_job_identity IS NOT OLD.invocation_job_identity
+    OR NEW.created_at IS NOT OLD.created_at
+    OR NEW.decision_metadata_legacy IS NOT OLD.decision_metadata_legacy
+    OR (
+        (
+            (OLD.grant_issued_at IS NOT NULL)
+            + (OLD.abort_committed_at IS NOT NULL)
+            + (OLD.rejection_committed_at IS NOT NULL)
+        ) = 1
+        AND (
+            NEW.grant_issued_at IS NOT OLD.grant_issued_at
+            OR NEW.abort_committed_at IS NOT OLD.abort_committed_at
+            OR NEW.rejection_committed_at IS NOT OLD.rejection_committed_at
+            OR NEW.decision_code IS NOT OLD.decision_code
+            OR NEW.decision_outcome_state IS NOT OLD.decision_outcome_state
+            OR NEW.decision_source_state IS NOT OLD.decision_source_state
+            OR NEW.decision_next_attempt_at IS NOT OLD.decision_next_attempt_at
+        )
+    )
+    OR (OLD.runtime_stopped_at IS NOT NULL
+        AND NEW.runtime_stopped_at IS NOT OLD.runtime_stopped_at)
+    OR (OLD.invocation_job_empty_at IS NOT NULL
+        AND NEW.invocation_job_empty_at IS NOT OLD.invocation_job_empty_at)
+    OR (OLD.cleanup_proof_hash IS NOT NULL
+        AND NEW.cleanup_proof_hash IS NOT OLD.cleanup_proof_hash)
+BEGIN
+    SELECT RAISE(ABORT, 'dispatch attempt identity is immutable');
+END;
+
+CREATE TRIGGER trg_agent_dispatch_attempts_no_delete
+BEFORE DELETE ON agent_dispatch_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'dispatch attempts are append-only');
+END;
+"""
+
+
+# A notification-suppressed completed item has no SendMsg allocation and thus
+# no ``user_outbox`` row.  Keep its read/presentation cursor on the stable
+# item candidate so `/inbox` and switch-back delivery can expose it exactly
+# once without manufacturing a historical wire send.
+_MIGRATION_32_REPLY_CANDIDATE_PRESENTATION_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_reply_candidates_inbox_presentation
+    ON reply_candidates(
+        channel, bot_id, external_user_id, session_id, agent_id,
+        presentation, foreground, priority, created_at
+    );
+"""
+
+
+_MIGRATION_30_REVIEW_TABLE = """
+CREATE TABLE mailbox_orphan_reviews_v30 (
+    mailbox_maintenance_id TEXT PRIMARY KEY CHECK (
+        length(trim(mailbox_maintenance_id)) BETWEEN 1 AND 128
+    ),
+    payload_hash TEXT NOT NULL CHECK (
+        length(payload_hash) = 64
+        AND payload_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    authorization_grant_digest TEXT NOT NULL CHECK (
+        length(authorization_grant_digest) = 64
+        AND authorization_grant_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    authorization_scheme TEXT NOT NULL CHECK (
+        authorization_scheme IN ('legacy_v28_audit','process_grant_v1')
+    ),
+    mailbox_id TEXT NOT NULL,
+    mailbox_message_id TEXT NOT NULL,
+    expected_current_invocation_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('retry','dead_letter')),
+    actor TEXT NOT NULL CHECK (length(trim(actor)) > 0),
+    reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    authorized_at TEXT NOT NULL,
+    authorization_source TEXT NOT NULL CHECK (
+        length(trim(authorization_source)) > 0
+    ),
+    administrator_authorized INTEGER NOT NULL CHECK (
+        typeof(administrator_authorized) = 'integer'
+        AND administrator_authorized = 1
+    ),
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'retried','dead_lettered','rejected_expired',
+        'rejected_agent_unavailable','rejected_queue_full'
+    )),
+    replacement_invocation_id TEXT,
+    reviewed_at TEXT NOT NULL,
+    FOREIGN KEY (mailbox_id, mailbox_message_id)
+        REFERENCES agent_mailbox(mailbox_id, message_id) ON DELETE RESTRICT,
+    FOREIGN KEY (expected_current_invocation_id)
+        REFERENCES agent_invocations(invocation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (
+        expected_current_invocation_id, mailbox_id, mailbox_message_id
+    ) REFERENCES agent_invocations(
+        invocation_id, mailbox_id, work_id
+    ) ON DELETE RESTRICT,
+    FOREIGN KEY (replacement_invocation_id)
+        REFERENCES agent_invocations(invocation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (
+        replacement_invocation_id, mailbox_id, mailbox_message_id
+    ) REFERENCES agent_invocations(
+        invocation_id, mailbox_id, work_id
+    ) ON DELETE RESTRICT,
+    CHECK (
+        (action = 'dead_letter' AND outcome = 'dead_lettered'
+         AND replacement_invocation_id IS NULL)
+        OR
+        (action = 'retry' AND outcome = 'retried'
+         AND replacement_invocation_id IS NOT NULL
+         AND replacement_invocation_id != expected_current_invocation_id)
+        OR
+        (action = 'retry' AND outcome IN (
+            'rejected_expired','rejected_agent_unavailable',
+            'rejected_queue_full'
+         ) AND replacement_invocation_id IS NULL)
+    )
+);
+"""
+
+
+_MIGRATION_30_REVIEW_TRIGGERS = """
+CREATE INDEX idx_mailbox_orphan_reviews_mailbox
+    ON mailbox_orphan_reviews(mailbox_id, reviewed_at);
+
+CREATE TRIGGER trg_mailbox_orphan_reviews_insert_valid
+BEFORE INSERT ON mailbox_orphan_reviews
+WHEN NOT EXISTS (
+    SELECT 1
+      FROM agent_mailbox AS mailbox
+      JOIN agent_invocations AS old_invocation
+        ON old_invocation.invocation_id =
+           NEW.expected_current_invocation_id
+       AND old_invocation.work_kind = 'mailbox'
+       AND old_invocation.work_id = mailbox.message_id
+       AND old_invocation.mailbox_id = mailbox.mailbox_id
+       AND old_invocation.agent_id = mailbox.destination_agent_id
+       AND old_invocation.agent_incarnation =
+           mailbox.destination_agent_incarnation
+       AND old_invocation.expires_at IS mailbox.expires_at
+       AND old_invocation.state = 'orphaned'
+     WHERE mailbox.mailbox_id = NEW.mailbox_id
+       AND mailbox.message_id = NEW.mailbox_message_id
+       AND mailbox.current_invocation_id =
+           NEW.expected_current_invocation_id
+       AND mailbox.state = 'orphaned_mailbox'
+       AND (
+           NEW.replacement_invocation_id IS NULL
+           OR EXISTS (
+               SELECT 1 FROM agent_invocations AS replacement
+                WHERE replacement.invocation_id =
+                      NEW.replacement_invocation_id
+                  AND replacement.work_kind = 'mailbox'
+                  AND replacement.work_id = mailbox.message_id
+                  AND replacement.mailbox_id = mailbox.mailbox_id
+                  AND replacement.agent_id = mailbox.destination_agent_id
+                  AND replacement.agent_incarnation =
+                      mailbox.destination_agent_incarnation
+                  AND replacement.expires_at IS mailbox.expires_at
+                  AND replacement.state = 'queued'
+                  AND replacement.admission_released_at IS NULL
+           )
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox orphan review identity conflicts');
+END;
+
+CREATE TRIGGER trg_mailbox_orphan_reviews_no_update
+BEFORE UPDATE ON mailbox_orphan_reviews
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox orphan reviews are append-only');
+END;
+
+CREATE TRIGGER trg_mailbox_orphan_reviews_no_delete
+BEFORE DELETE ON mailbox_orphan_reviews
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox orphan reviews are append-only');
+END;
+
+CREATE TRIGGER trg_mailbox_orphan_reviews_resolution_event
+AFTER INSERT ON mailbox_orphan_reviews
+WHEN NEW.outcome IN ('retried','dead_lettered')
+BEGIN
+    INSERT INTO agent_invocation_events (
+        invocation_event_id, invocation_id, event_sequence, event_kind,
+        previous_state, new_state, source_kind, source_id, metadata_json,
+        created_at
+    )
+    SELECT
+        'invocation-event:' || NEW.expected_current_invocation_id || ':' ||
+            printf('%020d', COALESCE(MAX(event_sequence), 0) + 1),
+        NEW.expected_current_invocation_id,
+        COALESCE(MAX(event_sequence), 0) + 1,
+        'orphan_review_resolved', 'orphaned', 'orphaned',
+        'mailbox_orphan_review', NEW.mailbox_maintenance_id,
+        json_object(
+            'action', NEW.action,
+            'outcome', NEW.outcome,
+            'replacement_invocation_id', NEW.replacement_invocation_id
+        ),
+        NEW.reviewed_at
+    FROM agent_invocation_events
+    WHERE invocation_id = NEW.expected_current_invocation_id;
+END;
+"""
+
+
+_MIGRATION_30_EXPIRY_UPDATE_TRIGGERS = """
+CREATE TRIGGER trg_agent_mailbox_expiry_immutable
+BEFORE UPDATE ON agent_mailbox
+WHEN NEW.expires_at IS NOT OLD.expires_at
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox expiry is immutable');
+END;
+
+CREATE TRIGGER trg_agent_invocation_expiry_update_valid
+BEFORE UPDATE ON agent_invocations
+WHEN
+    NEW.expires_at IS NOT OLD.expires_at
+    OR (NEW.work_kind = 'task' AND NEW.expires_at IS NOT NULL)
+    OR (NEW.work_kind = 'mailbox' AND (
+        NEW.expires_at IS NULL
+        OR NOT EXISTS (
+            SELECT 1 FROM agent_mailbox AS mailbox
+             WHERE mailbox.mailbox_id = NEW.mailbox_id
+               AND mailbox.message_id = NEW.work_id
+               AND mailbox.destination_agent_id = NEW.agent_id
+               AND mailbox.destination_agent_incarnation = NEW.agent_incarnation
+               AND mailbox.expires_at IS NEW.expires_at
+        )
+    ) AND NOT EXISTS (
+        SELECT 1 FROM agent_mailbox AS current_mailbox
+         WHERE current_mailbox.current_invocation_id = NEW.invocation_id
+    ))
+BEGIN
+    SELECT RAISE(ABORT, 'invocation expiry is immutable or conflicts');
+END;
+"""
+
+
+_LATEST_SCHEMA_VERSION = 32
 
 
 @contextmanager
@@ -1044,7 +3206,34 @@ def _executescript_atomic(conn: sqlite3.Connection, script: str) -> None:
 
 
 def _utc_text(value: datetime | str | None = None) -> str:
-    return datetime_to_text(value or utcnow()) or datetime_to_text(utcnow())  # type: ignore[return-value]
+    candidate = utcnow() if value is None else value
+    if isinstance(candidate, str):
+        candidate = candidate.strip()
+        if not candidate:
+            raise ValueError("timestamp must be a valid ISO-8601 datetime")
+        # ``datetime.fromisoformat`` did not accept the standard UTC ``Z``
+        # suffix on every Python version supported by this project.
+        if candidate.endswith("Z"):
+            candidate = candidate[:-1] + "+00:00"
+    parsed = text_to_datetime(candidate)
+    canonical = datetime_to_text(parsed) if parsed is not None else None
+    if canonical is None:
+        raise ValueError("timestamp must be a valid ISO-8601 datetime")
+    return canonical
+
+
+def _required_row_datetime(
+    value: Any,
+    *,
+    label: str,
+    identity: Any,
+) -> datetime:
+    """Parse one required durable timestamp without laundering corruption."""
+
+    parsed = text_to_datetime(value)
+    if parsed is None:
+        raise StoreError(f"{label} timestamp is invalid: {identity}")
+    return parsed
 
 
 def _normalized_authorization_evidence(
@@ -1161,6 +3350,10 @@ class SQLiteStore:
         clock: Callable[[], datetime] | None = None,
         attachment_root: str | Path | None = None,
         transcription_ttl_seconds: float = DEFAULT_TRANSCRIPTION_TTL_SECONDS,
+        mailbox_ttl_seconds: float = DEFAULT_MAILBOX_TTL_SECONDS,
+        max_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
+        max_global_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+        mailbox_maintenance_authority: MailboxMaintenanceAuthority | None = None,
     ) -> None:
         raw_path = str(path)
         # SQLite does not expand shell syntax.  Canonicalize file-backed paths
@@ -1183,6 +3376,44 @@ class SQLiteStore:
                 "transcription_ttl_seconds must be a finite nonnegative number"
             )
         self.transcription_ttl_seconds = transcription_ttl
+        try:
+            mailbox_ttl = float(mailbox_ttl_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "mailbox_ttl_seconds must be a finite nonnegative number"
+            ) from exc
+        if not math.isfinite(mailbox_ttl) or mailbox_ttl < 0:
+            raise ValueError(
+                "mailbox_ttl_seconds must be a finite nonnegative number"
+            )
+        self.mailbox_ttl_seconds = mailbox_ttl
+        try:
+            self.max_agent_queue = int(max_agent_queue)
+            self.max_global_queue = int(max_global_queue)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Agent queue limits must be positive integers") from exc
+        if self.max_agent_queue <= 0 or self.max_global_queue <= 0:
+            raise ValueError("Agent queue limits must be positive integers")
+        if self.max_agent_queue > self.max_global_queue:
+            raise ValueError(
+                "max_agent_queue cannot exceed max_global_queue"
+            )
+        if (
+            mailbox_maintenance_authority is not None
+            and not isinstance(
+                mailbox_maintenance_authority,
+                MailboxMaintenanceAuthority,
+            )
+        ):
+            raise TypeError(
+                "mailbox_maintenance_authority must be a "
+                "MailboxMaintenanceAuthority"
+            )
+        # Privileged mailbox repair is intentionally disabled unless the
+        # owning supervisor injects its process-local verifier.  The store
+        # retains no issuing fallback and never derives authority from durable
+        # actor/source/time fields.
+        self._mailbox_maintenance_authority = mailbox_maintenance_authority
         self.attachment_root = (
             Path(attachment_root).expanduser().resolve()
             if attachment_root is not None
@@ -1196,9 +3427,31 @@ class SQLiteStore:
         # that report until the lifecycle owner calls ``startup_reconcile`` so
         # callers retain the existing diagnostics without repeating recovery.
         self._startup_recovery_report: RecoveryReport | None = None
+        # The owned supervisor opens/migrates first, then creates its durable
+        # epoch and performs process-boundary recovery in one transaction.  A
+        # deferred store rejects every ordinary operation until that activation
+        # barrier commits.  Legacy embedders retain automatic first-opener
+        # recovery by leaving the initialization option unset.
+        self._startup_recovery_deferred = False
+        # Local epoch ownership is retained through an explicit finish until
+        # close.  That lets close enforce last-adapter ordering and lets an exact
+        # same-owner finish replay remain idempotent without authorizing peers.
+        self._active_supervisor_epoch: tuple[int, str] | None = None
+        self._supervisor_epoch_finished = False
         self._initialized = False
         self._closed = False
         self._lock = asyncio.Lock()
+
+    def _startup_recovery_is_deferred(self) -> bool:
+        """Read the process-wide startup gate for this connection."""
+
+        database_key = self._live_database_key
+        if database_key is None:
+            # In-memory stores do not share a durable database with another
+            # adapter, so their existing instance-local barrier is sufficient.
+            return self._startup_recovery_deferred
+        with _LIVE_DATABASES_LOCK:
+            return database_key in _DEFERRED_DATABASES
 
     async def __aenter__(self) -> "SQLiteStore":
         await self.initialize()
@@ -1207,16 +3460,37 @@ class SQLiteStore:
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         await self.close()
 
-    async def initialize(self) -> None:
-        """Open the connection and apply idempotent migrations."""
+    async def initialize(
+        self, *, recover_startup_state: bool | None = None
+    ) -> None:
+        """Open the connection and apply idempotent migrations.
+
+        ``None`` preserves the compatibility first-process behavior.  The
+        exclusive supervisor passes ``False`` so migrations complete without
+        touching abandoned work, then calls :meth:`activate_supervisor_epoch`
+        to durably establish its epoch before strong recovery.
+        """
 
         async with self._lock:
             if self._initialized:
+                if (
+                    recover_startup_state is False
+                    and not self._startup_recovery_is_deferred()
+                ):
+                    raise StoreError(
+                        "startup recovery cannot be deferred after initialization"
+                    )
                 return
             if self._closed:
                 raise StoreError("store is closed")
             loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(self._executor, self._open_sync)
+            open_callback: Callable[[], None] = self._open_sync
+            if recover_startup_state is not None:
+                open_callback = functools.partial(
+                    self._open_sync,
+                    recover_startup_state=recover_startup_state,
+                )
+            future = loop.run_in_executor(self._executor, open_callback)
             try:
                 _result, cancellation = await self._drain_executor_future(future)
             finally:
@@ -1268,12 +3542,20 @@ class SQLiteStore:
         # cancellation that arrived while it was running.
         return future.result(), cancellation
 
-    def _open_sync(self) -> None:
+    def _open_sync(
+        self, *, recover_startup_state: bool | None = None
+    ) -> None:
         """Open/migrate a connection and close it if initialization fails."""
 
         try:
             if self.path == ":memory:":
-                self._open_sync_impl(recover_startup_state=True)
+                should_recover = (
+                    True
+                    if recover_startup_state is None
+                    else bool(recover_startup_state)
+                )
+                self._open_sync_impl(recover_startup_state=should_recover)
+                self._startup_recovery_deferred = not should_recover
                 return
 
             resolved_path = Path(self.path).expanduser().resolve()
@@ -1286,16 +3568,46 @@ class SQLiteStore:
             # that the first opener then marks interrupted.
             with _LIVE_DATABASES_LOCK:
                 live_count = _LIVE_DATABASES.get(database_key, 0)
-                self._open_sync_impl(
-                    recover_startup_state=live_count == 0
-                )
+                gate_exists = database_key in _DEFERRED_DATABASES
+                if (
+                    recover_startup_state is False
+                    and live_count > 0
+                    and not gate_exists
+                ):
+                    raise StoreError(
+                        "startup recovery cannot be deferred after an ordinary "
+                        "live connection exists"
+                    )
+                gate_created = False
+                if recover_startup_state is False and not gate_exists:
+                    _DEFERRED_DATABASES.add(database_key)
+                    gate_exists = True
+                    gate_created = True
+                try:
+                    self._open_sync_impl(
+                        recover_startup_state=(
+                            False
+                            if gate_exists
+                            else (
+                                live_count == 0
+                                if recover_startup_state is None
+                                else bool(recover_startup_state)
+                            )
+                        )
+                    )
+                except BaseException:
+                    if gate_created:
+                        _DEFERRED_DATABASES.discard(database_key)
+                    raise
                 _LIVE_DATABASES[database_key] = live_count + 1
                 self._live_database_key = database_key
+                self._startup_recovery_deferred = gate_exists
         except BaseException:
             # Migrations are transactional, but the connection itself must
             # also be released when a migration or pragma fails.  Otherwise a
             # failed initialize can retain a file lock until process exit.
             self._startup_recovery_report = None
+            self._startup_recovery_deferred = False
             self._close_sync()
             raise
 
@@ -1699,6 +4011,1413 @@ class SQLiteStore:
                     "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (19, _utc_text()),
                 )
+        if current < 20:
+            with _transaction(conn):
+                _executescript_atomic(conn, _MIGRATION_20)
+                binding_columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(thread_bindings)"
+                    ).fetchall()
+                }
+                role_binding_columns = {
+                    "role_version",
+                    "role_snapshot_hash",
+                    "persona_composition_version",
+                }
+                if not binding_columns & role_binding_columns:
+                    _executescript_atomic(
+                        conn, _MIGRATION_20_THREAD_BINDINGS
+                    )
+                elif not role_binding_columns.issubset(binding_columns):
+                    raise StoreError(
+                        "thread binding role migration is incomplete"
+                    )
+                else:
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_thread_bindings_thread "
+                        "ON thread_bindings(thread_id)"
+                    )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (20, _utc_text()),
+                )
+        if current < 21:
+            with _transaction(conn):
+                duplicate_thread = conn.execute(
+                    "SELECT thread_id FROM thread_bindings "
+                    "GROUP BY thread_id HAVING COUNT(*) > 1 LIMIT 1"
+                ).fetchone()
+                if duplicate_thread is not None:
+                    raise StoreError(
+                        "provider thread binding identities conflict during migration"
+                    )
+                _executescript_atomic(conn, _MIGRATION_21)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (21, _utc_text()),
+                )
+        if current < 22:
+            with _transaction(conn):
+                receipt_columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(command_receipts)"
+                    ).fetchall()
+                }
+                # Tolerate a process interruption after SQLite applied the
+                # column but before the migration marker became durable.
+                if "outcome_json" not in receipt_columns:
+                    _executescript_atomic(conn, _MIGRATION_22)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (22, _utc_text()),
+                )
+        if current < 23:
+            with _transaction(conn):
+                _executescript_atomic(conn, _MIGRATION_23)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (23, _utc_text()),
+                )
+        if current < 24:
+            with _transaction(conn):
+                _executescript_atomic(conn, _MIGRATION_24)
+                self._backfill_agent_lifecycle_v24_tx(
+                    conn,
+                    now_text=self._now(),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (24, _utc_text()),
+                )
+        else:
+            # The process schema landed before live lifetime-lock identity was
+            # made globally exclusive. Repair already-marked development
+            # databases idempotently; an existing collision fails closed.
+            with _transaction(conn):
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "idx_agent_processes_one_live_lifetime_lock "
+                    "ON agent_processes(lifetime_lock_identity) "
+                    "WHERE observed_state != 'stopped'"
+                )
+        if current < 25:
+            with _transaction(conn):
+                _executescript_atomic(conn, _MIGRATION_25)
+                self._migrate_agent_lifecycle_v25_tx(
+                    conn,
+                    now_text=self._now(),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (25, _utc_text()),
+                )
+        if current < 26:
+            # Rebuilding parent tables while preserving all dependent task,
+            # event, reply, and outbox identities requires FK enforcement to
+            # be disabled before BEGIN.  DDL is still fully transactional;
+            # foreign_key_check runs before the marker can commit and the
+            # connection setting is restored on every exit path.
+            task_columns_v26 = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)")
+            }
+            existing_v26_tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                    "('agent_invocations','agent_admission_counters',"
+                    "'global_agent_admission_counter','agent_execution_slots',"
+                    "'agent_dispatch_attempts')"
+                ).fetchall()
+            }
+            completed_without_marker = (
+                {"agent_incarnation", "current_execution_id"}.issubset(
+                    task_columns_v26
+                )
+                and len(existing_v26_tables) == 5
+            )
+            if completed_without_marker:
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise StoreError(
+                        "schema v26 marker is absent and foreign-key truth conflicts"
+                    )
+                with _transaction(conn):
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (26, _utc_text()),
+                    )
+            else:
+                self._apply_schema_v26_rebuild(conn)
+        v26_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=26"
+        ).fetchone()
+        if current < 27 and v26_applied is not None:
+            with _transaction(conn):
+                attempt_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='agent_dispatch_attempts'"
+                ).fetchone()
+                if attempt_table is None:
+                    raise StoreError(
+                        "schema v26 marker exists without dispatch-attempt storage"
+                    )
+                attempt_columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(agent_dispatch_attempts)"
+                    ).fetchall()
+                }
+                for name, definition in (
+                    (
+                        "decision_code",
+                        "TEXT CHECK (decision_code IS NULL OR "
+                        "(length(trim(decision_code)) BETWEEN 1 AND 128))",
+                    ),
+                    (
+                        "decision_outcome_state",
+                        "TEXT CHECK (decision_outcome_state IS NULL OR "
+                        "decision_outcome_state IN "
+                        "('queued','running','cancelled','failed'))",
+                    ),
+                    (
+                        "cleanup_proof_hash",
+                        "TEXT CHECK (cleanup_proof_hash IS NULL OR "
+                        "(length(cleanup_proof_hash)=64 AND "
+                        "cleanup_proof_hash NOT GLOB '*[^0-9a-f]*'))",
+                    ),
+                ):
+                    if name not in attempt_columns:
+                        conn.execute(
+                            "ALTER TABLE agent_dispatch_attempts "
+                            f"ADD COLUMN {name} {definition}"
+                        )
+                _executescript_atomic(
+                    conn,
+                    _MIGRATION_27_DISPATCH_ATTEMPT_TRIGGERS,
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (27, _utc_text()),
+                )
+        v27_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=27"
+        ).fetchone()
+        if current < 28 and v27_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v28_mailbox_lifecycle_tx(conn)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (28, _utc_text()),
+                )
+        v28_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=28"
+        ).fetchone()
+        if current < 29 and v28_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v29_dispatch_decisions_tx(conn)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (29, _utc_text()),
+                )
+        v29_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=29"
+        ).fetchone()
+        if current < 30 and v29_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v30_mailbox_hardening_tx(conn)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (30, _utc_text()),
+                )
+        v30_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=30"
+        ).fetchone()
+        if current < 31 and v30_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v31_dispatch_decisions_tx(conn)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (31, _utc_text()),
+                )
+        v31_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=31"
+        ).fetchone()
+        if current < 32 and v31_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v32_reply_candidate_presentation_tx(conn)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (32, _utc_text()),
+                )
+        self._finish_initialize_sync(
+            conn,
+            current=current,
+            recover_startup_state=recover_startup_state,
+        )
+
+    def _apply_schema_v32_reply_candidate_presentation_tx(
+        self,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Add the durable unread cursor for inbox-only completed items."""
+
+        columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(reply_candidates)"
+            ).fetchall()
+        }
+        if "presentation" not in columns:
+            conn.execute(
+                "ALTER TABLE reply_candidates ADD COLUMN presentation TEXT "
+                "NOT NULL DEFAULT 'unseen' CHECK (presentation IN "
+                "('unseen','presented','acknowledged'))"
+            )
+        if "presented_at" not in columns:
+            conn.execute(
+                "ALTER TABLE reply_candidates ADD COLUMN presented_at TEXT"
+            )
+        receipt_columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(command_receipts)"
+            ).fetchall()
+        }
+        if "response_fragments_json" not in receipt_columns:
+            conn.execute(
+                "ALTER TABLE command_receipts ADD COLUMN "
+                "response_fragments_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        # v31 and older had no durable unread cursor.  Treat their retained
+        # candidates as historical instead of guessing that every old row is
+        # unread and replaying an entire Agent transcript on first switch.
+        migration_time = _utc_text()
+        conn.execute(
+            "UPDATE reply_candidates SET presentation='presented', "
+            "presented_at=COALESCE(presented_at, ?)",
+            (migration_time,),
+        )
+        _executescript_atomic(
+            conn,
+            _MIGRATION_32_REPLY_CANDIDATE_PRESENTATION_INDEX,
+        )
+
+    def _apply_schema_v31_dispatch_decisions_tx(
+        self,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Make post-v31 dispatch decisions complete and exactly replayable."""
+
+        # Schema v30 was released while timestamp strings still passed through
+        # ``_utc_text`` verbatim.  Repair and re-audit that retained history
+        # here as well as in the v30 migration so a database already carrying
+        # the v30 marker cannot bypass the hardened invariants.
+        self._canonicalize_v30_invocation_history_timestamps_tx(conn)
+        self._validate_v30_invocation_event_seeds_tx(conn)
+        self._validate_v30_mailbox_orphan_review_timing_tx(conn)
+        self._validate_v30_mailbox_orphan_review_history_tx(conn)
+
+        for trigger in (
+            "trg_agent_dispatch_attempts_insert_valid",
+            "trg_agent_dispatch_attempts_update_valid",
+            "trg_agent_dispatch_attempts_immutable",
+            "trg_agent_dispatch_attempts_no_delete",
+        ):
+            conn.execute(f'DROP TRIGGER IF EXISTS "{trigger}"')
+        attempt_columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(agent_dispatch_attempts)"
+            ).fetchall()
+        }
+        if "decision_next_attempt_at" not in attempt_columns:
+            conn.execute(
+                "ALTER TABLE agent_dispatch_attempts ADD COLUMN "
+                "decision_next_attempt_at TEXT"
+            )
+        marker_added = "decision_metadata_legacy" not in attempt_columns
+        if marker_added:
+            conn.execute(
+                "ALTER TABLE agent_dispatch_attempts ADD COLUMN "
+                "decision_metadata_legacy INTEGER NOT NULL DEFAULT 0 CHECK ("
+                "typeof(decision_metadata_legacy)='integer' AND "
+                "decision_metadata_legacy IN (0,1))"
+            )
+            # Retry timing was not retained before v31.  Mark every decision
+            # which already exists before installing the immutable v31
+            # triggers; undecided attempts remain eligible for a complete v31
+            # decision later.
+            conn.execute(
+                """UPDATE agent_dispatch_attempts
+                      SET decision_metadata_legacy=1
+                    WHERE grant_issued_at IS NOT NULL
+                       OR abort_committed_at IS NOT NULL
+                       OR rejection_committed_at IS NOT NULL"""
+            )
+
+        _executescript_atomic(
+            conn,
+            _MIGRATION_31_DISPATCH_DECISION_TRIGGERS,
+        )
+        try:
+            # Triggers do not retroactively inspect retained rows.  A no-op
+            # update validates the complete legacy/new decision matrix and
+            # cleanup tuple before the schema marker can commit.
+            conn.execute(
+                "UPDATE agent_dispatch_attempts SET "
+                "decision_next_attempt_at=decision_next_attempt_at "
+                "WHERE NOT (decision_metadata_legacy=1 "
+                "AND runtime_stopped_at IS NOT NULL "
+                "AND invocation_job_empty_at IS NOT NULL "
+                "AND cleanup_proof_hash IS NULL)"
+            )
+        except sqlite3.IntegrityError as exc:
+            raise StoreError(
+                "schema v31 dispatch decision validation conflicts"
+            ) from exc
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise StoreError(
+                "schema v31 foreign-key validation failed: "
+                + repr(tuple(violations[0]))
+            )
+
+    def _apply_schema_v30_mailbox_hardening_tx(
+        self,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Canonicalize expiry and structurally fence orphan reviews."""
+
+        self._canonicalize_v30_mailbox_expiry_tx(conn)
+        self._canonicalize_v30_invocation_history_timestamps_tx(conn)
+        self._validate_v30_invocation_event_seeds_tx(conn)
+        self._validate_v30_mailbox_orphan_review_timing_tx(conn)
+        self._validate_v30_mailbox_orphan_review_history_tx(conn)
+        self._rebuild_v30_mailbox_orphan_reviews_tx(conn)
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise StoreError(
+                "schema v30 foreign-key validation failed: "
+                + repr(tuple(violations[0]))
+            )
+
+    @staticmethod
+    def _canonicalize_v30_mailbox_expiry_tx(
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Normalize deployed v28 expiry before lexical comparisons resume."""
+
+        conn.execute("DROP TRIGGER IF EXISTS trg_agent_mailbox_expiry_immutable")
+        conn.execute(
+            "DROP TRIGGER IF EXISTS trg_agent_invocation_expiry_update_valid"
+        )
+        mailbox_expiry: dict[str, str] = {}
+        for row in conn.execute(
+            "SELECT mailbox_id,expires_at FROM agent_mailbox"
+        ).fetchall():
+            parsed = text_to_datetime(row["expires_at"])
+            canonical = datetime_to_text(parsed) if parsed is not None else None
+            if canonical is None:
+                raise StoreError(
+                    "mailbox expiry is invalid during schema v30: "
+                    + str(row["mailbox_id"])
+                )
+            mailbox_id = str(row["mailbox_id"])
+            mailbox_expiry[mailbox_id] = canonical
+            if str(row["expires_at"]) != canonical:
+                conn.execute(
+                    "UPDATE agent_mailbox SET expires_at=? WHERE mailbox_id=?",
+                    (canonical, mailbox_id),
+                )
+
+        invalid_task = conn.execute(
+            "SELECT invocation_id FROM agent_invocations "
+            "WHERE work_kind='task' AND expires_at IS NOT NULL LIMIT 1"
+        ).fetchone()
+        if invalid_task is not None:
+            raise StoreError(
+                "task invocation expiry conflicts during schema v30: "
+                + str(invalid_task["invocation_id"])
+            )
+        mailbox_rows = conn.execute(
+            """SELECT invocation.invocation_id,invocation.mailbox_id,
+                      invocation.expires_at,mailbox.expires_at AS mailbox_expires_at
+                 FROM agent_invocations AS invocation
+                 LEFT JOIN agent_mailbox AS mailbox
+                   ON mailbox.mailbox_id=invocation.mailbox_id
+                  AND mailbox.message_id=invocation.work_id
+                  AND mailbox.destination_agent_id=invocation.agent_id
+                  AND mailbox.destination_agent_incarnation=
+                      invocation.agent_incarnation
+                WHERE invocation.work_kind='mailbox'"""
+        ).fetchall()
+        for row in mailbox_rows:
+            mailbox_id = str(row["mailbox_id"] or "")
+            expected = mailbox_expiry.get(mailbox_id)
+            retained = text_to_datetime(row["expires_at"])
+            canonical = datetime_to_text(retained) if retained is not None else None
+            if (
+                expected is None
+                or row["mailbox_expires_at"] is None
+                or canonical != expected
+            ):
+                raise StoreError(
+                    "mailbox invocation expiry conflicts during schema v30: "
+                    + str(row["invocation_id"])
+                )
+            if str(row["expires_at"]) != canonical:
+                conn.execute(
+                    "UPDATE agent_invocations SET expires_at=? "
+                    "WHERE invocation_id=?",
+                    (canonical, row["invocation_id"]),
+                )
+        _executescript_atomic(conn, _MIGRATION_30_EXPIRY_UPDATE_TRIGGERS)
+
+    @staticmethod
+    def _canonicalize_v30_invocation_history_timestamps_tx(
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Normalize retained invocation, event, and review decision times.
+
+        SQLite compares the durable timestamps lexically, while deployed
+        pre-v31 stores accepted arbitrary ISO-8601 offset spellings.  Convert
+        every accepted spelling to the canonical UTC representation without
+        changing its instant.  The surrounding migration transaction makes
+        the trigger removal, data rewrite, and trigger restoration atomic.
+        """
+
+        invocation_updates: list[tuple[str, str, str | None, str]] = []
+        for row in conn.execute(
+            "SELECT invocation_id,created_at,updated_at,terminal_at "
+            "FROM agent_invocations"
+        ).fetchall():
+            invocation_id = str(row["invocation_id"])
+            created_time = text_to_datetime(row["created_at"])
+            updated_time = text_to_datetime(row["updated_at"])
+            created_text = (
+                datetime_to_text(created_time)
+                if created_time is not None
+                else None
+            )
+            updated_text = (
+                datetime_to_text(updated_time)
+                if updated_time is not None
+                else None
+            )
+            terminal_time = text_to_datetime(row["terminal_at"])
+            terminal_text = (
+                datetime_to_text(terminal_time)
+                if terminal_time is not None
+                else None
+            )
+            if created_text is None or updated_text is None:
+                raise StoreError(
+                    "invocation timestamp is invalid during schema v30: "
+                    + invocation_id
+                )
+            if created_time > updated_time:
+                raise StoreError(
+                    "invocation timestamp order conflicts during schema v30: "
+                    + invocation_id
+                )
+            if row["terminal_at"] is not None and terminal_text is None:
+                raise StoreError(
+                    "invocation terminal timestamp is invalid during schema v30: "
+                    + invocation_id
+                )
+            if (
+                str(row["created_at"]) != created_text
+                or str(row["updated_at"]) != updated_text
+                or (
+                    row["terminal_at"] is not None
+                    and str(row["terminal_at"]) != terminal_text
+                )
+            ):
+                invocation_updates.append(
+                    (created_text, updated_text, terminal_text, invocation_id)
+                )
+
+        event_updates: list[tuple[str, str]] = []
+        for row in conn.execute(
+            "SELECT invocation_event_id,created_at "
+            "FROM agent_invocation_events"
+        ).fetchall():
+            event_id = str(row["invocation_event_id"])
+            event_time = text_to_datetime(row["created_at"])
+            event_text = (
+                datetime_to_text(event_time)
+                if event_time is not None
+                else None
+            )
+            if event_text is None:
+                raise StoreError(
+                    "invocation event timestamp is invalid during schema v30: "
+                    + event_id
+                )
+            if str(row["created_at"]) != event_text:
+                event_updates.append((event_text, event_id))
+
+        review_updates: list[tuple[str, str]] = []
+        for row in conn.execute(
+            "SELECT mailbox_maintenance_id,reviewed_at "
+            "FROM mailbox_orphan_reviews"
+        ).fetchall():
+            maintenance_id = str(row["mailbox_maintenance_id"])
+            reviewed_time = text_to_datetime(row["reviewed_at"])
+            reviewed_text = (
+                datetime_to_text(reviewed_time)
+                if reviewed_time is not None
+                else None
+            )
+            if reviewed_text is None:
+                # Retain the established migration diagnostic used by the
+                # review-table integrity checks below.
+                raise StoreError(
+                    "mailbox review decision time conflicts during schema v30: "
+                    + maintenance_id
+                )
+            if str(row["reviewed_at"]) != reviewed_text:
+                review_updates.append((reviewed_text, maintenance_id))
+
+        trigger_names = (
+            "trg_agent_invocation_events_no_update",
+            "trg_mailbox_orphan_reviews_no_update",
+        )
+        trigger_sql: list[str] = []
+        for name in trigger_names:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='trigger' AND name=?",
+                (name,),
+            ).fetchone()
+            if row is None or not str(row["sql"] or "").strip():
+                raise StoreError(
+                    "immutable history trigger is missing during schema v30: "
+                    + name
+                )
+            trigger_sql.append(str(row["sql"]))
+
+        for name in trigger_names:
+            conn.execute(f'DROP TRIGGER "{name}"')
+        for (
+            created_text,
+            updated_text,
+            terminal_text,
+            invocation_id,
+        ) in invocation_updates:
+            conn.execute(
+                "UPDATE agent_invocations "
+                "SET created_at=?,updated_at=?,terminal_at=? "
+                "WHERE invocation_id=?",
+                (created_text, updated_text, terminal_text, invocation_id),
+            )
+        for event_text, event_id in event_updates:
+            conn.execute(
+                "UPDATE agent_invocation_events SET created_at=? "
+                "WHERE invocation_event_id=?",
+                (event_text, event_id),
+            )
+        for reviewed_text, maintenance_id in review_updates:
+            conn.execute(
+                "UPDATE mailbox_orphan_reviews SET reviewed_at=? "
+                "WHERE mailbox_maintenance_id=?",
+                (reviewed_text, maintenance_id),
+            )
+        for statement in trigger_sql:
+            conn.execute(statement)
+
+    @staticmethod
+    def _validate_v30_invocation_event_seeds_tx(
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Validate canonical sequence-one identity and recoverable timing.
+
+        A lone migration snapshot must retain the invocation's migration-time
+        ``updated_at`` exactly.  Once sequence two exists, later aggregate
+        updates make that original timestamp unrecoverable; canonical ordering
+        against sequence two and the current aggregate remains the safe proof.
+        """
+
+        rows = conn.execute(
+            """SELECT invocation.invocation_id,invocation.state,
+                      invocation.created_at,invocation.updated_at,
+                      event.invocation_event_id,event.event_kind,
+                      event.previous_state,event.new_state,event.source_kind,
+                      event.source_id,event.metadata_json,event.created_at AS event_at,
+                      next_event.previous_state AS next_previous_state,
+                      next_event.created_at AS next_event_at
+                 FROM agent_invocations AS invocation
+                 LEFT JOIN agent_invocation_events AS event
+                   ON event.invocation_id=invocation.invocation_id
+                  AND event.event_sequence=1
+                 LEFT JOIN agent_invocation_events AS next_event
+                   ON next_event.invocation_id=invocation.invocation_id
+                  AND next_event.event_sequence=2"""
+        ).fetchall()
+        for row in rows:
+            invocation_id = str(row["invocation_id"])
+            event_id = row["invocation_event_id"]
+            event_kind = row["event_kind"]
+            initial_state = (
+                str(row["next_previous_state"])
+                if row["next_previous_state"] is not None
+                else str(row["state"])
+            )
+            common_valid = (
+                event_id is not None
+                and row["previous_state"] is None
+                and str(row["new_state"] or "") == initial_state
+            )
+            if event_kind == "migration_snapshot":
+                valid = common_valid and (
+                    str(event_id)
+                    == "invocation-event:migration-v28:" + invocation_id
+                    and str(row["source_kind"] or "") == "migration"
+                    and str(row["source_id"] or "") == "schema-v28"
+                    and str(row["metadata_json"] or "")
+                    == '{"schema_version":28}'
+                    and (
+                        row["next_event_at"] is not None
+                        or row["event_at"] == row["updated_at"]
+                    )
+                )
+            elif event_kind == "invocation_created":
+                valid = common_valid and (
+                    str(event_id)
+                    == "invocation-event:"
+                    + invocation_id
+                    + ":00000000000000000001"
+                    and str(row["source_kind"] or "") == "store"
+                    and str(row["source_id"] or "") == invocation_id
+                    and str(row["metadata_json"] or "") == "{}"
+                    and row["event_at"] == row["created_at"]
+                )
+            else:
+                valid = False
+
+            created_time = text_to_datetime(row["created_at"])
+            canonical_created_time = (
+                datetime_to_text(created_time)
+                if created_time is not None
+                else None
+            )
+            event_time = text_to_datetime(row["event_at"])
+            canonical_event_time = (
+                datetime_to_text(event_time) if event_time is not None else None
+            )
+            if (
+                canonical_created_time != row["created_at"]
+                or canonical_event_time != row["event_at"]
+                or created_time is None
+                or event_time is None
+                or created_time > event_time
+            ):
+                valid = False
+            next_time = text_to_datetime(row["next_event_at"])
+            if (
+                row["next_event_at"] is not None
+                and (
+                    next_time is None
+                    or datetime_to_text(next_time) != row["next_event_at"]
+                    or event_time is None
+                    or event_time > next_time
+                )
+            ):
+                valid = False
+            updated_time = text_to_datetime(row["updated_at"])
+            if (
+                updated_time is None
+                or datetime_to_text(updated_time) != row["updated_at"]
+                or event_time is None
+                or event_time > updated_time
+                or created_time is None
+                or created_time > updated_time
+                or (
+                    row["next_event_at"] is not None
+                    and (next_time is None or next_time > updated_time)
+                )
+            ):
+                valid = False
+            if not valid:
+                raise StoreError(
+                    "invocation event sequence-one identity conflicts during "
+                    "schema v30: "
+                    + invocation_id
+                )
+
+    @staticmethod
+    def _validate_v30_mailbox_orphan_review_timing_tx(
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Fence review authorization and decision time after orphaning."""
+
+        rows = conn.execute(
+            """SELECT review.mailbox_maintenance_id,review.authorized_at,
+                      review.reviewed_at,
+                      invocation.invocation_id,invocation.state,
+                      invocation.updated_at,invocation.terminal_at
+                 FROM mailbox_orphan_reviews AS review
+                 LEFT JOIN agent_invocations AS invocation
+                   ON invocation.invocation_id=
+                      review.expected_current_invocation_id"""
+        ).fetchall()
+        for row in rows:
+            maintenance_id = str(row["mailbox_maintenance_id"])
+            if row["invocation_id"] is None:
+                raise StoreError(
+                    "mailbox review invocation identity conflicts during "
+                    "schema v30: "
+                    + maintenance_id
+                )
+            authorized_at = text_to_datetime(row["authorized_at"])
+            reviewed_at = text_to_datetime(row["reviewed_at"])
+            updated_at = text_to_datetime(row["updated_at"])
+            terminal_at = text_to_datetime(row["terminal_at"])
+            if (
+                authorized_at is None
+                or datetime_to_text(authorized_at) != row["authorized_at"]
+            ):
+                raise StoreError(
+                    "mailbox review authorization time conflicts during "
+                    "schema v30: "
+                    + maintenance_id
+                )
+            if (
+                reviewed_at is None
+                or datetime_to_text(reviewed_at) != row["reviewed_at"]
+            ):
+                raise StoreError(
+                    "mailbox review decision time conflicts during schema v30: "
+                    + maintenance_id
+                )
+            if authorized_at > reviewed_at:
+                raise StoreError(
+                    "mailbox review authorization follows its decision during "
+                    "schema v30: "
+                    + maintenance_id
+                )
+            if (
+                str(row["state"] or "") != "orphaned"
+                or updated_at is None
+                or terminal_at is None
+                or datetime_to_text(updated_at) != row["updated_at"]
+                or datetime_to_text(terminal_at) != row["terminal_at"]
+                or reviewed_at < updated_at
+                or reviewed_at < terminal_at
+            ):
+                raise StoreError(
+                    "mailbox review predates orphan terminalization during "
+                    "schema v30: "
+                    + maintenance_id
+                )
+
+    @staticmethod
+    def _validate_v30_mailbox_orphan_review_history_tx(
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Require canonical accepted events and no rejected resolution."""
+
+        def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate metadata key")
+                result[key] = value
+            return result
+
+        reviews = conn.execute(
+            """SELECT mailbox_maintenance_id,
+                      expected_current_invocation_id,action,outcome,
+                      replacement_invocation_id,reviewed_at
+                 FROM mailbox_orphan_reviews"""
+        ).fetchall()
+        for review in reviews:
+            maintenance_id = str(review["mailbox_maintenance_id"])
+            expected_invocation_id = str(
+                review["expected_current_invocation_id"]
+            )
+            events = conn.execute(
+                """SELECT invocation_event_id,invocation_id,event_sequence,
+                          event_kind,previous_state,new_state,source_kind,
+                          source_id,metadata_json,created_at
+                    FROM agent_invocation_events
+                    WHERE (source_kind='mailbox_orphan_review'
+                           AND source_id=?)
+                       OR (event_kind='orphan_review_resolved'
+                           AND invocation_id=?)""",
+                (
+                    maintenance_id,
+                    expected_invocation_id,
+                ),
+            ).fetchall()
+            expected_metadata = {
+                "action": str(review["action"]),
+                "outcome": str(review["outcome"]),
+                "replacement_invocation_id": review[
+                    "replacement_invocation_id"
+                ],
+            }
+            correlated: list[tuple[sqlite3.Row, Any]] = []
+            accepted = str(review["outcome"]) in {
+                "retried",
+                "dead_lettered",
+            }
+            for event in events:
+                metadata: Any = None
+                try:
+                    metadata = json.loads(
+                        str(event["metadata_json"]),
+                        object_pairs_hook=unique_object,
+                    )
+                except (TypeError, ValueError):
+                    metadata = None
+                claimed_by_source = str(event["source_id"]) == maintenance_id
+                resolution_for_invocation = (
+                    str(event["event_kind"]) == "orphan_review_resolved"
+                    and str(event["invocation_id"])
+                    == expected_invocation_id
+                )
+                semantically_claimed = (
+                    resolution_for_invocation and metadata == expected_metadata
+                )
+                if claimed_by_source or (
+                    resolution_for_invocation
+                    if accepted
+                    else semantically_claimed
+                ):
+                    correlated.append((event, metadata))
+
+            if not accepted:
+                if correlated:
+                    raise StoreError(
+                        "rejected mailbox review has resolution history during "
+                        "schema v30: "
+                        + maintenance_id
+                    )
+                continue
+
+            valid = len(correlated) == 1
+            if valid:
+                event, metadata = correlated[0]
+                stats = conn.execute(
+                    """SELECT COUNT(*) AS event_count,
+                              COALESCE(MAX(event_sequence),0) AS max_sequence
+                         FROM agent_invocation_events
+                        WHERE invocation_id=?""",
+                    (expected_invocation_id,),
+                ).fetchone()
+                event_sequence = int(event["event_sequence"])
+                event_count = int(stats["event_count"])
+                max_sequence = int(stats["max_sequence"])
+                canonical_event_id = (
+                    "invocation-event:"
+                    + expected_invocation_id
+                    + ":"
+                    + f"{event_sequence:020d}"
+                )
+                valid = (
+                    str(event["invocation_id"])
+                    == expected_invocation_id
+                    and event_sequence == event_count
+                    and max_sequence == event_count
+                    and str(event["invocation_event_id"])
+                    == canonical_event_id
+                    and str(event["event_kind"])
+                    == "orphan_review_resolved"
+                    and str(event["source_kind"])
+                    == "mailbox_orphan_review"
+                    and str(event["source_id"]) == maintenance_id
+                    and str(event["previous_state"]) == "orphaned"
+                    and str(event["new_state"]) == "orphaned"
+                    and metadata == expected_metadata
+                    and str(event["created_at"])
+                    == str(review["reviewed_at"])
+                )
+            if not valid:
+                raise StoreError(
+                    "mailbox review event history conflicts during schema v30: "
+                    + maintenance_id
+                )
+
+        accepted_review_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM mailbox_orphan_reviews "
+                "WHERE outcome IN ('retried','dead_lettered')"
+            ).fetchone()[0]
+        )
+        resolution_event_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM agent_invocation_events "
+                "WHERE event_kind='orphan_review_resolved'"
+            ).fetchone()[0]
+        )
+        if resolution_event_count != accepted_review_count:
+            raise StoreError(
+                "mailbox review resolution history cardinality conflicts "
+                "during schema v30"
+            )
+
+    @staticmethod
+    def _rebuild_v30_mailbox_orphan_reviews_tx(
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Add compound invocation ownership FKs without changing history."""
+
+        legacy_columns = (
+            "mailbox_maintenance_id,payload_hash,mailbox_id,"
+            "mailbox_message_id,expected_current_invocation_id,action,actor,"
+            "reason,authorized_at,authorization_source,"
+            "administrator_authorized,outcome,replacement_invocation_id,"
+            "reviewed_at"
+        )
+        target_columns = (
+            "mailbox_maintenance_id,payload_hash,authorization_grant_digest,"
+            "authorization_scheme,mailbox_id,mailbox_message_id,"
+            "expected_current_invocation_id,"
+            "action,actor,reason,authorized_at,authorization_source,"
+            "administrator_authorized,outcome,replacement_invocation_id,"
+            "reviewed_at"
+        )
+        existing_columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(mailbox_orphan_reviews)"
+            ).fetchall()
+        }
+        v30_shape_landed = {
+            "authorization_grant_digest",
+            "authorization_scheme",
+        }.issubset(existing_columns)
+        snapshot_columns = (
+            target_columns if v30_shape_landed else legacy_columns
+        )
+        before = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT " + snapshot_columns + " FROM mailbox_orphan_reviews "
+                "ORDER BY mailbox_maintenance_id"
+            ).fetchall()
+        ]
+        invalid_identity = conn.execute(
+            """SELECT review.mailbox_maintenance_id
+                 FROM mailbox_orphan_reviews AS review
+                 LEFT JOIN agent_invocations AS expected
+                   ON expected.invocation_id=
+                      review.expected_current_invocation_id
+                  AND expected.mailbox_id=review.mailbox_id
+                  AND expected.work_id=review.mailbox_message_id
+                 LEFT JOIN agent_invocations AS replacement
+                   ON replacement.invocation_id=
+                      review.replacement_invocation_id
+                  AND replacement.mailbox_id=review.mailbox_id
+                  AND replacement.work_id=review.mailbox_message_id
+                WHERE expected.invocation_id IS NULL
+                   OR (review.replacement_invocation_id IS NOT NULL
+                       AND replacement.invocation_id IS NULL)
+                LIMIT 1"""
+        ).fetchone()
+        if invalid_identity is not None:
+            raise StoreError(
+                "mailbox review invocation identity conflicts during schema v30: "
+                + str(invalid_identity["mailbox_maintenance_id"])
+            )
+        for trigger in (
+            "trg_mailbox_orphan_reviews_insert_valid",
+            "trg_mailbox_orphan_reviews_no_update",
+            "trg_mailbox_orphan_reviews_no_delete",
+            "trg_mailbox_orphan_reviews_resolution_event",
+        ):
+            conn.execute(f'DROP TRIGGER IF EXISTS "{trigger}"')
+        conn.execute("DROP INDEX IF EXISTS idx_mailbox_orphan_reviews_mailbox")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_agent_invocations_mailbox_work_identity_v30 "
+            "ON agent_invocations(invocation_id,mailbox_id,work_id)"
+        )
+        stale = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='mailbox_orphan_reviews_v30'"
+        ).fetchone()
+        if stale is not None:
+            raise StoreError("schema v30 review rebuild table already exists")
+        _executescript_atomic(conn, _MIGRATION_30_REVIEW_TABLE)
+        legacy_rows = conn.execute(
+            "SELECT " + snapshot_columns + " FROM mailbox_orphan_reviews "
+            "ORDER BY mailbox_maintenance_id"
+        ).fetchall()
+        for row in legacy_rows:
+            authorized_at = text_to_datetime(row["authorized_at"])
+            if (
+                authorized_at is None
+                or datetime_to_text(authorized_at) != row["authorized_at"]
+            ):
+                raise StoreError(
+                    "mailbox review authorization time conflicts during "
+                    "schema v30: "
+                    + str(row["mailbox_maintenance_id"])
+                )
+            reviewed_at = text_to_datetime(row["reviewed_at"])
+            if (
+                reviewed_at is None
+                or datetime_to_text(reviewed_at) != row["reviewed_at"]
+            ):
+                raise StoreError(
+                    "mailbox review decision time conflicts during schema v30: "
+                    + str(row["mailbox_maintenance_id"])
+                )
+            expected_payload_hash = canonical_mailbox_review_payload_hash(
+                row["mailbox_message_id"],
+                row["expected_current_invocation_id"],
+                row["action"],
+            )
+            if not hmac.compare_digest(
+                expected_payload_hash,
+                str(row["payload_hash"]),
+            ):
+                raise StoreError(
+                    "mailbox review payload hash conflicts during schema v30: "
+                    + str(row["mailbox_maintenance_id"])
+                )
+            grant_digest = canonical_mailbox_review_authorization_digest(
+                mailbox_message_id=row["mailbox_message_id"],
+                expected_current_invocation_id=(
+                    row["expected_current_invocation_id"]
+                ),
+                mailbox_maintenance_id=row["mailbox_maintenance_id"],
+                action=row["action"],
+                actor=row["actor"],
+                reason=row["reason"],
+                authorization_source=row["authorization_source"],
+                authorized_at=authorized_at,
+            )
+            if v30_shape_landed:
+                scheme = str(row["authorization_scheme"])
+                retained_digest = str(row["authorization_grant_digest"])
+                if scheme not in {"legacy_v28_audit", "process_grant_v1"}:
+                    raise StoreError(
+                        "mailbox review authorization scheme conflicts during "
+                        "schema v30: "
+                        + str(row["mailbox_maintenance_id"])
+                    )
+                if not hmac.compare_digest(grant_digest, retained_digest):
+                    raise StoreError(
+                        "mailbox review grant digest conflicts during schema v30: "
+                        + str(row["mailbox_maintenance_id"])
+                    )
+            else:
+                scheme = "legacy_v28_audit"
+                retained_digest = grant_digest
+            values = (
+                row["mailbox_maintenance_id"],
+                row["payload_hash"],
+                retained_digest,
+                scheme,
+                row["mailbox_id"],
+                row["mailbox_message_id"],
+                row["expected_current_invocation_id"],
+                row["action"],
+                row["actor"],
+                row["reason"],
+                row["authorized_at"],
+                row["authorization_source"],
+                row["administrator_authorized"],
+                row["outcome"],
+                row["replacement_invocation_id"],
+                row["reviewed_at"],
+            )
+            conn.execute(
+                "INSERT INTO mailbox_orphan_reviews_v30 ("
+                + target_columns
+                + ") VALUES ("
+                + ",".join("?" for _value in values)
+                + ")",
+                values,
+            )
+        conn.execute("DROP TABLE mailbox_orphan_reviews")
+        conn.execute(
+            "ALTER TABLE mailbox_orphan_reviews_v30 "
+            "RENAME TO mailbox_orphan_reviews"
+        )
+        _executescript_atomic(conn, _MIGRATION_30_REVIEW_TRIGGERS)
+        after = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT " + snapshot_columns + " FROM mailbox_orphan_reviews "
+                "ORDER BY mailbox_maintenance_id"
+            ).fetchall()
+        ]
+        if after != before:
+            raise StoreError("schema v30 mailbox review replay conflicts")
+
+    def _apply_schema_v29_dispatch_decisions_tx(
+        self,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Persist the exact aggregate outcome of every typed decision."""
+
+        attempt_columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(agent_dispatch_attempts)"
+            ).fetchall()
+        }
+        if "decision_source_state" not in attempt_columns:
+            conn.execute(
+                "ALTER TABLE agent_dispatch_attempts ADD COLUMN "
+                "decision_source_state TEXT CHECK ("
+                "decision_source_state IS NULL OR decision_source_state IN ("
+                "'queued','running','cancelled','failed','pending','processing',"
+                "'rejected','expired'))"
+            )
+
+        # Schema v27 could persist the generic outcome but not whether a
+        # mailbox became rejected or expired.  Reserved-mailbox expiry was not
+        # supported before this migration, so every old terminal mailbox
+        # decision is unambiguously a rejection.  Truly legacy v26 decisions
+        # have no generic metadata and intentionally remain all-NULL history.
+        conn.execute(
+            """UPDATE agent_dispatch_attempts AS attempt
+                  SET decision_source_state = CASE
+                      WHEN EXISTS (
+                          SELECT 1 FROM agent_invocations AS invocation
+                           WHERE invocation.invocation_id=attempt.invocation_id
+                             AND invocation.work_kind='task'
+                      ) THEN CASE attempt.decision_outcome_state
+                          WHEN 'queued' THEN 'queued'
+                          WHEN 'running' THEN 'running'
+                          WHEN 'cancelled' THEN 'cancelled'
+                          WHEN 'failed' THEN 'failed'
+                      END
+                      WHEN attempt.grant_issued_at IS NOT NULL THEN 'processing'
+                      WHEN attempt.decision_outcome_state='queued' THEN 'pending'
+                      WHEN attempt.decision_outcome_state='failed' THEN 'rejected'
+                  END
+                WHERE decision_source_state IS NULL
+                  AND decision_code IS NOT NULL
+                  AND decision_outcome_state IS NOT NULL"""
+        )
+        invalid = conn.execute(
+            """SELECT dispatch_attempt_id FROM agent_dispatch_attempts
+                WHERE (decision_code IS NULL) !=
+                      (decision_outcome_state IS NULL)
+                   OR (decision_code IS NOT NULL
+                       AND decision_source_state IS NULL)
+                LIMIT 1"""
+        ).fetchone()
+        if invalid is not None:
+            raise StoreError(
+                "dispatch decision source migration conflicts: "
+                + str(invalid["dispatch_attempt_id"])
+            )
+        _executescript_atomic(
+            conn,
+            _MIGRATION_29_DISPATCH_DECISION_TRIGGERS,
+        )
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise StoreError(
+                "schema v29 foreign-key validation failed: "
+                + repr(tuple(violations[0]))
+            )
+
+    def _apply_schema_v28_mailbox_lifecycle_tx(
+        self,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Install immutable mailbox expiry and orphan-review history."""
+
+        event_table_existed = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='agent_invocation_events'"
+        ).fetchone() is not None
+        preexisting_event_rows = (
+            int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM agent_invocation_events"
+                ).fetchone()[0]
+            )
+            if event_table_existed
+            else 0
+        )
+        mailbox_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(agent_mailbox)").fetchall()
+        }
+        if "expires_at" not in mailbox_columns:
+            conn.execute("ALTER TABLE agent_mailbox ADD COLUMN expires_at TEXT")
+        invocation_columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(agent_invocations)"
+            ).fetchall()
+        }
+        if "expires_at" not in invocation_columns:
+            conn.execute("ALTER TABLE agent_invocations ADD COLUMN expires_at TEXT")
+
+        for row in conn.execute(
+            "SELECT mailbox_id,created_at,expires_at FROM agent_mailbox"
+        ).fetchall():
+            created = text_to_datetime(row["created_at"])
+            if created is None:
+                raise StoreError(
+                    "mailbox creation timestamp is invalid during schema v28: "
+                    + str(row["mailbox_id"])
+                )
+            expected = datetime_to_text(
+                created + timedelta(seconds=DEFAULT_MAILBOX_TTL_SECONDS)
+            )
+            retained = row["expires_at"]
+            if retained is None:
+                conn.execute(
+                    "UPDATE agent_mailbox SET expires_at=? WHERE mailbox_id=?",
+                    (expected, row["mailbox_id"]),
+                )
+            else:
+                parsed = text_to_datetime(retained)
+                canonical = datetime_to_text(parsed) if parsed is not None else None
+                if canonical != expected:
+                    raise StoreError(
+                        "mailbox expiry conflicts during schema v28: "
+                        + str(row["mailbox_id"])
+                    )
+                if str(retained) != expected:
+                    conn.execute(
+                        "UPDATE agent_mailbox SET expires_at=? WHERE mailbox_id=?",
+                        (expected, row["mailbox_id"]),
+                    )
+
+        invalid_task = conn.execute(
+            "SELECT invocation_id FROM agent_invocations "
+            "WHERE work_kind='task' AND expires_at IS NOT NULL LIMIT 1"
+        ).fetchone()
+        if invalid_task is not None:
+            raise StoreError(
+                "task invocation expiry conflicts during schema v28: "
+                + str(invalid_task["invocation_id"])
+            )
+        mailbox_invocations = conn.execute(
+            """SELECT invocation.invocation_id, invocation.expires_at,
+                      mailbox.expires_at AS mailbox_expires_at
+                 FROM agent_invocations AS invocation
+                 JOIN agent_mailbox AS mailbox
+                   ON mailbox.mailbox_id=invocation.mailbox_id
+                  AND mailbox.message_id=invocation.work_id
+                  AND mailbox.destination_agent_id=invocation.agent_id
+                  AND mailbox.destination_agent_incarnation=
+                      invocation.agent_incarnation
+                WHERE invocation.work_kind='mailbox'"""
+        ).fetchall()
+        mailbox_invocation_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM agent_invocations WHERE work_kind='mailbox'"
+            ).fetchone()[0]
+        )
+        if len(mailbox_invocations) != mailbox_invocation_count:
+            raise StoreError(
+                "mailbox invocation identity conflicts during schema v28"
+            )
+        for row in mailbox_invocations:
+            retained = row["expires_at"]
+            expected = str(row["mailbox_expires_at"])
+            if retained is None:
+                conn.execute(
+                    "UPDATE agent_invocations SET expires_at=? "
+                    "WHERE invocation_id=?",
+                    (expected, row["invocation_id"]),
+                )
+            else:
+                canonical = datetime_to_text(text_to_datetime(retained))
+                if canonical != expected:
+                    raise StoreError(
+                        "mailbox invocation expiry conflicts during schema v28: "
+                        + str(row["invocation_id"])
+                    )
+                if str(retained) != expected:
+                    conn.execute(
+                        "UPDATE agent_invocations SET expires_at=? "
+                        "WHERE invocation_id=?",
+                        (expected, row["invocation_id"]),
+                    )
+
+        _executescript_atomic(conn, _MIGRATION_28_MAILBOX_LIFECYCLE)
+        if preexisting_event_rows:
+            # A fully landed v28 schema whose marker was lost contains both
+            # migration snapshots and invocation-created rows.  Replay accepts
+            # either form only after validating every canonical field.
+            self._canonicalize_v30_invocation_history_timestamps_tx(conn)
+            self._validate_v30_invocation_event_seeds_tx(conn)
+        else:
+            bad_seed = conn.execute(
+                """SELECT invocation.invocation_id
+                     FROM agent_invocations AS invocation
+                     LEFT JOIN agent_invocation_events AS event
+                       ON event.invocation_id=invocation.invocation_id
+                      AND event.event_sequence=1
+                    WHERE event.invocation_id IS NULL
+                       OR event.invocation_event_id IS NOT
+                          ('invocation-event:migration-v28:' ||
+                           invocation.invocation_id)
+                       OR event.event_kind IS NOT 'migration_snapshot'
+                       OR event.previous_state IS NOT NULL
+                       OR event.new_state IS NOT invocation.state
+                       OR event.source_kind IS NOT 'migration'
+                       OR event.source_id IS NOT 'schema-v28'
+                       OR event.metadata_json IS NOT '{"schema_version":28}'
+                       OR event.created_at IS NOT invocation.updated_at
+                    LIMIT 1"""
+            ).fetchone()
+            if bad_seed is not None:
+                raise StoreError(
+                    "invocation event migration snapshot conflicts: "
+                    + str(bad_seed["invocation_id"])
+                )
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise StoreError(
+                "schema v28 foreign-key validation failed: "
+                + repr(tuple(violations[0]))
+            )
+
+    def _apply_schema_v26_rebuild(self, conn: sqlite3.Connection) -> None:
+        """Run the FK-off parent-table rebuild and always restore PRAGMAs."""
+
+        foreign_keys = int(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+        legacy_alter = int(
+            conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+        )
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        try:
+            with _transaction(conn):
+                self._migrate_invocations_v26_tx(conn, now_text=self._now())
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (26, _utc_text()),
+                )
+        finally:
+            conn.execute(f"PRAGMA legacy_alter_table={legacy_alter}")
+            conn.execute(f"PRAGMA foreign_keys={foreign_keys}")
+        if foreign_keys and not bool(
+            conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        ):
+            raise StoreError("schema v26 failed to restore foreign keys")
+
+    def _finish_initialize_sync(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        current: int,
+        recover_startup_state: bool,
+    ) -> None:
         # v19 originally added ``from_user_id`` with an empty compatibility
         # default.  Repair both freshly migrated rows and databases that were
         # already marked v19 before the sender backfill was introduced.  The
@@ -1720,6 +5439,17 @@ class SQLiteStore:
             # conflict must not leave a partially seeded catalog behind.
             with _transaction(conn):
                 self._seed_defaults(conn)
+        # Admission counters are a recoverable projection of immutable
+        # invocation history.  A crash cannot normally split these rows
+        # because every acceptance/release is transactional, but older
+        # development builds and manual maintenance may leave a stale or
+        # missing projection.  Rebuild before any dispatcher can observe the
+        # store, while preserving the monotonic ready-sequence high-water mark.
+        with _transaction(conn):
+            self._rebuild_invocation_admission_tx(
+                conn,
+                now_text=self._now(),
+            )
         # The first connection represents this process taking ownership of
         # the durable database. Receipts and leased work it finds active have
         # uncertain effects from the previous process, so recover them before
@@ -1729,13 +5459,7 @@ class SQLiteStore:
             startup_report: RecoveryReport
             with _transaction(conn):
                 now_text = self._now()
-                conn.execute(
-                    "UPDATE command_receipts SET state='interrupted', "
-                    "interrupted_at=COALESCE(interrupted_at, ?) "
-                    "WHERE state='started'",
-                    (now_text,),
-                )
-                startup_report = self._recover_startup_state_tx(
+                startup_report = self._strong_startup_recovery_tx(
                     conn,
                     now_text=now_text,
                 )
@@ -1743,31 +5467,735 @@ class SQLiteStore:
             self._startup_recovery_report = startup_report
         self._conn = conn
 
+    @staticmethod
+    def _rebuild_invocation_admission_tx(
+        conn: sqlite3.Connection,
+        *,
+        now_text: str,
+    ) -> None:
+        """Audit and reconstruct derived invocation admission counters."""
+
+        # Migration tests and interrupted-development recovery can
+        # deliberately stop before schema v26 is installed.  There is no
+        # derived invocation projection to audit at that older boundary.
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='agent_invocations'"
+        ).fetchone() is None:
+            return
+
+        invalid = conn.execute(
+            """SELECT invocation_id FROM agent_invocations
+                WHERE (
+                    state IN ('queued','dispatching','running','cancel_requested')
+                    AND admission_released_at IS NOT NULL
+                ) OR (
+                    state IN ('completed','failed','interrupted','cancelled','orphaned')
+                    AND admission_released_at IS NULL
+                )
+                LIMIT 1"""
+        ).fetchone()
+        if invalid is not None:
+            raise StoreError(
+                "invocation admission release truth conflicts: "
+                f"{invalid['invocation_id']}"
+            )
+
+        expected_rows = conn.execute(
+            """SELECT agent_id,agent_incarnation,
+                      SUM(CASE WHEN admission_released_at IS NULL THEN 1 ELSE 0 END)
+                          AS unfinished_count,
+                      COALESCE(MAX(ready_sequence),0)+1 AS minimum_next_sequence
+                 FROM agent_invocations
+                GROUP BY agent_id,agent_incarnation"""
+        ).fetchall()
+        expected: dict[tuple[str, int], tuple[int, int]] = {
+            (str(row["agent_id"]), int(row["agent_incarnation"])): (
+                int(row["unfinished_count"] or 0),
+                max(1, int(row["minimum_next_sequence"] or 1)),
+            )
+            for row in expected_rows
+        }
+        existing_rows = conn.execute(
+            "SELECT * FROM agent_admission_counters"
+        ).fetchall()
+        existing = {
+            (str(row["agent_id"]), int(row["agent_incarnation"])): row
+            for row in existing_rows
+        }
+
+        all_keys = set(existing) | set(expected)
+        for agent_id, incarnation in sorted(all_keys):
+            unfinished_count, minimum_next = expected.get(
+                (agent_id, incarnation),
+                (0, 1),
+            )
+            prior = existing.get((agent_id, incarnation))
+            next_sequence = max(
+                minimum_next,
+                int(prior["next_ready_sequence"]) if prior is not None else 1,
+            )
+            lifecycle = conn.execute(
+                "SELECT 1 FROM agent_lifecycle "
+                "WHERE agent_id=? AND agent_incarnation=?",
+                (agent_id, incarnation),
+            ).fetchone()
+            if lifecycle is None:
+                raise StoreError(
+                    "admission counter references missing Agent incarnation: "
+                    f"{agent_id}@{incarnation}"
+                )
+            conn.execute(
+                """INSERT INTO agent_admission_counters
+                       (agent_id,agent_incarnation,unfinished_count,
+                        next_ready_sequence,updated_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(agent_id,agent_incarnation) DO UPDATE SET
+                       unfinished_count=excluded.unfinished_count,
+                       next_ready_sequence=excluded.next_ready_sequence,
+                       updated_at=excluded.updated_at""",
+                (
+                    agent_id,
+                    incarnation,
+                    unfinished_count,
+                    next_sequence,
+                    now_text,
+                ),
+            )
+
+        unfinished_total = sum(value[0] for value in expected.values())
+        conn.execute(
+            """INSERT INTO global_agent_admission_counter
+                   (singleton,unfinished_count,updated_at)
+               VALUES (1,?,?)
+               ON CONFLICT(singleton) DO UPDATE SET
+                   unfinished_count=excluded.unfinished_count,
+                   updated_at=excluded.updated_at""",
+            (unfinished_total, now_text),
+        )
+
+    def _strong_startup_recovery_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        now_text: str,
+    ) -> RecoveryReport:
+        """Fence every operation owned by the preceding process boundary."""
+
+        conn.execute(
+            "UPDATE command_receipts SET state='interrupted', "
+            "interrupted_at=COALESCE(interrupted_at, ?) "
+            "WHERE state='started'",
+            (now_text,),
+        )
+        return self._recover_startup_state_tx(conn, now_text=now_text)
+
+    @staticmethod
+    def _legacy_agent_incarnation_v26_tx(
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str,
+        profile_version: int | None,
+        created_at: str | None,
+    ) -> tuple[int, bool]:
+        """Resolve retained work without silently targeting a recreation.
+
+        Profile evidence is preferred.  When the same immutable Profile was
+        reused by more than one incarnation, lifecycle time bounds must select
+        exactly one.  The returned fallback is only a storage/audit identity;
+        ``False`` tells the migration to terminalize nonterminal work.
+        """
+
+        rows = conn.execute(
+            "SELECT * FROM agent_lifecycle WHERE agent_id=? "
+            "ORDER BY agent_incarnation ASC",
+            (str(agent_id),),
+        ).fetchall()
+        if not rows:
+            raise StoreError(f"task references Agent without lifecycle: {agent_id}")
+        matching = [
+            row
+            for row in rows
+            if profile_version is not None
+            and int(row["profile_version"]) == int(profile_version)
+        ]
+        candidates = matching or (rows if len(rows) == 1 else [])
+        if len(candidates) == 1:
+            return int(candidates[0]["agent_incarnation"]), bool(matching)
+        created = text_to_datetime(created_at)
+        temporal: list[sqlite3.Row] = []
+        if created is not None:
+            for row in candidates:
+                lower = text_to_datetime(row["created_at"])
+                upper = text_to_datetime(row["retiring_at"] or row["tombstoned_at"])
+                # Migration-seeded initial incarnations can postdate all
+                # retained work.  Only use a lower bound when it is real
+                # lifecycle evidence rather than the sole legacy seed.
+                lower_ok = lower is None or created >= lower
+                upper_ok = upper is None or created <= upper
+                if lower_ok and upper_ok:
+                    temporal.append(row)
+        if len(temporal) == 1:
+            return int(temporal[0]["agent_incarnation"]), True
+        fallback_rows = matching or rows
+        return int(fallback_rows[0]["agent_incarnation"]), False
+
+    @staticmethod
+    def _legacy_mailbox_snapshot_complete_v26(
+        conn: sqlite3.Connection,
+        snapshot: Any,
+        *,
+        destination_agent_id: str,
+        request_id: str,
+    ) -> bool:
+        """Accept only a reconstructable immutable compatibility snapshot.
+
+        A nonempty JSON object is not evidence that legacy mailbox work can be
+        run safely.  Require the complete shape emitted by the compatibility
+        writer and exact destination/conversation identities; ambiguous rows
+        are retained as dead letters by migration rather than scheduled with
+        invented policy.
+        """
+
+        if not isinstance(snapshot, Mapping):
+            return False
+        required = {
+            "agent_id",
+            "conversation_id",
+            "reply_target",
+            "mode_id",
+            "profile_version",
+            "policy_version",
+            "model",
+            "reasoning_effort",
+            "metadata",
+        }
+        if not required.issubset(snapshot):
+            return False
+        if str(snapshot.get("agent_id") or "") != str(destination_agent_id):
+            return False
+        if str(snapshot.get("conversation_id") or "") != mailbox_conversation_id(
+            str(destination_agent_id),
+            str(request_id),
+        ):
+            return False
+        if not str(snapshot.get("mode_id") or "").strip():
+            return False
+        try:
+            if int(snapshot.get("profile_version")) <= 0:
+                return False
+            if int(snapshot.get("policy_version")) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(snapshot.get("reply_target"), Mapping):
+            return False
+        metadata = snapshot.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return False
+        profile_snapshot = metadata.get("profile")
+        if not isinstance(profile_snapshot, Mapping) and conn.execute(
+            "SELECT 1 FROM agent_profiles WHERE agent_id=? "
+            "AND profile_version=?",
+            (destination_agent_id, int(snapshot["profile_version"])),
+        ).fetchone() is None:
+            return False
+        mode_snapshot = metadata.get("mode")
+        if not isinstance(mode_snapshot, Mapping) and conn.execute(
+            "SELECT 1 FROM agent_modes WHERE agent_id=? AND mode_id=? "
+            "AND policy_version=?",
+            (
+                destination_agent_id,
+                str(snapshot["mode_id"]),
+                int(snapshot["policy_version"]),
+            ),
+        ).fetchone() is None:
+            return False
+        return True
+
+    def _migrate_invocations_v26_tx(
+        self, conn: sqlite3.Connection, *, now_text: str
+    ) -> None:
+        """Rebuild source tables and project authoritative invocation truth."""
+
+        _executescript_atomic(conn, _MIGRATION_26_TABLES)
+        old_tasks = conn.execute(
+            "SELECT * FROM tasks ORDER BY created_at, task_id"
+        ).fetchall()
+        task_incarnations: dict[str, tuple[int, bool]] = {}
+        normalized_task_states: dict[str, str] = {}
+        for row in old_tasks:
+            incarnation, certain = self._legacy_agent_incarnation_v26_tx(
+                conn,
+                agent_id=str(row["agent_id"]),
+                profile_version=int(row["profile_version"]),
+                created_at=row["created_at"],
+            )
+            old_state = str(row["state"])
+            state = (
+                "orphaned"
+                if old_state in {"claimed", "running", "cancel_requested"}
+                or (old_state == "queued" and not certain)
+                else old_state
+            )
+            terminal_claim = state not in {
+                "dispatching", "running", "cancel_requested"
+            }
+            task_incarnations[str(row["task_id"])] = (incarnation, certain)
+            normalized_task_states[str(row["task_id"])] = state
+            conn.execute(
+                """INSERT INTO tasks_v26 (
+                       task_id,dedupe_key,inbound_message_id,channel,bot_id,
+                       external_user_id,session_id,agent_id,agent_incarnation,
+                       conversation_id,thread_id,mode_id,profile_version,
+                       policy_version,model,reasoning_effort,reply_target_json,
+                       inputs_json,state,current_execution_id,claimed_by,
+                       claim_token,lease_expires_at,attempts,next_attempt_at,
+                       last_error,result_json,parent_task_id,child_depth,
+                       request_id,created_at,updated_at,terminal_at,
+                       cancel_requested_at,metadata_json,
+                       pending_delivery_reply_scope_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    row["task_id"], row["dedupe_key"], row["inbound_message_id"],
+                    row["channel"], row["bot_id"], row["external_user_id"],
+                    row["session_id"], row["agent_id"], incarnation,
+                    row["conversation_id"], row["thread_id"], row["mode_id"],
+                    row["profile_version"], row["policy_version"], row["model"],
+                    row["reasoning_effort"], row["reply_target_json"],
+                    row["inputs_json"], state, None,
+                    None if terminal_claim else row["claimed_by"],
+                    None if terminal_claim else row["claim_token"],
+                    None if terminal_claim else row["lease_expires_at"],
+                    row["attempts"], row["next_attempt_at"],
+                    (row["last_error"] or "ambiguous Agent incarnation at schema v26")
+                    if old_state == "queued" and not certain else row["last_error"],
+                    row["result_json"], row["parent_task_id"], row["child_depth"],
+                    row["request_id"], row["created_at"], now_text
+                    if state != old_state else row["updated_at"],
+                    row["terminal_at"], row["cancel_requested_at"],
+                    row["metadata_json"], row["pending_delivery_reply_scope_id"],
+                ),
+            )
+
+        executions_by_task: dict[str, list[dict[str, Any]]] = {}
+        for row in conn.execute(
+            "SELECT * FROM task_executions ORDER BY task_id, attempt"
+        ).fetchall():
+            task_id = str(row["task_id"])
+            incarnation, _certain = task_incarnations[task_id]
+            task_row = next(item for item in old_tasks if str(item["task_id"]) == task_id)
+            old_state = str(row["state"])
+            state = "orphaned" if old_state in {"claimed", "running"} else old_state
+            finished_at = row["finished_at"]
+            if state in {"completed", "failed", "interrupted", "cancelled", "orphaned"}:
+                finished_at = finished_at or now_text
+            execution = {
+                "execution_id": str(row["execution_id"]),
+                "task_id": task_id,
+                "attempt": int(row["attempt"]),
+                "agent_id": str(task_row["agent_id"]),
+                "agent_incarnation": incarnation,
+                "state": state,
+                "worker_id": None if state == "orphaned" else row["worker_id"],
+                "claim_token": None if state == "orphaned" else row["claim_token"],
+                "lease_expires_at": None if finished_at is not None else row["lease_expires_at"],
+                "started_at": row["started_at"],
+                "finished_at": finished_at,
+                "last_error": (
+                    row["last_error"] or "active compatibility execution orphaned at schema v26"
+                    if state == "orphaned" else row["last_error"]
+                ),
+                "external_turn_id": row["external_turn_id"],
+                "created_at": row["created_at"],
+                "delivery_reply_scope_id": row["delivery_reply_scope_id"],
+            }
+            executions_by_task.setdefault(task_id, []).append(execution)
+
+        for task_row in old_tasks:
+            task_id = str(task_row["task_id"])
+            executions = executions_by_task.setdefault(task_id, [])
+            aggregate_state = normalized_task_states[task_id]
+            needs_new = not executions or (
+                aggregate_state == "queued"
+                and executions[-1]["state"] != "queued"
+            )
+            if needs_new:
+                attempt = max([item["attempt"] for item in executions] or [0]) + 1
+                execution_id = compound_id(
+                    "task-execution", ("schema-v26", task_id, attempt)
+                )
+                incarnation, _certain = task_incarnations[task_id]
+                finished_at = (
+                    None if aggregate_state == "queued" else
+                    (task_row["terminal_at"] or now_text)
+                )
+                executions.append(
+                    {
+                        "execution_id": execution_id,
+                        "task_id": task_id,
+                        "attempt": attempt,
+                        "agent_id": str(task_row["agent_id"]),
+                        "agent_incarnation": incarnation,
+                        "state": aggregate_state,
+                        "worker_id": None,
+                        "claim_token": None,
+                        "lease_expires_at": None,
+                        "started_at": None,
+                        "finished_at": finished_at,
+                        "last_error": task_row["last_error"],
+                        "external_turn_id": None,
+                        "created_at": task_row["created_at"],
+                        "delivery_reply_scope_id": task_row["pending_delivery_reply_scope_id"],
+                    }
+                )
+            current = executions[-1]
+            # Cutover ownership loss is authoritative for the current active
+            # attempt even if a corrupt older aggregate spelling disagreed.
+            if normalized_task_states[task_id] == "orphaned" and current["state"] not in {
+                "completed", "failed", "interrupted", "cancelled", "orphaned"
+            }:
+                current["state"] = "orphaned"
+                current["finished_at"] = now_text
+                current["worker_id"] = None
+                current["claim_token"] = None
+                current["lease_expires_at"] = None
+            conn.execute(
+                "UPDATE tasks_v26 SET current_execution_id=? WHERE task_id=?",
+                (current["execution_id"], task_id),
+            )
+
+        for executions in executions_by_task.values():
+            for item in executions:
+                conn.execute(
+                    """INSERT INTO task_executions_v26 (
+                           execution_id,task_id,attempt,agent_id,agent_incarnation,
+                           state,dispatch_backend,worker_id,claim_token,
+                           lease_expires_at,started_at,finished_at,last_error,
+                           external_turn_id,created_at,delivery_reply_scope_id)
+                       VALUES (?,?,?,?,?,?,'compatibility',?,?,?,?,?,?,?,?,?)""",
+                    (
+                        item["execution_id"], item["task_id"], item["attempt"],
+                        item["agent_id"], item["agent_incarnation"], item["state"],
+                        item["worker_id"], item["claim_token"],
+                        item["lease_expires_at"], item["started_at"],
+                        item["finished_at"], item["last_error"],
+                        item["external_turn_id"], item["created_at"],
+                        item["delivery_reply_scope_id"],
+                    ),
+                )
+
+        mailbox_info: dict[str, tuple[int, bool, str]] = {}
+        for row in conn.execute(
+            "SELECT * FROM agent_mailbox ORDER BY created_at, mailbox_id"
+        ).fetchall():
+            snapshot = json_loads(row["execution_snapshot_json"], {}) or {}
+            profile_version = (
+                int(snapshot.get("profile_version"))
+                if isinstance(snapshot, Mapping) and snapshot.get("profile_version")
+                else None
+            )
+            incarnation, certain = self._legacy_agent_incarnation_v26_tx(
+                conn,
+                agent_id=str(row["destination_agent_id"]),
+                profile_version=profile_version,
+                created_at=row["created_at"],
+            )
+            old_state = str(row["state"])
+            complete_snapshot = self._legacy_mailbox_snapshot_complete_v26(
+                conn,
+                snapshot,
+                destination_agent_id=str(row["destination_agent_id"]),
+                request_id=str(row["request_id"]),
+            )
+            if old_state in {"claimed", "processing"}:
+                state = "orphaned_mailbox"
+            elif old_state == "pending" and (
+                not certain or not complete_snapshot
+            ):
+                state = "dead_letter"
+            else:
+                state = old_state
+            mailbox_info[str(row["mailbox_id"])] = (incarnation, certain, state)
+            terminal = state != "pending"
+            conn.execute(
+                """INSERT INTO agent_mailbox_v26 (
+                       mailbox_id,message_id,request_id,reply_to_id,causation_id,
+                       source_agent_id,destination_agent_id,
+                       destination_agent_incarnation,task_id,content,payload_json,
+                       execution_snapshot_json,state,current_invocation_id,
+                       claimed_by,claim_token,lease_expires_at,attempts,
+                       next_attempt_at,last_error,created_at,processed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    row["mailbox_id"], row["message_id"], row["request_id"],
+                    row["reply_to_id"], row["causation_id"], row["source_agent_id"],
+                    row["destination_agent_id"], incarnation, row["task_id"],
+                    row["content"], row["payload_json"],
+                    row["execution_snapshot_json"], state, None,
+                    None if terminal else row["claimed_by"],
+                    None if terminal else row["claim_token"],
+                    None if terminal else row["lease_expires_at"], row["attempts"],
+                    row["next_attempt_at"],
+                    (row["last_error"] or "legacy mailbox execution orphaned at schema v26")
+                    if old_state in {"claimed", "processing"} else row["last_error"],
+                    row["created_at"], row["processed_at"],
+                ),
+            )
+
+        mailbox_rows_v26 = conn.execute(
+            "SELECT * FROM agent_mailbox_v26 ORDER BY created_at, mailbox_id"
+        ).fetchall()
+        ready_entries: list[
+            tuple[str, int, str, str, str]
+        ] = []
+        for task_row in old_tasks:
+            task_id = str(task_row["task_id"])
+            for item in executions_by_task[task_id]:
+                parsed_created = text_to_datetime(item["created_at"])
+                created_key = (
+                    datetime_to_text(parsed_created)
+                    if parsed_created is not None
+                    else str(item["created_at"] or "")
+                ) or ""
+                ready_entries.append(
+                    (
+                        str(item["agent_id"]),
+                        int(item["agent_incarnation"]),
+                        created_key,
+                        "task",
+                        str(item["execution_id"]),
+                    )
+                )
+        for row in mailbox_rows_v26:
+            parsed_created = text_to_datetime(row["created_at"])
+            created_key = (
+                datetime_to_text(parsed_created)
+                if parsed_created is not None
+                else str(row["created_at"] or "")
+            ) or ""
+            ready_entries.append(
+                (
+                    str(row["destination_agent_id"]),
+                    int(row["destination_agent_incarnation"]),
+                    created_key,
+                    "mailbox",
+                    str(row["mailbox_id"]),
+                )
+            )
+        ready: dict[tuple[str, int], int] = {}
+        ready_sequence: dict[tuple[str, str], int] = {}
+        for agent_id, incarnation, _created, work_kind, work_id in sorted(
+            ready_entries
+        ):
+            key = (agent_id, incarnation)
+            sequence = ready.get(key, 0) + 1
+            ready[key] = sequence
+            ready_sequence[(work_kind, work_id)] = sequence
+        unfinished_total = 0
+        # Every retained execution gets generic truth; only the current queued
+        # execution consumes admission after this conservative cutover.
+        for task_row in old_tasks:
+            task_id = str(task_row["task_id"])
+            current_id = str(
+                conn.execute(
+                    "SELECT current_execution_id FROM tasks_v26 WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()[0]
+            )
+            for item in executions_by_task[task_id]:
+                sequence = ready_sequence[("task", str(item["execution_id"]))]
+                state = str(item["state"])
+                unfinished = item["execution_id"] == current_id and state == "queued"
+                terminal_at = None if unfinished else (item["finished_at"] or now_text)
+                conn.execute(
+                    """INSERT INTO agent_invocations (
+                           invocation_id,work_kind,work_id,agent_id,
+                           agent_incarnation,state,dispatch_backend,ready_sequence,
+                           task_id,execution_id,mailbox_id,claimed_by,claim_token,
+                           lease_expires_at,next_attempt_at,admission_released_at,
+                           created_at,updated_at,terminal_at,last_error)
+                       VALUES (?,'task',?,?,?,?, 'compatibility',?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        item["execution_id"], item["execution_id"], item["agent_id"],
+                        item["agent_incarnation"], state, sequence, task_id,
+                        item["execution_id"], None, item["worker_id"] if not terminal_at else None,
+                        item["claim_token"] if not terminal_at else None,
+                        item["lease_expires_at"] if not terminal_at else None,
+                        task_row["next_attempt_at"] if unfinished else None,
+                        None if unfinished else terminal_at, item["created_at"], now_text,
+                        terminal_at, item["last_error"],
+                    ),
+                )
+                unfinished_total += int(unfinished)
+
+        for row in mailbox_rows_v26:
+            sequence = ready_sequence[("mailbox", str(row["mailbox_id"]))]
+            invocation_id = compound_id(
+                "mailbox-invocation", ("schema-v26", row["mailbox_id"], 1)
+            )
+            state_map = {
+                "pending": "queued", "dispatching": "dispatching",
+                "processing": "running", "processed": "completed",
+                "rejected": "failed", "dead_letter": "failed",
+                "expired": "failed", "orphaned_mailbox": "orphaned",
+            }
+            invocation_state = state_map[str(row["state"])]
+            unfinished = invocation_state in {
+                "queued", "dispatching", "running", "cancel_requested"
+            }
+            terminal_at = None if unfinished else (row["processed_at"] or now_text)
+            conn.execute(
+                """INSERT INTO agent_invocations (
+                       invocation_id,work_kind,work_id,agent_id,agent_incarnation,
+                       state,dispatch_backend,ready_sequence,task_id,execution_id,
+                       mailbox_id,claimed_by,claim_token,lease_expires_at,
+                       next_attempt_at,admission_released_at,created_at,updated_at,
+                       terminal_at,last_error)
+                   VALUES (?,'mailbox',?,?,?,?,'compatibility',?,NULL,NULL,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    invocation_id, row["message_id"], row["destination_agent_id"],
+                    row["destination_agent_incarnation"], invocation_state, sequence,
+                    row["mailbox_id"], row["claimed_by"] if unfinished else None,
+                    row["claim_token"] if unfinished else None,
+                    row["lease_expires_at"] if unfinished else None,
+                    row["next_attempt_at"] if unfinished else None,
+                    None if unfinished else terminal_at, row["created_at"], now_text,
+                    terminal_at, row["last_error"],
+                ),
+            )
+            conn.execute(
+                "UPDATE agent_mailbox_v26 SET current_invocation_id=? WHERE mailbox_id=?",
+                (invocation_id, row["mailbox_id"]),
+            )
+            unfinished_total += int(unfinished)
+
+        for (agent_id, incarnation), next_value in ready.items():
+            count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM agent_invocations WHERE agent_id=? "
+                    "AND agent_incarnation=? AND admission_released_at IS NULL",
+                    (agent_id, incarnation),
+                ).fetchone()[0]
+            )
+            conn.execute(
+                "INSERT INTO agent_admission_counters VALUES (?,?,?,?,?)",
+                (agent_id, incarnation, count, next_value + 1, now_text),
+            )
+        conn.execute(
+            "INSERT INTO global_agent_admission_counter VALUES (1,?,?)",
+            (unfinished_total, now_text),
+        )
+
+        # FK enforcement is deliberately disabled by the caller.  Existing
+        # dependent tables retain canonical FK SQL while the parents are
+        # replaced, so durable task/event/reply identities are untouched.
+        conn.execute("DROP TABLE task_executions")
+        conn.execute("DROP TABLE agent_mailbox")
+        conn.execute("DROP TABLE tasks")
+        conn.execute("ALTER TABLE tasks_v26 RENAME TO tasks")
+        conn.execute("ALTER TABLE task_executions_v26 RENAME TO task_executions")
+        conn.execute("ALTER TABLE agent_mailbox_v26 RENAME TO agent_mailbox")
+        _executescript_atomic(conn, _MIGRATION_26_INDEXES)
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            first = violations[0]
+            raise StoreError(
+                "schema v26 foreign-key rebuild failed: " + repr(tuple(first))
+            )
+
     def _close_sync(self) -> None:
+        epoch_error: BaseException | None = None
+        active_epoch = self._active_supervisor_epoch
+
+        def finish_active_epoch() -> None:
+            nonlocal epoch_error
+            if self._conn is None or active_epoch is None:
+                return
+            try:
+                epoch, owner_instance_id = active_epoch
+                with _transaction(self._conn):
+                    stopped_text, _stopped_time = self._process_timestamp(
+                        self.clock(),
+                        "stopped_at",
+                    )
+                    changed = self._conn.execute(
+                        "UPDATE supervisor_epochs SET stopped_at=?, "
+                        "stop_reason='store_closed' "
+                        "WHERE epoch=? AND owner_instance_id=? "
+                        "AND stopped_at IS NULL",
+                        (stopped_text, int(epoch), owner_instance_id),
+                    ).rowcount
+                    if changed != 1:
+                        row = self._conn.execute(
+                            "SELECT owner_instance_id, stopped_at "
+                            "FROM supervisor_epochs WHERE epoch=?",
+                            (int(epoch),),
+                        ).fetchone()
+                        if (
+                            row is None
+                            or str(row["owner_instance_id"]) != owner_instance_id
+                            or row["stopped_at"] is None
+                        ):
+                            raise StoreError(
+                                "active supervisor epoch could not be finished"
+                            )
+            except BaseException as exc:
+                # Closing SQLite remains mandatory even if the diagnostic end
+                # marker cannot commit.  The next exclusive owner will fence
+                # the still-open epoch as superseded.
+                epoch_error = exc
+            finally:
+                self._active_supervisor_epoch = None
+
         database_key = self._live_database_key
         if database_key is None:
+            finish_active_epoch()
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
+            self._startup_recovery_deferred = False
+            self._supervisor_epoch_finished = False
+            if epoch_error is not None:
+                raise StoreError(
+                    "supervisor epoch finish failed during close"
+                ) from epoch_error
             return
 
-        # Serialize the final connection close with process-local opens.  An
-        # opener must never observe this store as live after its SQLite
-        # connection has already closed, or it could skip abandoned-receipt
-        # recovery and leave a command permanently in ``started``.
+        # The adapter which activated the supervisor epoch is its temporary
+        # process-local lifecycle owner.  Until epoch ownership is represented
+        # by a separate supervisor object, require that adapter to close last:
+        # otherwise another connection could keep writing beneath a durably
+        # stopped epoch.  Holding the registry lock through epoch finish and
+        # connection close also prevents an opener from joining the old live
+        # count between those two boundaries and incorrectly skipping recovery.
         with _LIVE_DATABASES_LOCK:
+            live_count = _LIVE_DATABASES.get(database_key, 0)
+            if active_epoch is not None and live_count > 1:
+                raise StoreError(
+                    "the supervisor epoch-owning store must close after all "
+                    "other database adapters"
+                )
+            finish_active_epoch()
             try:
                 if self._conn is not None:
                     self._conn.close()
                     self._conn = None
             finally:
                 if self._live_database_key is not None:
-                    live_count = _LIVE_DATABASES.get(database_key, 0)
                     if live_count <= 1:
                         _LIVE_DATABASES.pop(database_key, None)
+                        _DEFERRED_DATABASES.discard(database_key)
+                        _FINISHED_DATABASES.discard(database_key)
                     else:
                         _LIVE_DATABASES[database_key] = live_count - 1
                     self._live_database_key = None
+                    self._startup_recovery_deferred = False
+                    self._supervisor_epoch_finished = False
+        if epoch_error is not None:
+            raise StoreError(
+                "supervisor epoch finish failed during close"
+            ) from epoch_error
 
     def _recover_startup_state_tx(
         self,
@@ -1811,7 +6239,7 @@ class SQLiteStore:
         )
         task_rows = conn.execute(
             "SELECT task_id FROM tasks "
-            "WHERE state IN ('claimed','running','cancel_requested')"
+            "WHERE state IN ('dispatching','running','cancel_requested')"
         ).fetchall()
         for row in task_rows:
             current_task = self._fetch_task_tx(conn, row["task_id"])
@@ -1842,10 +6270,21 @@ class SQLiteStore:
             )
             conn.execute(
                 "UPDATE task_executions SET state='orphaned', finished_at=?, "
-                "lease_expires_at=NULL, last_error=COALESCE(last_error,?) "
+                "worker_id=NULL,claim_token=NULL,lease_expires_at=NULL, last_error=COALESCE(last_error,?) "
                 "WHERE task_id=? AND finished_at IS NULL",
                 (now_text, recovery_reason, row["task_id"]),
             )
+            current_id = conn.execute(
+                "SELECT current_execution_id FROM tasks WHERE task_id=?",
+                (row["task_id"],),
+            ).fetchone()[0]
+            if not self._release_invocation_tx(
+                conn, invocation_id=str(current_id), state="orphaned",
+                now=now_text, last_error=recovery_reason,
+            ):
+                raise StoreError(
+                    "startup task invocation was already released"
+                )
 
         outbox_rows = conn.execute(
             "SELECT outbox_id, state FROM user_outbox "
@@ -1870,15 +6309,31 @@ class SQLiteStore:
 
         mailbox_rows = conn.execute(
             "SELECT mailbox_id FROM agent_mailbox "
-            "WHERE state IN ('claimed','processing')"
+            "WHERE state IN ('dispatching','processing')"
         ).fetchall()
         for row in mailbox_rows:
+            invocation_id = conn.execute(
+                "SELECT current_invocation_id FROM agent_mailbox WHERE mailbox_id=?",
+                (row["mailbox_id"],),
+            ).fetchone()[0]
             conn.execute(
-                "UPDATE agent_mailbox SET state='pending', claimed_by=NULL, "
-                "claim_token=NULL, lease_expires_at=NULL, next_attempt_at=?, "
+                "UPDATE agent_mailbox SET state='orphaned_mailbox', claimed_by=NULL, "
+                "claim_token=NULL, lease_expires_at=NULL, next_attempt_at=NULL, "
                 "last_error=COALESCE(last_error,?) WHERE mailbox_id=?",
-                (now_text, recovery_reason, row["mailbox_id"]),
+                (recovery_reason, row["mailbox_id"]),
             )
+            if not self._release_invocation_tx(
+                conn, invocation_id=str(invocation_id), state="orphaned",
+                now=now_text, last_error=recovery_reason,
+            ):
+                raise StoreError(
+                    "startup mailbox invocation was already released"
+                )
+
+        mailbox_expired = self._expire_pending_mailboxes_tx(
+            conn,
+            now=now_text,
+        )
 
         media_rows = conn.execute(
             "SELECT media_id, state FROM outgoing_media "
@@ -1963,6 +6418,7 @@ class SQLiteStore:
             mailbox_requeued=len(mailbox_rows),
             missing_attachments=missing,
             media_requeued=media_requeued,
+            mailbox_expired=mailbox_expired,
         )
 
     def _seed_defaults(self, conn: sqlite3.Connection) -> None:
@@ -1992,6 +6448,31 @@ class SQLiteStore:
             now=now,
             allow_legacy_seed_upgrade=True,
         )
+        # Migration 17 also calls this helper before lifecycle tables exist.
+        # Once v25 is present, keep the built-in Profile publication and its
+        # lifecycle projection in this same transaction.
+        lifecycle_events_exist = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='agent_lifecycle_events'"
+        ).fetchone()
+        if lifecycle_events_exist is not None:
+            self._project_profile_lifecycle_tx(
+                conn,
+                agent_id=profile.agent_id,
+                profile_version=int(profile.profile_version),
+                now_text=now,
+                source_kind="builtin_profile_seed",
+                source_id=compound_id(
+                    "agent-lifecycle-source",
+                    (
+                        "builtin-profile",
+                        profile.agent_id,
+                        int(profile.profile_version),
+                    ),
+                ),
+                actor="system:builtin-profile-seed",
+                provenance={"builtin_profile": True},
+            )
         for mode in modes:
             self._ensure_mode_tx(
                 conn,
@@ -2032,7 +6513,13 @@ class SQLiteStore:
                     now=now,
                 )
 
-    async def _call(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+    async def _call(
+        self,
+        fn: Callable[[sqlite3.Connection], Any],
+        *,
+        allow_deferred_startup: bool = False,
+        initialize_if_needed: bool = True,
+    ) -> Any:
         """Execute ``fn`` on the dedicated SQLite thread.
 
         Cancellation waits for the underlying operation before releasing the
@@ -2044,6 +6531,10 @@ class SQLiteStore:
             if self._closed:
                 raise StoreError("store is closed")
             if not self._initialized:
+                if not initialize_if_needed:
+                    raise StoreError(
+                        "store must be initialized with startup recovery deferred"
+                    )
                 loop = asyncio.get_running_loop()
                 open_future = loop.run_in_executor(self._executor, self._open_sync)
                 try:
@@ -2057,8 +6548,29 @@ class SQLiteStore:
             conn = self._conn
             if conn is None:
                 raise StoreError("store connection is unavailable")
+
+            def guarded_call() -> Any:
+                database_key = self._live_database_key
+                if database_key is None:
+                    recovery_deferred = self._startup_recovery_deferred
+                else:
+                    # Perform the process-wide fence on this store's executor
+                    # thread.  If activation is committing on another adapter,
+                    # callers wait without blocking their asyncio event loop and
+                    # cross the boundary only after the shared gate is removed.
+                    with _LIVE_DATABASES_LOCK:
+                        recovery_deferred = (
+                            database_key in _DEFERRED_DATABASES
+                        )
+                if recovery_deferred and not allow_deferred_startup:
+                    raise StoreError(
+                        "supervisor epoch activation is required before "
+                        "store operations"
+                    )
+                return fn(conn)
+
             loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(self._executor, functools.partial(fn, conn))
+            future = loop.run_in_executor(self._executor, guarded_call)
             result, cancellation = await self._drain_executor_future(future)
             if cancellation is not None:
                 raise cancellation
@@ -2221,6 +6733,1184 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _backfill_agent_lifecycle_v24_tx(
+        conn: sqlite3.Connection,
+        *,
+        now_text: str,
+    ) -> None:
+        """Materialize one honest legacy incarnation without inventing a child.
+
+        Profile history predates explicit lifecycle rows.  The naturally latest
+        immutable Profile determines the retained configuration, while an
+        existing deletion tombstone takes precedence over its legacy enabled
+        bit.  Migration 24 deliberately creates no ``agent_processes`` row:
+        only a real spawn/handshake may publish observed process state.
+        """
+
+        rows = conn.execute(
+            """SELECT p.agent_id, p.profile_version, p.enabled,
+                      p.created_at AS profile_created_at,
+                      first_profile.first_created_at,
+                      deleted.agent_id AS deleted_agent_id,
+                      deleted.deleted_at
+               FROM agent_profiles p
+               JOIN (
+                   SELECT agent_id, MAX(profile_version) AS profile_version,
+                          MIN(created_at) AS first_created_at
+                   FROM agent_profiles
+                   GROUP BY agent_id
+               ) first_profile
+                 ON first_profile.agent_id=p.agent_id
+                AND first_profile.profile_version=p.profile_version
+               LEFT JOIN deleted_agents deleted
+                 ON deleted.agent_id=p.agent_id
+               ORDER BY p.agent_id"""
+        ).fetchall()
+        for row in rows:
+            agent_id = str(row["agent_id"] or "").strip()
+            profile_version = int(row["profile_version"])
+            deleted_at = (
+                str(row["deleted_at"]).strip()
+                if row["deleted_at"] is not None
+                else ""
+            )
+            was_deleted = row["deleted_agent_id"] is not None
+            if was_deleted and not deleted_at:
+                raise StoreError(
+                    "legacy Agent tombstone timestamp is invalid: "
+                    f"{agent_id}"
+                )
+            if was_deleted:
+                lifecycle_state = AgentLifecycleState.TOMBSTONED.value
+                desired_state = AgentDesiredProcessState.STOPPED.value
+                retiring_at: str | None = deleted_at
+                tombstoned_at: str | None = deleted_at
+            elif bool(row["enabled"]):
+                lifecycle_state = AgentLifecycleState.ENABLED.value
+                desired_state = AgentDesiredProcessState.RUNNING.value
+                retiring_at = None
+                tombstoned_at = None
+            else:
+                lifecycle_state = AgentLifecycleState.DISABLED.value
+                desired_state = AgentDesiredProcessState.STOPPED.value
+                retiring_at = None
+                tombstoned_at = None
+            created_at = str(row["first_created_at"] or "").strip()
+            if not created_at:
+                created_at = str(row["profile_created_at"] or "").strip()
+            created_time = text_to_datetime(created_at)
+            if created_time is None:
+                raise StoreError(
+                    "legacy Agent profile timestamp is invalid: "
+                    f"{agent_id}@{profile_version}"
+                )
+            created_at = datetime_to_text(created_time) or ""
+            if was_deleted:
+                deleted_time = text_to_datetime(deleted_at)
+                if deleted_time is None:
+                    raise StoreError(
+                        "legacy Agent tombstone timestamp is invalid: "
+                        f"{agent_id}"
+                    )
+                deleted_at = datetime_to_text(deleted_time) or ""
+                retiring_at = deleted_at
+                tombstoned_at = deleted_at
+            provenance_json = json_dumps(
+                {
+                    "migration_version": 24,
+                    "source": "agent_profiles",
+                    "source_profile_version": profile_version,
+                    "legacy_deleted": was_deleted,
+                }
+            )
+            expected = {
+                "profile_version": profile_version,
+                "lifecycle_state": lifecycle_state,
+                "desired_process_state": desired_state,
+                "provenance_kind": "legacy_profile",
+                "provenance_profile_version": profile_version,
+                "provenance_json": provenance_json,
+                "created_at": created_at,
+                "retiring_at": retiring_at,
+                "tombstoned_at": tombstoned_at,
+            }
+            existing = conn.execute(
+                "SELECT * FROM agent_lifecycle "
+                "WHERE agent_id=? AND agent_incarnation=1",
+                (agent_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """INSERT INTO agent_lifecycle(
+                           agent_id, agent_incarnation, profile_version,
+                           lifecycle_state, desired_process_state,
+                           provenance_kind, provenance_profile_version,
+                           provenance_json, created_at, updated_at,
+                           retiring_at, tombstoned_at
+                       ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        agent_id,
+                        profile_version,
+                        lifecycle_state,
+                        desired_state,
+                        "legacy_profile",
+                        profile_version,
+                        provenance_json,
+                        created_at,
+                        now_text,
+                        retiring_at,
+                        tombstoned_at,
+                    ),
+                )
+                continue
+            # Development and replay tests may deliberately remove an older
+            # migration marker while retaining tables from a later schema.
+            # A v25-created incarnation is identified by its append-only
+            # event, and must not be rewritten or rejected as a conflicting
+            # legacy seed when migration 24 replays underneath it.
+            event_table = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='agent_lifecycle_events'"
+            ).fetchone()
+            if event_table is not None:
+                later_event = conn.execute(
+                    "SELECT 1 FROM agent_lifecycle_events "
+                    "WHERE agent_id=? AND agent_incarnation=1 LIMIT 1",
+                    (agent_id,),
+                ).fetchone()
+                if later_event is not None:
+                    continue
+            mismatches = [
+                column
+                for column, value in expected.items()
+                if existing[column] != value
+            ]
+            if mismatches:
+                raise StoreError(
+                    "legacy Agent lifecycle metadata conflicts: "
+                    f"{agent_id}@1 ({', '.join(mismatches)})"
+                )
+
+    @classmethod
+    def _migrate_agent_lifecycle_v25_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        now_text: str,
+    ) -> None:
+        """Seed the event ledger and reconcile v24 compatibility drift.
+
+        Migration 24 introduced the lifecycle projection while Profile and
+        deletion compatibility methods still wrote only their older tables.
+        Seed every eventless incarnation first, then make those projections
+        agree with the latest Profile and deletion marker.  An incarnation
+        created by v25 already owns an event, so deleting only the migration
+        marker and replaying this method never mislabels it as legacy state.
+        """
+
+        migration_actor = "schema-migration-25"
+        lifecycle_rows = conn.execute(
+            "SELECT * FROM agent_lifecycle "
+            "ORDER BY agent_id, agent_incarnation"
+        ).fetchall()
+        for row in lifecycle_rows:
+            has_event = conn.execute(
+                "SELECT 1 FROM agent_lifecycle_events "
+                "WHERE agent_id=? AND agent_incarnation=? LIMIT 1",
+                (str(row["agent_id"]), int(row["agent_incarnation"])),
+            ).fetchone()
+            if has_event is not None:
+                continue
+            agent_id = str(row["agent_id"])
+            incarnation = int(row["agent_incarnation"])
+            source_id = compound_id(
+                "agent-lifecycle-source",
+                ("schema-migration-25", agent_id, incarnation),
+            )
+            idempotency_key = compound_id(
+                "agent-lifecycle-idempotency",
+                ("migration_seed", source_id, agent_id, incarnation),
+            )
+            cls._insert_agent_lifecycle_event_tx(
+                conn,
+                idempotency_key=idempotency_key,
+                agent_id=agent_id,
+                agent_incarnation=incarnation,
+                event_kind="migration_seed",
+                previous=None,
+                new_profile_version=int(row["profile_version"]),
+                new_lifecycle_state=str(row["lifecycle_state"]),
+                new_desired_process_state=str(row["desired_process_state"]),
+                actor_kind="migration",
+                actor_id=migration_actor,
+                source_kind="schema_migration",
+                source_id=source_id,
+                provenance={
+                    "migration_version": 25,
+                    "seeded_projection": True,
+                    "projection_provenance_kind": str(row["provenance_kind"]),
+                },
+                # The seed describes when the retained projection last
+                # changed, rather than when this migration happened.
+                created_at=str(row["updated_at"]),
+            )
+
+        agent_rows = conn.execute(
+            """SELECT agent_id FROM agent_profiles
+               UNION SELECT agent_id FROM agent_lifecycle
+               UNION SELECT agent_id FROM deleted_agents
+               ORDER BY agent_id"""
+        ).fetchall()
+        for agent_row in agent_rows:
+            agent_id = str(agent_row["agent_id"])
+            profile = cls._latest_agent_profile_row_tx(conn, agent_id)
+            if profile is None:
+                raise StoreError(
+                    "cannot reconcile Agent lifecycle without a Profile: "
+                    f"{agent_id}"
+                )
+            current = cls._current_agent_lifecycle_row_tx(conn, agent_id)
+            latest = cls._latest_agent_lifecycle_row_tx(conn, agent_id)
+            if (
+                current is not None
+                and latest is not None
+                and int(current["agent_incarnation"])
+                != int(latest["agent_incarnation"])
+            ):
+                raise StoreError(
+                    "Agent lifecycle current incarnation is not latest: "
+                    f"{agent_id}"
+                )
+            deleted = conn.execute(
+                "SELECT * FROM deleted_agents WHERE agent_id=?",
+                (agent_id,),
+            ).fetchone()
+            if deleted is not None:
+                source_id = compound_id(
+                    "agent-lifecycle-source",
+                    (
+                        "schema-migration-25-deleted",
+                        agent_id,
+                        str(deleted["deleted_at"]),
+                    ),
+                )
+                cls._project_profile_lifecycle_tx(
+                    conn,
+                    agent_id=agent_id,
+                    profile_version=int(profile["profile_version"]),
+                    now_text=now_text,
+                    source_kind="schema_migration_reconciliation",
+                    source_id=source_id,
+                    actor=migration_actor,
+                    event_kind="compatibility_reconciled",
+                    provenance={
+                        "migration_version": 25,
+                        "deleted_marker_present": True,
+                    },
+                )
+                continue
+
+            if latest is not None and str(latest["lifecycle_state"]) == (
+                AgentLifecycleState.TOMBSTONED.value
+            ):
+                source_id = compound_id(
+                    "agent-lifecycle-source",
+                    (
+                        "schema-migration-25-cleared-deletion",
+                        agent_id,
+                        int(latest["agent_incarnation"]),
+                    ),
+                )
+                cls._create_agent_incarnation_tx(
+                    conn,
+                    agent_id=agent_id,
+                    profile_version=int(profile["profile_version"]),
+                    now_text=now_text,
+                    event_kind="compatibility_reconciled",
+                    source_kind="schema_migration_reconciliation",
+                    source_id=source_id,
+                    require_enabled=False,
+                    actor=migration_actor,
+                    provenance={
+                        "migration_version": 25,
+                        "deleted_marker_present": False,
+                    },
+                )
+
+            source_id = compound_id(
+                "agent-lifecycle-source",
+                (
+                    "schema-migration-25-profile",
+                    agent_id,
+                    int(profile["profile_version"]),
+                ),
+            )
+            cls._project_profile_lifecycle_tx(
+                conn,
+                agent_id=agent_id,
+                profile_version=int(profile["profile_version"]),
+                now_text=now_text,
+                source_kind="schema_migration_reconciliation",
+                source_id=source_id,
+                actor=migration_actor,
+                event_kind="compatibility_reconciled",
+                provenance={
+                    "migration_version": 25,
+                    "deleted_marker_present": False,
+                },
+            )
+
+    @staticmethod
+    def _current_agent_lifecycle_row_tx(
+        conn: sqlite3.Connection,
+        agent_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """SELECT * FROM agent_lifecycle
+               WHERE agent_id=? AND lifecycle_state!='tombstoned'
+               ORDER BY agent_incarnation DESC LIMIT 1""",
+            (agent_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _latest_agent_lifecycle_row_tx(
+        conn: sqlite3.Connection,
+        agent_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """SELECT * FROM agent_lifecycle WHERE agent_id=?
+               ORDER BY agent_incarnation DESC LIMIT 1""",
+            (agent_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _latest_agent_profile_row_tx(
+        conn: sqlite3.Connection,
+        agent_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """SELECT * FROM agent_profiles WHERE agent_id=?
+               ORDER BY profile_version DESC LIMIT 1""",
+            (agent_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _lifecycle_actor(actor: Any) -> tuple[str, str | None]:
+        actor_value = str(actor or "").strip()
+        if actor_value == "schema-migration-25":
+            return "migration", actor_value
+        if actor_value.startswith("system:"):
+            return "system", actor_value
+        if actor_value:
+            return "compatibility_actor", actor_value
+        return "compatibility_unattributed", None
+
+    @staticmethod
+    def _assert_no_live_agent_process_tx(
+        conn: sqlite3.Connection,
+        agent_id: str,
+        agent_incarnation: int | None = None,
+    ) -> None:
+        sql = (
+            "SELECT agent_incarnation, worker_generation FROM agent_processes "
+            "WHERE agent_id=? AND observed_state!='stopped'"
+        )
+        parameters: list[Any] = [agent_id]
+        if agent_incarnation is not None:
+            sql += " AND agent_incarnation=?"
+            parameters.append(int(agent_incarnation))
+        live = conn.execute(sql + " LIMIT 1", parameters).fetchone()
+        if live is not None:
+            raise InvalidTransition(
+                "cannot tombstone Agent with a live process generation: "
+                f"{agent_id}@{int(live['agent_incarnation'])}/"
+                f"{int(live['worker_generation'])}"
+            )
+
+    @classmethod
+    def _insert_agent_lifecycle_event_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        idempotency_key: str,
+        agent_id: str,
+        agent_incarnation: int,
+        event_kind: str,
+        previous: Mapping[str, Any] | sqlite3.Row | None,
+        new_profile_version: int,
+        new_lifecycle_state: str,
+        new_desired_process_state: str,
+        actor_kind: str,
+        actor_id: str | None,
+        source_kind: str,
+        source_id: str,
+        provenance: Mapping[str, Any],
+        created_at: str,
+    ) -> sqlite3.Row:
+        event_id = compound_id("agent-lifecycle-event", (idempotency_key,))
+        provenance_json = json_dumps(dict(provenance))
+        previous_profile_version = (
+            int(previous["profile_version"]) if previous is not None else None
+        )
+        previous_lifecycle_state = (
+            str(previous["lifecycle_state"]) if previous is not None else None
+        )
+        previous_desired_process_state = (
+            str(previous["desired_process_state"])
+            if previous is not None
+            else None
+        )
+        immutable = {
+            "lifecycle_event_id": event_id,
+            "agent_id": agent_id,
+            "agent_incarnation": int(agent_incarnation),
+            "event_kind": event_kind,
+            "previous_profile_version": previous_profile_version,
+            "previous_lifecycle_state": previous_lifecycle_state,
+            "previous_desired_process_state": previous_desired_process_state,
+            "new_profile_version": int(new_profile_version),
+            "new_lifecycle_state": new_lifecycle_state,
+            "new_desired_process_state": new_desired_process_state,
+            "actor_kind": actor_kind,
+            "actor_id": actor_id,
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "provenance_json": provenance_json,
+        }
+        existing = conn.execute(
+            "SELECT * FROM agent_lifecycle_events WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            mismatches = [
+                column
+                for column, expected in immutable.items()
+                if existing[column] != expected
+            ]
+            if mismatches:
+                raise StoreError(
+                    "Agent lifecycle event identity conflicts: "
+                    f"{idempotency_key} ({', '.join(mismatches)})"
+                )
+            return existing
+        sequence = int(
+            conn.execute(
+                """SELECT COALESCE(MAX(event_sequence), 0) + 1
+                   FROM agent_lifecycle_events
+                   WHERE agent_id=? AND agent_incarnation=?""",
+                (agent_id, int(agent_incarnation)),
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """INSERT INTO agent_lifecycle_events(
+                   lifecycle_event_id, idempotency_key, agent_id,
+                   agent_incarnation, event_sequence, event_kind,
+                   previous_profile_version, previous_lifecycle_state,
+                   previous_desired_process_state, new_profile_version,
+                   new_lifecycle_state, new_desired_process_state,
+                   actor_kind, actor_id, source_kind, source_id,
+                   provenance_json, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                event_id,
+                idempotency_key,
+                agent_id,
+                int(agent_incarnation),
+                sequence,
+                event_kind,
+                previous_profile_version,
+                previous_lifecycle_state,
+                previous_desired_process_state,
+                int(new_profile_version),
+                new_lifecycle_state,
+                new_desired_process_state,
+                actor_kind,
+                actor_id,
+                source_kind,
+                source_id,
+                provenance_json,
+                created_at,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM agent_lifecycle_events WHERE lifecycle_event_id=?",
+            (event_id,),
+        ).fetchone()
+        if row is None:  # pragma: no cover - guarded by the INSERT above.
+            raise StoreError("Agent lifecycle event was not persisted")
+        return row
+
+    @classmethod
+    def _project_profile_lifecycle_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str,
+        profile_version: int,
+        now_text: str,
+        source_kind: str,
+        source_id: str,
+        actor: Any = None,
+        event_kind: str = "profile_published",
+        provenance: Mapping[str, Any] | None = None,
+        emit_if_unchanged: bool = False,
+    ) -> sqlite3.Row:
+        profile = conn.execute(
+            """SELECT * FROM agent_profiles
+               WHERE agent_id=? AND profile_version=?""",
+            (agent_id, int(profile_version)),
+        ).fetchone()
+        if profile is None:
+            raise StoreError(
+                f"cannot project missing Agent profile: "
+                f"{agent_id}@{profile_version}"
+            )
+        current = cls._current_agent_lifecycle_row_tx(conn, agent_id)
+        deleted = conn.execute(
+            "SELECT 1 FROM deleted_agents WHERE agent_id=?",
+            (agent_id,),
+        ).fetchone()
+        if deleted is not None and current is not None:
+            cls._tombstone_agent_lifecycle_tx(
+                conn,
+                agent_id=agent_id,
+                now_text=now_text,
+                event_kind="compatibility_reconciled",
+                source_kind="deleted_agent_projection",
+                source_id=compound_id(
+                    "agent-lifecycle-source",
+                    ("deleted-agent-projection", agent_id, current["agent_incarnation"]),
+                ),
+                actor=actor,
+                provenance={"trigger": source_kind, "trigger_source_id": source_id},
+            )
+            current = None
+        lifecycle = current or cls._latest_agent_lifecycle_row_tx(conn, agent_id)
+        older_publication = bool(
+            lifecycle is not None
+            and int(profile_version) < int(lifecycle["profile_version"])
+        )
+        if older_publication:
+            # Startup persists complete immutable Profile history.  An older
+            # definition is useful evidence for a preparation operation, but
+            # it must never move the current projection backwards.
+            target_profile_version = int(lifecycle["profile_version"])
+            target_state = str(lifecycle["lifecycle_state"])
+            target_desired = str(lifecycle["desired_process_state"])
+        elif deleted is not None or (
+            lifecycle is not None
+            and str(lifecycle["lifecycle_state"])
+            == AgentLifecycleState.TOMBSTONED.value
+        ):
+            target_profile_version = int(profile_version)
+            target_state = AgentLifecycleState.TOMBSTONED.value
+            target_desired = AgentDesiredProcessState.STOPPED.value
+        else:
+            target_profile_version = int(profile_version)
+            target_state = (
+                AgentLifecycleState.ENABLED.value
+                if bool(profile["enabled"])
+                else AgentLifecycleState.DISABLED.value
+            )
+            target_desired = (
+                AgentDesiredProcessState.RUNNING.value
+                if target_state == AgentLifecycleState.ENABLED.value
+                else AgentDesiredProcessState.STOPPED.value
+            )
+        actor_kind, actor_id = cls._lifecycle_actor(actor)
+        projection_provenance = {
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "requested_profile_version": int(profile_version),
+            "projected_profile_version": target_profile_version,
+            **dict(provenance or {}),
+        }
+        projection_json = json_dumps(projection_provenance)
+        if lifecycle is None:
+            incarnation = 1
+            conn.execute(
+                """INSERT INTO agent_lifecycle(
+                       agent_id, agent_incarnation, profile_version,
+                       lifecycle_state, desired_process_state,
+                       provenance_kind, provenance_profile_version,
+                       provenance_json, created_at, updated_at,
+                       retiring_at, tombstoned_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    agent_id,
+                    incarnation,
+                    target_profile_version,
+                    target_state,
+                    target_desired,
+                    (
+                        "compatibility_tombstone"
+                        if target_state == AgentLifecycleState.TOMBSTONED.value
+                        else "compatibility_profile"
+                    ),
+                    target_profile_version,
+                    projection_json,
+                    now_text,
+                    now_text,
+                    (
+                        now_text
+                        if target_state == AgentLifecycleState.TOMBSTONED.value
+                        else None
+                    ),
+                    (
+                        now_text
+                        if target_state == AgentLifecycleState.TOMBSTONED.value
+                        else None
+                    ),
+                ),
+            )
+            previous = None
+        else:
+            incarnation = int(lifecycle["agent_incarnation"])
+            if (
+                int(lifecycle["profile_version"]) == target_profile_version
+                and str(lifecycle["lifecycle_state"]) == target_state
+                and str(lifecycle["desired_process_state"]) == target_desired
+            ):
+                if not emit_if_unchanged:
+                    return lifecycle
+                replay_key = compound_id(
+                    "agent-lifecycle-idempotency",
+                    (
+                        event_kind,
+                        source_kind,
+                        source_id,
+                        agent_id,
+                        incarnation,
+                        target_profile_version,
+                        target_state,
+                        target_desired,
+                    ),
+                )
+                if conn.execute(
+                    "SELECT 1 FROM agent_lifecycle_events "
+                    "WHERE idempotency_key=?",
+                    (replay_key,),
+                ).fetchone() is not None:
+                    # A retry observes the already-projected state, not the
+                    # original event's previous state.  The stable event is
+                    # already durable, so do not reconstruct conflicting
+                    # history from the new projection.
+                    return lifecycle
+                previous = dict(lifecycle)
+            else:
+                previous = dict(lifecycle)
+                if target_state == AgentLifecycleState.TOMBSTONED.value:
+                    retiring_at = lifecycle["retiring_at"] or now_text
+                    tombstoned_at = lifecycle["tombstoned_at"] or now_text
+                else:
+                    retiring_at = None
+                    tombstoned_at = None
+                changed = conn.execute(
+                    """UPDATE agent_lifecycle
+                       SET profile_version=?, lifecycle_state=?,
+                           desired_process_state=?, provenance_kind=?,
+                           provenance_profile_version=?, provenance_json=?,
+                           updated_at=?, retiring_at=?, tombstoned_at=?
+                       WHERE agent_id=? AND agent_incarnation=?
+                         AND profile_version=? AND lifecycle_state=?
+                         AND desired_process_state=?""",
+                    (
+                        target_profile_version,
+                        target_state,
+                        target_desired,
+                        (
+                            "compatibility_tombstone"
+                            if target_state
+                            == AgentLifecycleState.TOMBSTONED.value
+                            else "compatibility_profile"
+                        ),
+                        target_profile_version,
+                        projection_json,
+                        now_text,
+                        retiring_at,
+                        tombstoned_at,
+                        agent_id,
+                        incarnation,
+                        int(lifecycle["profile_version"]),
+                        str(lifecycle["lifecycle_state"]),
+                        str(lifecycle["desired_process_state"]),
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise StoreError(
+                        "Agent lifecycle profile projection lost its fence"
+                    )
+        idempotency_key = compound_id(
+            "agent-lifecycle-idempotency",
+            (
+                event_kind,
+                source_kind,
+                source_id,
+                agent_id,
+                incarnation,
+                target_profile_version,
+                target_state,
+                target_desired,
+            ),
+        )
+        cls._insert_agent_lifecycle_event_tx(
+            conn,
+            idempotency_key=idempotency_key,
+            agent_id=agent_id,
+            agent_incarnation=incarnation,
+            event_kind=event_kind,
+            previous=previous,
+            new_profile_version=target_profile_version,
+            new_lifecycle_state=target_state,
+            new_desired_process_state=target_desired,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+            source_kind=source_kind,
+            source_id=source_id,
+            provenance=projection_provenance,
+            created_at=now_text,
+        )
+        row = conn.execute(
+            """SELECT * FROM agent_lifecycle
+               WHERE agent_id=? AND agent_incarnation=?""",
+            (agent_id, incarnation),
+        ).fetchone()
+        if row is None:  # pragma: no cover - projection was just persisted.
+            raise StoreError("Agent lifecycle profile projection disappeared")
+        return row
+
+    @classmethod
+    def _tombstone_agent_lifecycle_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str,
+        now_text: str,
+        event_kind: str,
+        source_kind: str,
+        source_id: str,
+        actor: Any = None,
+        provenance: Mapping[str, Any] | None = None,
+        profile_version: int | None = None,
+    ) -> sqlite3.Row:
+        current = cls._current_agent_lifecycle_row_tx(conn, agent_id)
+        if current is None:
+            latest = cls._latest_agent_lifecycle_row_tx(conn, agent_id)
+            if latest is not None and str(latest["lifecycle_state"]) == "tombstoned":
+                return latest
+            raise StoreError(f"Agent lifecycle not found for tombstone: {agent_id}")
+        incarnation = int(current["agent_incarnation"])
+        target_profile_version = (
+            int(profile_version)
+            if profile_version is not None
+            else int(current["profile_version"])
+        )
+        profile = conn.execute(
+            "SELECT 1 FROM agent_profiles "
+            "WHERE agent_id=? AND profile_version=?",
+            (agent_id, target_profile_version),
+        ).fetchone()
+        if profile is None:
+            raise StoreError(
+                "cannot tombstone Agent with a missing Profile: "
+                f"{agent_id}@{target_profile_version}"
+            )
+        cls._assert_no_live_agent_process_tx(conn, agent_id, incarnation)
+        actor_kind, actor_id = cls._lifecycle_actor(actor)
+        event_provenance = {
+            "source_kind": source_kind,
+            "source_id": source_id,
+            **dict(provenance or {}),
+        }
+        provenance_json = json_dumps(event_provenance)
+        changed = conn.execute(
+            """UPDATE agent_lifecycle
+               SET profile_version=?, lifecycle_state='tombstoned',
+                   desired_process_state='stopped',
+                   provenance_kind='compatibility_tombstone',
+                   provenance_profile_version=?,
+                   provenance_json=?, updated_at=?,
+                   retiring_at=?, tombstoned_at=?
+               WHERE agent_id=? AND agent_incarnation=?
+                 AND lifecycle_state!='tombstoned'""",
+            (
+                target_profile_version,
+                target_profile_version,
+                provenance_json,
+                now_text,
+                now_text,
+                now_text,
+                agent_id,
+                incarnation,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise StoreError("Agent lifecycle tombstone lost its fence")
+        idempotency_key = compound_id(
+            "agent-lifecycle-idempotency",
+            (event_kind, source_kind, source_id, agent_id, incarnation),
+        )
+        cls._insert_agent_lifecycle_event_tx(
+            conn,
+            idempotency_key=idempotency_key,
+            agent_id=agent_id,
+            agent_incarnation=incarnation,
+            event_kind=event_kind,
+            previous=dict(current),
+            new_profile_version=target_profile_version,
+            new_lifecycle_state=AgentLifecycleState.TOMBSTONED.value,
+            new_desired_process_state=AgentDesiredProcessState.STOPPED.value,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+            source_kind=source_kind,
+            source_id=source_id,
+            provenance=event_provenance,
+            created_at=now_text,
+        )
+        row = cls._latest_agent_lifecycle_row_tx(conn, agent_id)
+        if row is None:  # pragma: no cover - UPDATE preserved the row.
+            raise StoreError("Agent lifecycle tombstone disappeared")
+        return row
+
+    @classmethod
+    def _create_agent_incarnation_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str,
+        profile_version: int,
+        now_text: str,
+        event_kind: str,
+        source_kind: str,
+        source_id: str,
+        require_enabled: bool,
+        actor: Any = None,
+        provenance: Mapping[str, Any] | None = None,
+    ) -> sqlite3.Row:
+        current = cls._current_agent_lifecycle_row_tx(conn, agent_id)
+        if current is not None:
+            raise StoreError(
+                "Agent recreation found an existing current incarnation: "
+                f"{agent_id}@{int(current['agent_incarnation'])}"
+            )
+        previous = cls._latest_agent_lifecycle_row_tx(conn, agent_id)
+        if previous is None or str(previous["lifecycle_state"]) != "tombstoned":
+            raise StoreError(f"Agent recreation lacks a tombstoned incarnation: {agent_id}")
+        cls._assert_no_live_agent_process_tx(conn, agent_id)
+        profile = conn.execute(
+            """SELECT * FROM agent_profiles
+               WHERE agent_id=? AND profile_version=?""",
+            (agent_id, int(profile_version)),
+        ).fetchone()
+        if profile is None:
+            raise StoreError(
+                f"cannot recreate missing Agent profile: {agent_id}@{profile_version}"
+            )
+        enabled = bool(profile["enabled"])
+        if require_enabled and not enabled:
+            raise StoreError(f"Agent reactivation is incomplete: {agent_id}")
+        state = (
+            AgentLifecycleState.ENABLED.value
+            if enabled
+            else AgentLifecycleState.DISABLED.value
+        )
+        desired = (
+            AgentDesiredProcessState.RUNNING.value
+            if enabled
+            else AgentDesiredProcessState.STOPPED.value
+        )
+        incarnation = int(
+            conn.execute(
+                """SELECT COALESCE(MAX(agent_incarnation), 0) + 1
+                   FROM agent_lifecycle WHERE agent_id=?""",
+                (agent_id,),
+            ).fetchone()[0]
+        )
+        actor_kind, actor_id = cls._lifecycle_actor(actor)
+        event_provenance = {
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "previous_incarnation": int(previous["agent_incarnation"]),
+            **dict(provenance or {}),
+        }
+        provenance_json = json_dumps(event_provenance)
+        conn.execute(
+            """INSERT INTO agent_lifecycle(
+                   agent_id, agent_incarnation, profile_version,
+                   lifecycle_state, desired_process_state,
+                   provenance_kind, provenance_profile_version,
+                   provenance_json, created_at, updated_at,
+                   retiring_at, tombstoned_at
+               ) VALUES (?, ?, ?, ?, ?, 'compatibility_reactivation', ?, ?, ?, ?, NULL, NULL)""",
+            (
+                agent_id,
+                incarnation,
+                int(profile_version),
+                state,
+                desired,
+                int(profile_version),
+                provenance_json,
+                now_text,
+                now_text,
+            ),
+        )
+        idempotency_key = compound_id(
+            "agent-lifecycle-idempotency",
+            (event_kind, source_kind, source_id, agent_id, incarnation),
+        )
+        cls._insert_agent_lifecycle_event_tx(
+            conn,
+            idempotency_key=idempotency_key,
+            agent_id=agent_id,
+            agent_incarnation=incarnation,
+            event_kind=event_kind,
+            previous=dict(previous),
+            new_profile_version=int(profile_version),
+            new_lifecycle_state=state,
+            new_desired_process_state=desired,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+            source_kind=source_kind,
+            source_id=source_id,
+            provenance=event_provenance,
+            created_at=now_text,
+        )
+        row = cls._current_agent_lifecycle_row_tx(conn, agent_id)
+        if row is None:  # pragma: no cover - INSERT created the current row.
+            raise StoreError("Agent recreation lifecycle disappeared")
+        return row
+
+    @staticmethod
+    def _agent_lifecycle_from_row(
+        row: sqlite3.Row | None,
+    ) -> AgentLifecycleRecord | None:
+        if row is None:
+            return None
+        provenance = json_loads(row["provenance_json"], None)
+        if not isinstance(provenance, Mapping):
+            raise StoreError("Agent lifecycle provenance is invalid")
+        return AgentLifecycleRecord(
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            profile_version=int(row["profile_version"]),
+            lifecycle_state=AgentLifecycleState(str(row["lifecycle_state"])),
+            desired_process_state=AgentDesiredProcessState(
+                str(row["desired_process_state"])
+            ),
+            provenance_kind=str(row["provenance_kind"]),
+            provenance_profile_version=(
+                int(row["provenance_profile_version"])
+                if row["provenance_profile_version"] is not None
+                else None
+            ),
+            provenance=dict(provenance),
+            created_at=text_to_datetime(row["created_at"]),
+            updated_at=text_to_datetime(row["updated_at"]),
+            retiring_at=text_to_datetime(row["retiring_at"]),
+            tombstoned_at=text_to_datetime(row["tombstoned_at"]),
+        )
+
+    @staticmethod
+    def _agent_lifecycle_event_from_row(
+        row: sqlite3.Row | None,
+    ) -> AgentLifecycleEventRecord | None:
+        if row is None:
+            return None
+        provenance = json_loads(row["provenance_json"], None)
+        if not isinstance(provenance, Mapping):
+            raise StoreError("Agent lifecycle event provenance is invalid")
+        return AgentLifecycleEventRecord(
+            lifecycle_event_id=str(row["lifecycle_event_id"]),
+            idempotency_key=str(row["idempotency_key"]),
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            event_sequence=int(row["event_sequence"]),
+            event_kind=str(row["event_kind"]),
+            previous_profile_version=(
+                int(row["previous_profile_version"])
+                if row["previous_profile_version"] is not None
+                else None
+            ),
+            previous_lifecycle_state=(
+                AgentLifecycleState(str(row["previous_lifecycle_state"]))
+                if row["previous_lifecycle_state"] is not None
+                else None
+            ),
+            previous_desired_process_state=(
+                AgentDesiredProcessState(
+                    str(row["previous_desired_process_state"])
+                )
+                if row["previous_desired_process_state"] is not None
+                else None
+            ),
+            new_profile_version=int(row["new_profile_version"]),
+            new_lifecycle_state=AgentLifecycleState(
+                str(row["new_lifecycle_state"])
+            ),
+            new_desired_process_state=AgentDesiredProcessState(
+                str(row["new_desired_process_state"])
+            ),
+            actor_kind=str(row["actor_kind"]),
+            actor_id=(
+                str(row["actor_id"])
+                if row["actor_id"] is not None
+                else None
+            ),
+            source_kind=str(row["source_kind"]),
+            source_id=str(row["source_id"]),
+            provenance=dict(provenance),
+            created_at=text_to_datetime(row["created_at"]),
+        )
+
+    @staticmethod
+    def _agent_process_from_row(
+        row: sqlite3.Row | None,
+    ) -> AgentProcessRecord | None:
+        if row is None:
+            return None
+        raw_cleanup = row["cleanup_proof_json"]
+        cleanup_proof: Mapping[str, Any]
+        if raw_cleanup is None:
+            cleanup_proof = {}
+        else:
+            decoded = json_loads(raw_cleanup, None)
+            if not isinstance(decoded, Mapping):
+                raise StoreError("Agent process cleanup proof is invalid")
+            cleanup_proof = dict(decoded)
+        return AgentProcessRecord(
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            worker_generation=int(row["worker_generation"]),
+            supervisor_epoch=int(row["supervisor_epoch"]),
+            observed_state=AgentProcessState(str(row["observed_state"])),
+            generation_capability_hash=str(row["generation_capability_hash"]),
+            lifetime_lock_identity=str(row["lifetime_lock_identity"]),
+            lifetime_lock_acquired_at=text_to_datetime(
+                row["lifetime_lock_acquired_at"]
+            ),
+            process_lease_identity=str(row["process_lease_identity"]),
+            process_lease_token_hash=str(row["process_lease_token_hash"]),
+            lease_expires_at=text_to_datetime(row["lease_expires_at"]),
+            lease_ended_at=text_to_datetime(row["lease_ended_at"]),
+            pid=int(row["pid"]) if row["pid"] is not None else None,
+            process_group_id=(
+                int(row["process_group_id"])
+                if row["process_group_id"] is not None
+                else None
+            ),
+            kernel_process_birth_id=(
+                str(row["kernel_process_birth_id"])
+                if row["kernel_process_birth_id"] is not None
+                else None
+            ),
+            started_at=text_to_datetime(row["started_at"]),
+            hello_frame_id=(
+                str(row["hello_frame_id"])
+                if row["hello_frame_id"] is not None
+                else None
+            ),
+            hello_payload_hash=(
+                str(row["hello_payload_hash"])
+                if row["hello_payload_hash"] is not None
+                else None
+            ),
+            capabilities_frame_id=(
+                str(row["capabilities_frame_id"])
+                if row["capabilities_frame_id"] is not None
+                else None
+            ),
+            capabilities_payload_hash=(
+                str(row["capabilities_payload_hash"])
+                if row["capabilities_payload_hash"] is not None
+                else None
+            ),
+            capability_snapshot_hash=(
+                str(row["capability_snapshot_hash"])
+                if row["capability_snapshot_hash"] is not None
+                else None
+            ),
+            handshake_committed_at=text_to_datetime(
+                row["handshake_committed_at"]
+            ),
+            ready_frame_id=(
+                str(row["ready_frame_id"])
+                if row["ready_frame_id"] is not None
+                else None
+            ),
+            ready_payload_hash=(
+                str(row["ready_payload_hash"])
+                if row["ready_payload_hash"] is not None
+                else None
+            ),
+            ready_at=text_to_datetime(row["ready_at"]),
+            last_heartbeat_at=text_to_datetime(row["last_heartbeat_at"]),
+            stopped_by_supervisor_epoch=(
+                int(row["stopped_by_supervisor_epoch"])
+                if row["stopped_by_supervisor_epoch"] is not None
+                else None
+            ),
+            cleanup_proof=cleanup_proof,
+            cleanup_proof_hash=(
+                str(row["cleanup_proof_hash"])
+                if row["cleanup_proof_hash"] is not None
+                else None
+            ),
+            cleanup_proved_at=text_to_datetime(row["cleanup_proved_at"]),
+            stopped_at=text_to_datetime(row["stopped_at"]),
+            stop_reason=(
+                str(row["stop_reason"])
+                if row["stop_reason"] is not None
+                else None
+            ),
+            last_exit_code=(
+                int(row["last_exit_code"])
+                if row["last_exit_code"] is not None
+                else None
+            ),
+            last_error=(
+                str(row["last_error"])
+                if row["last_error"] is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _supervisor_epoch_from_row(
+        row: sqlite3.Row | None,
+    ) -> SupervisorEpochRecord | None:
+        if row is None:
+            return None
+        started_at = text_to_datetime(row["started_at"])
+        if started_at is None:
+            raise StoreError("supervisor epoch start timestamp is invalid")
+        raw_stopped_at = row["stopped_at"]
+        stopped_at = text_to_datetime(raw_stopped_at)
+        if raw_stopped_at is not None and stopped_at is None:
+            raise StoreError("supervisor epoch stop timestamp is invalid")
+        stop_reason = (
+            str(row["stop_reason"]).strip()
+            if row["stop_reason"] is not None
+            else None
+        )
+        if stopped_at is None:
+            if stop_reason is not None:
+                raise StoreError("active supervisor epoch has a stop reason")
+        else:
+            if not stop_reason:
+                raise StoreError("stopped supervisor epoch has no stop reason")
+            if stopped_at < started_at:
+                raise StoreError("supervisor epoch stop predates its start")
+        return SupervisorEpochRecord(
+            epoch=int(row["epoch"]),
+            owner_instance_id=str(row["owner_instance_id"]),
+            channel=str(row["channel"]),
+            bot_id=str(row["bot_id"]),
+            started_at=started_at,
+            stopped_at=stopped_at,
+            stop_reason=stop_reason,
+        )
+
+    @staticmethod
     def _reply_scope_from_row(row: sqlite3.Row | None) -> ReplyScopeRecord | None:
         if row is None:
             return None
@@ -2268,7 +7958,11 @@ class SQLiteStore:
             delivery_mode=DeliveryMode(str(row["delivery_mode"])),
             notify_enabled=bool(row["notify_enabled"]),
             foreground=bool(row["foreground"]),
+            presentation=PresentationState(
+                str(row["presentation"] or PresentationState.UNSEEN.value)
+            ),
             created_at=text_to_datetime(row["created_at"]),
+            presented_at=text_to_datetime(row["presented_at"]),
         )
 
     @staticmethod
@@ -2332,10 +8026,12 @@ class SQLiteStore:
     def _task_from_row(row: sqlite3.Row | None) -> TaskRecord | None:
         if row is None:
             return None
+        stored_state = str(row["state"])
         return TaskRecord(
             task_id=row["task_id"],
-            state=TaskState(row["state"]),
+            state=TaskState.CLAIMED if stored_state == "dispatching" else TaskState(stored_state),
             agent_id=row["agent_id"],
+            agent_incarnation=int(row["agent_incarnation"]),
             conversation_id=row["conversation_id"],
             mode_id=row["mode_id"],
             profile_version=int(row["profile_version"]),
@@ -2373,11 +8069,19 @@ class SQLiteStore:
     def _execution_from_row(row: sqlite3.Row | None) -> TaskExecution | None:
         if row is None:
             return None
+        stored_state = str(row["state"])
         return TaskExecution(
             execution_id=row["execution_id"],
             task_id=row["task_id"],
             attempt=int(row["attempt"]),
-            state=ExecutionState(row["state"]),
+            state=(
+                ExecutionState.CLAIMED
+                if stored_state == "dispatching"
+                else ExecutionState(stored_state)
+            ),
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            dispatch_backend=DispatchBackend(str(row["dispatch_backend"])),
             worker_id=row["worker_id"],
             claim_token=row["claim_token"],
             lease_expires_at=text_to_datetime(row["lease_expires_at"]),
@@ -2393,7 +8097,416 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _invocation_from_row(
+        row: sqlite3.Row | None,
+    ) -> AgentInvocationRecord | None:
+        if row is None:
+            return None
+        return AgentInvocationRecord(
+            invocation_id=str(row["invocation_id"]),
+            work_kind=InvocationWorkKind(str(row["work_kind"])),
+            work_id=str(row["work_id"]),
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            state=InvocationState(str(row["state"])),
+            dispatch_backend=DispatchBackend(str(row["dispatch_backend"])),
+            ready_sequence=int(row["ready_sequence"]),
+            task_id=row["task_id"],
+            execution_id=row["execution_id"],
+            mailbox_id=row["mailbox_id"],
+            claimed_by=row["claimed_by"],
+            claim_token=row["claim_token"],
+            lease_expires_at=text_to_datetime(row["lease_expires_at"]),
+            next_attempt_at=text_to_datetime(row["next_attempt_at"]),
+            admission_released_at=text_to_datetime(row["admission_released_at"]),
+            created_at=text_to_datetime(row["created_at"]),
+            updated_at=text_to_datetime(row["updated_at"]),
+            terminal_at=text_to_datetime(row["terminal_at"]),
+            last_error=row["last_error"],
+            expires_at=text_to_datetime(
+                row["expires_at"] if "expires_at" in row.keys() else None
+            ),
+        )
+
+    @staticmethod
+    def _invocation_event_from_row(
+        row: sqlite3.Row | None,
+    ) -> AgentInvocationEventRecord | None:
+        if row is None:
+            return None
+        return AgentInvocationEventRecord(
+            invocation_event_id=str(row["invocation_event_id"]),
+            invocation_id=str(row["invocation_id"]),
+            event_sequence=int(row["event_sequence"]),
+            event_kind=str(row["event_kind"]),
+            previous_state=(
+                InvocationState(str(row["previous_state"]))
+                if row["previous_state"] is not None
+                else None
+            ),
+            new_state=InvocationState(str(row["new_state"])),
+            source_kind=str(row["source_kind"]),
+            source_id=str(row["source_id"]),
+            metadata=json_loads(row["metadata_json"], {}) or {},
+            created_at=text_to_datetime(row["created_at"]),
+        )
+
+    @staticmethod
+    def _mailbox_orphan_review_from_row(
+        row: sqlite3.Row | None,
+        *,
+        replayed: bool = False,
+    ) -> MailboxOrphanReviewRecord | None:
+        if row is None:
+            return None
+        authorized_at = text_to_datetime(row["authorized_at"])
+        if authorized_at is None:
+            raise StoreError("mailbox orphan review authorization time is invalid")
+        return MailboxOrphanReviewRecord(
+            mailbox_maintenance_id=str(row["mailbox_maintenance_id"]),
+            payload_hash=str(row["payload_hash"]),
+            authorization_scheme=str(row["authorization_scheme"]),
+            authorization_grant_digest=str(row["authorization_grant_digest"]),
+            mailbox_id=str(row["mailbox_id"]),
+            mailbox_message_id=str(row["mailbox_message_id"]),
+            expected_current_invocation_id=str(
+                row["expected_current_invocation_id"]
+            ),
+            action=MailboxOrphanReviewAction(str(row["action"])),
+            actor=str(row["actor"]),
+            reason=str(row["reason"]),
+            authorized_at=authorized_at,
+            authorization_source=str(row["authorization_source"]),
+            administrator_authorized=bool(row["administrator_authorized"]),
+            outcome=MailboxOrphanReviewOutcome(str(row["outcome"])),
+            replacement_invocation_id=row["replacement_invocation_id"],
+            reviewed_at=text_to_datetime(row["reviewed_at"]),
+            replayed=bool(replayed),
+        )
+
+    @staticmethod
+    def _agent_admission_counter_from_row(
+        row: sqlite3.Row | None,
+    ) -> AgentAdmissionCounterRecord | None:
+        if row is None:
+            return None
+        return AgentAdmissionCounterRecord(
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            unfinished_count=int(row["unfinished_count"]),
+            next_ready_sequence=int(row["next_ready_sequence"]),
+            updated_at=text_to_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _global_agent_admission_counter_from_row(
+        row: sqlite3.Row | None,
+    ) -> GlobalAgentAdmissionCounterRecord | None:
+        if row is None:
+            return None
+        return GlobalAgentAdmissionCounterRecord(
+            singleton=int(row["singleton"]),
+            unfinished_count=int(row["unfinished_count"]),
+            updated_at=text_to_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _agent_execution_slot_from_row(
+        row: sqlite3.Row | None,
+    ) -> AgentExecutionSlotRecord | None:
+        if row is None:
+            return None
+        return AgentExecutionSlotRecord(
+            slot_id=str(row["slot_id"]),
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            slot_sequence=int(row["slot_sequence"]),
+            slot_kind=ExecutionSlotKind(str(row["slot_kind"])),
+            state=ExecutionSlotState(str(row["state"])),
+            dispatch_backend=DispatchBackend(str(row["dispatch_backend"])),
+            invocation_id=(
+                str(row["invocation_id"])
+                if row["invocation_id"] is not None
+                else None
+            ),
+            worker_generation=int(row["worker_generation"]),
+            acquired_at=text_to_datetime(row["acquired_at"]),
+            released_at=text_to_datetime(row["released_at"]),
+        )
+
+    @staticmethod
+    def _agent_dispatch_attempt_from_row(
+        row: sqlite3.Row | None,
+    ) -> AgentDispatchAttemptRecord | None:
+        if row is None:
+            return None
+        decision_outcome = (
+            row["decision_outcome_state"]
+            if "decision_outcome_state" in row.keys()
+            else None
+        )
+        return AgentDispatchAttemptRecord(
+            dispatch_attempt_id=str(row["dispatch_attempt_id"]),
+            invocation_id=str(row["invocation_id"]),
+            slot_id=str(row["slot_id"]),
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            worker_generation=int(row["worker_generation"]),
+            supervisor_epoch=int(row["supervisor_epoch"]),
+            dispatch_backend=DispatchBackend(str(row["dispatch_backend"])),
+            claim_token_hash=str(row["claim_token_hash"]),
+            lease_identity=str(row["lease_identity"]),
+            lease_expires_at=text_to_datetime(row["lease_expires_at"]),
+            invocation_job_identity=str(row["invocation_job_identity"]),
+            grant_issued_at=text_to_datetime(row["grant_issued_at"]),
+            abort_committed_at=text_to_datetime(row["abort_committed_at"]),
+            rejection_committed_at=text_to_datetime(
+                row["rejection_committed_at"]
+            ),
+            decision_code=(
+                str(row["decision_code"])
+                if "decision_code" in row.keys()
+                and row["decision_code"] is not None
+                else None
+            ),
+            decision_outcome_state=(
+                InvocationState(str(decision_outcome))
+                if decision_outcome is not None
+                else None
+            ),
+            decision_source_state=(
+                DispatchSourceState(str(row["decision_source_state"]))
+                if "decision_source_state" in row.keys()
+                and row["decision_source_state"] is not None
+                else None
+            ),
+            decision_next_attempt_at=(
+                text_to_datetime(row["decision_next_attempt_at"])
+                if "decision_next_attempt_at" in row.keys()
+                else None
+            ),
+            decision_metadata_legacy=(
+                bool(int(row["decision_metadata_legacy"]))
+                if "decision_metadata_legacy" in row.keys()
+                else False
+            ),
+            runtime_stopped_at=text_to_datetime(row["runtime_stopped_at"]),
+            invocation_job_empty_at=text_to_datetime(
+                row["invocation_job_empty_at"]
+            ),
+            cleanup_proof_hash=(
+                str(row["cleanup_proof_hash"])
+                if "cleanup_proof_hash" in row.keys()
+                and row["cleanup_proof_hash"] is not None
+                else None
+            ),
+            created_at=text_to_datetime(row["created_at"]),
+        )
+
+    @classmethod
+    def _require_dispatch_attempt_fences_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        dispatch_attempt_id: str,
+        invocation_id: str,
+        slot_id: str,
+        agent_id: str,
+        agent_incarnation: int,
+        worker_generation: int,
+        supervisor_epoch: int,
+        claim_token_hash: str,
+        lease_identity: str,
+        invocation_job_identity: str,
+    ) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row]:
+        attempt = conn.execute(
+            "SELECT * FROM agent_dispatch_attempts WHERE dispatch_attempt_id=?",
+            (dispatch_attempt_id,),
+        ).fetchone()
+        if attempt is None:
+            raise NotFoundError(
+                f"Agent dispatch attempt not found: {dispatch_attempt_id}"
+            )
+        expected: dict[str, Any] = {
+            "invocation_id": invocation_id,
+            "slot_id": slot_id,
+            "agent_id": agent_id,
+            "agent_incarnation": agent_incarnation,
+            "worker_generation": worker_generation,
+            "supervisor_epoch": supervisor_epoch,
+            "dispatch_backend": DispatchBackend.CHILD.value,
+            "claim_token_hash": claim_token_hash,
+            "lease_identity": lease_identity,
+            "invocation_job_identity": invocation_job_identity,
+        }
+        mismatches = [
+            column
+            for column, value in expected.items()
+            if str(attempt[column]) != str(value)
+        ]
+        if mismatches:
+            raise StoreError(
+                "Agent dispatch attempt identity conflicts: "
+                + ", ".join(mismatches)
+            )
+        slot = conn.execute(
+            "SELECT * FROM agent_execution_slots WHERE slot_id=?",
+            (slot_id,),
+        ).fetchone()
+        if slot is None:
+            raise StoreError("Agent dispatch attempt slot is missing")
+        invocation = conn.execute(
+            "SELECT * FROM agent_invocations WHERE invocation_id=?",
+            (invocation_id,),
+        ).fetchone()
+        if invocation is None:
+            raise StoreError("Agent dispatch attempt invocation is missing")
+        for row, label in ((slot, "slot"), (invocation, "invocation")):
+            ownership = {
+                "agent_id": agent_id,
+                "agent_incarnation": agent_incarnation,
+                "dispatch_backend": DispatchBackend.CHILD.value,
+            }
+            if row is slot:
+                ownership.update(
+                    {
+                        "invocation_id": invocation_id,
+                        "worker_generation": worker_generation,
+                    }
+                )
+            conflicts = [
+                column
+                for column, value in ownership.items()
+                if str(row[column]) != str(value)
+            ]
+            if conflicts:
+                raise StoreError(
+                    f"Agent dispatch {label} ownership conflicts: "
+                    + ", ".join(conflicts)
+                )
+        return attempt, slot, invocation
+
+    @classmethod
+    def _dispatch_reservation_from_attempt_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        attempt: sqlite3.Row,
+        claim_token: str,
+        replayed: bool,
+    ) -> AgentDispatchReservation:
+        invocation_row = conn.execute(
+            "SELECT * FROM agent_invocations WHERE invocation_id=?",
+            (attempt["invocation_id"],),
+        ).fetchone()
+        slot_row = conn.execute(
+            "SELECT * FROM agent_execution_slots WHERE slot_id=?",
+            (attempt["slot_id"],),
+        ).fetchone()
+        invocation = cls._invocation_from_row(invocation_row)
+        slot = cls._agent_execution_slot_from_row(slot_row)
+        attempt_record = cls._agent_dispatch_attempt_from_row(attempt)
+        if invocation is None or slot is None or attempt_record is None:
+            raise StoreError("Agent dispatch reservation projection is incomplete")
+        task: TaskRecord | None = None
+        mailbox: AgentMailboxItem | None = None
+        if invocation.work_kind is InvocationWorkKind.TASK:
+            if invocation.task_id is None:
+                raise StoreError("task dispatch reservation lacks task identity")
+            task_row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id=?",
+                (invocation.task_id,),
+            ).fetchone()
+            execution_row = conn.execute(
+                "SELECT * FROM task_executions WHERE execution_id=?",
+                (invocation.invocation_id,),
+            ).fetchone()
+            task = cls._task_from_row(task_row)
+            if task is None or execution_row is None:
+                raise StoreError("task dispatch reservation source is missing")
+            expected_source = {
+                "task.current_execution_id": task_row["current_execution_id"],
+                "task.state": task_row["state"],
+                "task.claim_token": task_row["claim_token"],
+                "task.lease_expires_at": task_row["lease_expires_at"],
+                "execution.task_id": execution_row["task_id"],
+                "execution.state": execution_row["state"],
+                "execution.claim_token": execution_row["claim_token"],
+                "execution.lease_expires_at": execution_row["lease_expires_at"],
+            }
+            required_source = {
+                "task.current_execution_id": invocation.invocation_id,
+                "task.state": InvocationState.DISPATCHING.value,
+                "task.claim_token": claim_token,
+                "task.lease_expires_at": attempt["lease_expires_at"],
+                "execution.task_id": invocation.task_id,
+                "execution.state": InvocationState.DISPATCHING.value,
+                "execution.claim_token": claim_token,
+                "execution.lease_expires_at": attempt["lease_expires_at"],
+            }
+            mismatches = [
+                name
+                for name, expected in required_source.items()
+                if str(expected_source[name] or "") != str(expected or "")
+            ]
+            if mismatches:
+                raise StoreError(
+                    "task dispatch reservation source conflicts: "
+                    + ", ".join(mismatches)
+                )
+        else:
+            if invocation.mailbox_id is None:
+                raise StoreError("mailbox dispatch reservation lacks mailbox identity")
+            mailbox_row = conn.execute(
+                "SELECT * FROM agent_mailbox WHERE mailbox_id=?",
+                (invocation.mailbox_id,),
+            ).fetchone()
+            mailbox = cls._mailbox_from_row(mailbox_row)
+            if mailbox is None or mailbox_row is None:
+                raise StoreError("mailbox dispatch reservation source is missing")
+            expected_source = {
+                "current_invocation_id": invocation.invocation_id,
+                "message_id": invocation.work_id,
+                "destination_agent_id": invocation.agent_id,
+                "destination_agent_incarnation": invocation.agent_incarnation,
+                "state": MailboxState.DISPATCHING.value,
+                "claim_token": claim_token,
+                "lease_expires_at": attempt["lease_expires_at"],
+                "expires_at": (
+                    datetime_to_text(invocation.expires_at)
+                    if invocation.expires_at is not None
+                    else None
+                ),
+            }
+            mismatches = [
+                name
+                for name, expected in expected_source.items()
+                if str(mailbox_row[name] or "") != str(expected or "")
+            ]
+            if invocation.expires_at is None:
+                mismatches.append("invocation.expires_at")
+            if mismatches:
+                raise StoreError(
+                    "mailbox dispatch reservation source conflicts: "
+                    + ", ".join(dict.fromkeys(mismatches))
+                )
+        return AgentDispatchReservation(
+            invocation=invocation,
+            slot=slot,
+            attempt=attempt_record,
+            claim_token=claim_token,
+            task=task,
+            mailbox=mailbox,
+            replayed=replayed,
+        )
+
+    @staticmethod
     def _task_event_from_row(row: sqlite3.Row) -> TaskEvent:
+        created_at = _required_row_datetime(
+            row["created_at"],
+            label="task event creation",
+            identity=row["event_id"],
+        )
         return TaskEvent(
             event_id=row["event_id"],
             task_id=row["task_id"],
@@ -2403,7 +8516,7 @@ class SQLiteStore:
             priority=EventPriority(int(row["priority"])),
             content=row["content"],
             attachments=tuple(json_loads(row["attachments_json"], []) or []),
-            created_at=text_to_datetime(row["created_at"]),
+            created_at=created_at,
             execution_id=row["execution_id"],
             destination_agent_id=row["destination_agent_id"],
             request_id=row["request_id"],
@@ -2429,6 +8542,11 @@ class SQLiteStore:
     def _outbox_from_row(row: sqlite3.Row | None) -> UserOutboxItem | None:
         if row is None:
             return None
+        created_at = _required_row_datetime(
+            row["created_at"],
+            label="user outbox creation",
+            identity=row["outbox_id"],
+        )
         return UserOutboxItem(
             outbox_id=row["outbox_id"],
             task_id=row["task_id"],
@@ -2453,7 +8571,7 @@ class SQLiteStore:
             lease_expires_at=text_to_datetime(row["lease_expires_at"]),
             next_attempt_at=text_to_datetime(row["next_attempt_at"]),
             last_error=row["last_error"],
-            created_at=text_to_datetime(row["created_at"]),
+            created_at=created_at,
             sent_at=text_to_datetime(row["sent_at"]),
             attachments=tuple(json_loads(row["attachments_json"], []) or []),
             reply_scope_id=(
@@ -2495,11 +8613,58 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _normalize_command_response_fragments(
+        values: Iterable[Any] | None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Canonicalize the exact explicit wire fragments stored in a receipt."""
+
+        normalized: list[dict[str, Any]] = []
+        for ordinal, value in enumerate(values or (), start=1):
+            if not isinstance(value, Mapping):
+                raise ValueError("command response fragment must be a mapping")
+            kind = str(
+                value.get("kind", value.get("fragment_kind", "text")) or "text"
+            ).strip().lower()
+            if kind not in {"text", "media", "bundle"}:
+                raise ValueError("command response fragment kind is invalid")
+            content = str(
+                value.get("content", value.get("text", "")) or ""
+            ).strip()
+            raw_attachments = value.get("attachments", ()) or ()
+            if isinstance(raw_attachments, (str, bytes, bytearray, Mapping)):
+                raise ValueError("command response fragment attachments are invalid")
+            attachments = list(raw_attachments)
+            if not content.strip() and not attachments:
+                raise ValueError("command response fragment is empty")
+            text_limit = (
+                REPLY_TEXT_MAX_CHARS
+                if ordinal < REPLY_SCOPE_CAPACITY
+                else REPLY_TEXT_MAX_CHARS - len(REPLY_CONTINUATION_SUFFIX)
+            )
+            if kind in {"text", "bundle"} and len(content) > text_limit:
+                raise ValueError(
+                    "command response fragment exceeds its deterministic text limit"
+                )
+            item: dict[str, Any] = {"kind": kind, "content": content}
+            if attachments:
+                item["attachments"] = attachments
+            # Validate that the durable representation is JSON-safe before a
+            # receipt effect can commit.
+            json_dumps(item)
+            normalized.append(item)
+        return tuple(normalized)
+
+    @staticmethod
     def _command_receipt_from_row(
         row: sqlite3.Row | None, *, created: bool = False
     ) -> dict[str, Any] | None:
         if row is None:
             return None
+        raw_outcome = (
+            json_loads(row["outcome_json"], {})
+            if "outcome_json" in row.keys()
+            else {}
+        )
         return {
             "command_id": str(row["command_id"]),
             "channel": str(row["channel"]),
@@ -2522,11 +8687,24 @@ class SQLiteStore:
                     json_loads(row["presentation_ids_json"], []) or []
                 )
             ),
+            "response_fragments": SQLiteStore._normalize_command_response_fragments(
+                (json_loads(row["response_fragments_json"], []) or [])
+                if "response_fragments_json" in row.keys()
+                else ()
+            ),
+            "outcome": dict(raw_outcome)
+            if isinstance(raw_outcome, Mapping)
+            else {},
             "created": bool(created),
         }
 
     @staticmethod
     def _inbound_from_row(row: sqlite3.Row) -> InboundMessage:
+        received_at = _required_row_datetime(
+            row["received_at"],
+            label="inbound receipt",
+            identity=row["message_id"],
+        )
         return InboundMessage(
             channel=row["channel"],
             bot_id=row["bot_id"],
@@ -2537,7 +8715,7 @@ class SQLiteStore:
             source_sequence=row["source_sequence"],
             context_token=row["context_token"],
             payload=json_loads(row["payload_json"], {}) or {},
-            received_at=text_to_datetime(row["received_at"]),
+            received_at=received_at,
             message_id=row["message_id"],
             status=InboundState(row["status"]),
             task_id=row["task_id"],
@@ -3067,13 +9245,298 @@ class SQLiteStore:
 
     @staticmethod
     def _task_select_sql() -> str:
-        # Include the latest execution id in the row model without making the
-        # task table mutable whenever a new attempt is created.
-        return """SELECT t.*, (
-                    SELECT e.execution_id FROM task_executions e
-                    WHERE e.task_id = t.task_id ORDER BY e.attempt DESC LIMIT 1
-                ) AS execution_id
+        return """SELECT t.*, t.current_execution_id AS execution_id
                 FROM tasks t"""
+
+    @staticmethod
+    def _current_agent_incarnation_tx(
+        conn: sqlite3.Connection, agent_id: str, profile_version: int | None = None
+    ) -> int:
+        params: list[Any] = [str(agent_id)]
+        profile_clause = ""
+        if profile_version is not None:
+            profile_clause = " AND profile_version=?"
+            params.append(int(profile_version))
+        rows = conn.execute(
+            "SELECT agent_incarnation FROM agent_lifecycle WHERE agent_id=? "
+            "AND lifecycle_state!='tombstoned'" + profile_clause
+            + " ORDER BY agent_incarnation DESC",
+            params,
+        ).fetchall()
+        if len(rows) != 1:
+            raise StoreError(
+                f"Agent incarnation is not uniquely resolvable: {agent_id}"
+            )
+        return int(rows[0]["agent_incarnation"])
+
+    @classmethod
+    def _reserve_invocation_admission_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str,
+        agent_incarnation: int,
+        now: str,
+        max_agent_queue: int,
+        max_global_queue: int,
+    ) -> int:
+        conn.execute(
+            """INSERT INTO agent_admission_counters
+                   (agent_id,agent_incarnation,unfinished_count,
+                    next_ready_sequence,updated_at)
+               VALUES (?,?,0,1,?) ON CONFLICT DO NOTHING""",
+            (agent_id, int(agent_incarnation), now),
+        )
+        conn.execute(
+            """INSERT INTO global_agent_admission_counter
+                   (singleton,unfinished_count,updated_at) VALUES (1,0,?)
+               ON CONFLICT(singleton) DO NOTHING""",
+            (now,),
+        )
+        row = conn.execute(
+            "SELECT unfinished_count,next_ready_sequence "
+            "FROM agent_admission_counters "
+            "WHERE agent_id=? AND agent_incarnation=?",
+            (agent_id, int(agent_incarnation)),
+        ).fetchone()
+        if row is None:
+            raise StoreError("Agent admission counter is unavailable")
+        global_row = conn.execute(
+            "SELECT unfinished_count FROM global_agent_admission_counter "
+            "WHERE singleton=1"
+        ).fetchone()
+        if global_row is None:
+            raise StoreError("global Agent admission counter is unavailable")
+        if int(global_row["unfinished_count"]) >= int(max_global_queue):
+            raise QueueFullError("global", int(max_global_queue))
+        if int(row["unfinished_count"]) >= int(max_agent_queue):
+            raise QueueFullError("agent", int(max_agent_queue))
+        sequence = int(row["next_ready_sequence"])
+        conn.execute(
+            """UPDATE agent_admission_counters
+               SET unfinished_count=unfinished_count+1,
+                   next_ready_sequence=next_ready_sequence+1,updated_at=?
+               WHERE agent_id=? AND agent_incarnation=?""",
+            (now, agent_id, int(agent_incarnation)),
+        )
+        if conn.execute(
+            """UPDATE global_agent_admission_counter
+               SET unfinished_count=unfinished_count+1,updated_at=?
+               WHERE singleton=1 AND unfinished_count < ?""",
+            (now, int(max_global_queue)),
+        ).rowcount != 1:
+            # BEGIN IMMEDIATE serializes writers, so this can only mean the
+            # durable counter was corrupted or a future caller bypassed the
+            # admission check.  Roll the whole acceptance transaction back.
+            raise QueueFullError("global", int(max_global_queue))
+        return sequence
+
+    @classmethod
+    def _release_invocation_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        invocation_id: str,
+        state: str,
+        now: str,
+        last_error: str | None = None,
+    ) -> bool:
+        row = conn.execute(
+            "SELECT agent_id,agent_incarnation,admission_released_at "
+            "FROM agent_invocations WHERE invocation_id=?",
+            (invocation_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"invocation not found: {invocation_id}")
+        changed = conn.execute(
+            """UPDATE agent_invocations SET state=?,claimed_by=NULL,
+                   claim_token=NULL,lease_expires_at=NULL,
+                   admission_released_at=?,terminal_at=?,updated_at=?,
+                   last_error=COALESCE(?,last_error)
+               WHERE invocation_id=? AND admission_released_at IS NULL""",
+            (state, now, now, now, last_error, invocation_id),
+        ).rowcount
+        if changed == 0:
+            return False
+        if conn.execute(
+            """UPDATE agent_admission_counters
+               SET unfinished_count=unfinished_count-1,updated_at=?
+               WHERE agent_id=? AND agent_incarnation=?
+                 AND unfinished_count>0""",
+            (now, row["agent_id"], row["agent_incarnation"]),
+        ).rowcount != 1:
+            raise StoreError("Agent admission counter underflow")
+        if conn.execute(
+            """UPDATE global_agent_admission_counter
+               SET unfinished_count=unfinished_count-1,updated_at=?
+               WHERE singleton=1 AND unfinished_count>0""",
+            (now,),
+        ).rowcount != 1:
+            raise StoreError("global Agent admission counter underflow")
+        return True
+
+    @classmethod
+    def _expire_pending_mailboxes_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        now: str,
+    ) -> int:
+        """Terminalize every elapsed, never-dispatched mailbox exactly once."""
+
+        columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(agent_mailbox)"
+            ).fetchall()
+        }
+        if not {"current_invocation_id", "expires_at"}.issubset(columns):
+            # Migration fixtures can intentionally stop before schema v26/v28.
+            return 0
+        rows = conn.execute(
+            """SELECT mailbox_id,current_invocation_id
+                 FROM agent_mailbox
+                WHERE state='pending' AND expires_at<=?
+                ORDER BY expires_at,mailbox_id""",
+            (now,),
+        ).fetchall()
+        reason = "mailbox expired before dispatch"
+        for row in rows:
+            invocation_id = str(row["current_invocation_id"] or "")
+            if not invocation_id:
+                raise StoreError("expired mailbox lacks a current invocation")
+            changed = conn.execute(
+                """UPDATE agent_mailbox
+                      SET state='expired',processed_at=?,next_attempt_at=NULL,
+                          claimed_by=NULL,claim_token=NULL,
+                          lease_expires_at=NULL,
+                          last_error=COALESCE(last_error,?)
+                    WHERE mailbox_id=? AND state='pending' AND expires_at<=?""",
+                (now, reason, row["mailbox_id"], now),
+            ).rowcount
+            if changed != 1:
+                raise StoreError("mailbox expiry lost its aggregate fence")
+            if not cls._release_invocation_tx(
+                conn,
+                invocation_id=invocation_id,
+                state=InvocationState.FAILED.value,
+                now=now,
+                last_error=reason,
+            ):
+                raise StoreError(
+                    "expired mailbox invocation was already released"
+                )
+        return len(rows)
+
+    @classmethod
+    def _create_queued_task_invocation_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        task_id: str,
+        now: str,
+        max_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
+        max_global_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+    ) -> str:
+        task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if task is None:
+            raise StoreError("queued task disappeared before invocation creation")
+        existing = task["current_execution_id"]
+        if existing:
+            invocation = conn.execute(
+                "SELECT invocation_id FROM agent_invocations WHERE invocation_id=?",
+                (existing,),
+            ).fetchone()
+            if invocation is None:
+                raise StoreError("task current execution lacks invocation")
+            return str(existing)
+        attempt = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(attempt),0)+1 FROM task_executions WHERE task_id=?",
+                (task_id,),
+            ).fetchone()[0]
+        )
+        execution_id = _uuid()
+        sequence = cls._reserve_invocation_admission_tx(
+            conn,
+            agent_id=str(task["agent_id"]),
+            agent_incarnation=int(task["agent_incarnation"]),
+            now=now,
+            max_agent_queue=max_agent_queue,
+            max_global_queue=max_global_queue,
+        )
+        conn.execute(
+            """INSERT INTO task_executions
+                   (execution_id,task_id,attempt,agent_id,agent_incarnation,
+                    state,dispatch_backend,created_at,delivery_reply_scope_id)
+               VALUES (?,?,?,?,?,'queued','compatibility',?,?)""",
+            (
+                execution_id, task_id, attempt, task["agent_id"],
+                task["agent_incarnation"], now,
+                task["pending_delivery_reply_scope_id"],
+            ),
+        )
+        conn.execute(
+            """INSERT INTO agent_invocations
+                   (invocation_id,work_kind,work_id,agent_id,agent_incarnation,
+                    state,dispatch_backend,ready_sequence,task_id,execution_id,
+                    next_attempt_at,created_at,updated_at)
+               VALUES (?,'task',?,?,?,'queued','compatibility',?,?,?,?,?,?)""",
+            (
+                execution_id, execution_id, task["agent_id"],
+                task["agent_incarnation"], sequence, task_id, execution_id,
+                task["next_attempt_at"], now, now,
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET current_execution_id=? WHERE task_id=?",
+            (execution_id, task_id),
+        )
+        return execution_id
+
+    @classmethod
+    def _create_queued_mailbox_invocation_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        mailbox_id: str,
+        now: str,
+        max_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
+        max_global_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+    ) -> str:
+        row = conn.execute(
+            "SELECT * FROM agent_mailbox WHERE mailbox_id=?", (mailbox_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError("mailbox disappeared before invocation creation")
+        if row["current_invocation_id"]:
+            return str(row["current_invocation_id"])
+        invocation_id = _uuid()
+        sequence = cls._reserve_invocation_admission_tx(
+            conn,
+            agent_id=str(row["destination_agent_id"]),
+            agent_incarnation=int(row["destination_agent_incarnation"]),
+            now=now,
+            max_agent_queue=max_agent_queue,
+            max_global_queue=max_global_queue,
+        )
+        conn.execute(
+            """INSERT INTO agent_invocations
+                   (invocation_id,work_kind,work_id,agent_id,agent_incarnation,
+                    state,dispatch_backend,ready_sequence,mailbox_id,
+                    next_attempt_at,created_at,updated_at,expires_at)
+               VALUES (?,'mailbox',?,?,?,'queued','compatibility',?,?,?,?,?,?)""",
+            (
+                invocation_id, row["message_id"], row["destination_agent_id"],
+                row["destination_agent_incarnation"], sequence, mailbox_id,
+                row["next_attempt_at"], now, now, row["expires_at"],
+            ),
+        )
+        conn.execute(
+            "UPDATE agent_mailbox SET current_invocation_id=? WHERE mailbox_id=?",
+            (invocation_id, mailbox_id),
+        )
+        return invocation_id
 
     @classmethod
     def _fetch_task_tx(cls, conn: sqlite3.Connection, task_id: str) -> TaskRecord | None:
@@ -3474,6 +9937,55 @@ class SQLiteStore:
             return [cls._json_snapshot(item) for item in value]
         return value
 
+    @staticmethod
+    def _string_set_json_snapshot(value: Any) -> frozenset[str] | None:
+        """Decode one immutable set-valued JSON column without laundering it.
+
+        Profile ACL/capability values and Mode tool values are public
+        ``frozenset`` fields.  Older rows can therefore contain a different
+        JSON array order from the canonical order emitted by the current
+        dataclasses even though they describe the same immutable value.  Keep
+        accepting only arrays of strings; malformed JSON, objects, and mixed
+        arrays must still conflict rather than being treated as an empty set.
+        """
+
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(decoded, list) or not all(
+            isinstance(item, str) for item in decoded
+        ):
+            return None
+        return frozenset(decoded)
+
+    @classmethod
+    def _definition_metadata_equal(
+        cls,
+        column: str,
+        actual: Any,
+        expected: Any,
+    ) -> bool:
+        """Compare one Profile/Mode field according to its public semantics."""
+
+        if column in {
+            "capabilities_json",
+            "allowed_peers_json",
+            "denied_peers_json",
+            "allowed_request_types_json",
+            "denied_request_types_json",
+            "allowed_tools_json",
+            "denied_tools_json",
+        }:
+            actual_set = cls._string_set_json_snapshot(actual)
+            expected_set = cls._string_set_json_snapshot(expected)
+            return actual_set is not None and actual_set == expected_set
+        if column.endswith("_json"):
+            return cls._json_snapshot(json_loads(actual, [])) == cls._json_snapshot(
+                json_loads(expected, [])
+            )
+        return str(actual) == str(expected)
+
     @classmethod
     def _reply_target_snapshot(cls, value: Any) -> Any:
         """Canonicalize a reply target for durable identity checks.
@@ -3637,25 +10149,14 @@ class SQLiteStore:
             snapshot=canonical,
         )
 
-        def tool_set(value: Any) -> frozenset[str] | None:
-            try:
-                decoded = json.loads(value)
-            except (TypeError, ValueError):
-                return None
-            if not isinstance(decoded, list) or not all(
-                isinstance(item, str) for item in decoded
-            ):
-                return None
-            return frozenset(decoded)
-
         for column, expected in values.items():
             actual = row[column]
             if column == "sandbox_policy":
                 if str(actual or "") != "full_access":
                     return False
             elif column in {"allowed_tools_json", "denied_tools_json"}:
-                actual_tools = tool_set(actual)
-                expected_tools = tool_set(expected)
+                actual_tools = cls._string_set_json_snapshot(actual)
+                expected_tools = cls._string_set_json_snapshot(expected)
                 if actual_tools is None or actual_tools != expected_tools:
                     return False
             elif str(actual) != str(expected):
@@ -3685,12 +10186,9 @@ class SQLiteStore:
                 mismatches = []
                 for column, expected in values.items():
                     actual = row[column]
-                    if column.endswith("_json"):
-                        if cls._json_snapshot(json_loads(actual, [])) != cls._json_snapshot(
-                            json_loads(expected, [])
-                        ):
-                            mismatches.append(column)
-                    elif str(actual) != str(expected):
+                    if not cls._definition_metadata_equal(
+                        column, actual, expected
+                    ):
                         mismatches.append(column)
                 if mismatches:
                     if (
@@ -3766,12 +10264,9 @@ class SQLiteStore:
             if supplied:
                 for column, expected in values.items():
                     actual = row[column]
-                    if column.endswith("_json"):
-                        equal = cls._json_snapshot(json_loads(actual, [])) == cls._json_snapshot(
-                            json_loads(expected, [])
-                        )
-                    else:
-                        equal = str(actual) == str(expected)
+                    equal = cls._definition_metadata_equal(
+                        column, actual, expected
+                    )
                     if not equal:
                         if (
                             allow_legacy_seed_upgrade
@@ -3869,6 +10364,18 @@ class SQLiteStore:
             profile_version=int(profile_version),
             snapshot=profile_snapshot,
             now=now,
+        )
+        cls._project_profile_lifecycle_tx(
+            conn,
+            agent_id=agent_id,
+            profile_version=int(profile_version),
+            now_text=now,
+            source_kind="task_profile_materialization",
+            source_id=compound_id(
+                "agent-lifecycle-source",
+                ("task-profile", agent_id, int(profile_version)),
+            ),
+            provenance={"compatibility_path": "ensure_profile_mode"},
         )
         cls._ensure_mode_tx(
             conn,
@@ -3992,6 +10499,107 @@ class SQLiteStore:
         return conversation_id
 
     @staticmethod
+    def _role_snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        """Rebuild and verify one immutable session-role database row."""
+
+        try:
+            snapshot = build_role_snapshot(
+                role_version=row["role_version"],
+                normalization_version=str(row["normalization_version"]),
+                kind=str(row["kind"]),
+                normalized_content=row["normalized_content"],
+                persona_composition_version=str(
+                    row["persona_composition_version"]
+                ),
+            )
+        except RoleValidationError as exc:
+            raise StoreError("stored session role is invalid") from exc
+        if (
+            str(row["content_hash"] or "") != snapshot["content_hash"]
+            or str(row["snapshot_hash"] or "") != snapshot["snapshot_hash"]
+        ):
+            raise StoreError("stored session role hash conflicts")
+        return snapshot
+
+    @classmethod
+    def _task_role_snapshot_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        metadata: Any,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str,
+        agent_id: str,
+    ) -> dict[str, Any]:
+        """Validate a task's pinned role and its referenced immutable row.
+
+        Missing metadata is the v19 compatibility form and maps to the exact
+        implicit-default snapshot.  An explicit positive version must match
+        the role row in this task's user/session/Agent scope byte for byte.
+        """
+
+        metadata_map = metadata if isinstance(metadata, Mapping) else {}
+        if "session_role" not in metadata_map:
+            snapshot = dict(_IMPLICIT_DEFAULT_ROLE)
+        else:
+            raw = metadata_map["session_role"]
+            try:
+                snapshot = validate_role_snapshot(raw)
+            except RoleValidationError as exc:
+                raise StoreError("task session role snapshot is invalid") from exc
+        scope = (
+            str(channel or ""),
+            str(bot_id or ""),
+            str(external_user_id or ""),
+            str(session_id or "default"),
+            str(agent_id or ""),
+        )
+        if int(snapshot["role_version"]) == 0:
+            if snapshot != _IMPLICIT_DEFAULT_ROLE:
+                raise StoreError("task implicit session role conflicts")
+            conn.execute(
+                """INSERT OR IGNORE INTO session_agent_roles (
+                       channel, bot_id, external_user_id, session_id, agent_id,
+                       role_version, normalization_version, kind,
+                       normalized_content, content_hash,
+                       persona_composition_version, snapshot_hash,
+                       created_by, created_at
+                   ) VALUES (?, ?, ?, ?, ?, 0, ?, 'default', '', ?, ?, ?, NULL, NULL)""",
+                (
+                    *scope,
+                    snapshot["normalization_version"],
+                    snapshot["content_hash"],
+                    snapshot["persona_composition_version"],
+                    snapshot["snapshot_hash"],
+                ),
+            )
+            stored_row = conn.execute(
+                """SELECT * FROM session_agent_roles
+                   WHERE channel=? AND bot_id=? AND external_user_id=?
+                     AND session_id=? AND agent_id=? AND role_version=0""",
+                scope,
+            ).fetchone()
+            if stored_row is None or cls._role_snapshot_from_row(
+                stored_row
+            ) != snapshot:
+                raise StoreError("task implicit session role row conflicts")
+            return snapshot
+        row = conn.execute(
+            """SELECT * FROM session_agent_roles
+               WHERE channel=? AND bot_id=? AND external_user_id=?
+                 AND session_id=? AND agent_id=? AND role_version=?""",
+            (*scope, int(snapshot["role_version"])),
+        ).fetchone()
+        if row is None:
+            raise StoreError("task session role version is unavailable")
+        stored = cls._role_snapshot_from_row(row)
+        if stored != snapshot:
+            raise StoreError("task session role snapshot conflicts")
+        return snapshot
+
+    @staticmethod
     def _thread_binding_tx(
         conn: sqlite3.Connection,
         *,
@@ -3999,14 +10607,69 @@ class SQLiteStore:
         mode_id: str,
         profile_version: int,
         policy_version: int,
+        role_version: int = 0,
+        role_snapshot_hash: str = _IMPLICIT_DEFAULT_ROLE["snapshot_hash"],
+        persona_composition_version: str = ROLE_PERSONA_COMPOSITION_VERSION,
     ) -> str | None:
         row = conn.execute(
             """SELECT thread_id FROM thread_bindings
                WHERE conversation_id=? AND mode_id=? AND profile_version=?
-                 AND policy_version=?""",
-            (conversation_id, mode_id, int(profile_version), int(policy_version)),
+                 AND policy_version=? AND role_version=?
+                 AND role_snapshot_hash=?
+                 AND persona_composition_version=?""",
+            (
+                conversation_id,
+                mode_id,
+                int(profile_version),
+                int(policy_version),
+                int(role_version),
+                str(role_snapshot_hash),
+                str(persona_composition_version),
+            ),
         ).fetchone()
         return str(row["thread_id"]) if row is not None else None
+
+    @classmethod
+    def _resolve_task_thread_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        supplied_thread_id: Any,
+        conversation_id: str,
+        mode_id: str,
+        profile_version: int,
+        policy_version: int,
+        role_version: int,
+        role_snapshot_hash: str,
+        persona_composition_version: str,
+    ) -> str | None:
+        """Resolve only the provider thread durably bound to this exact task.
+
+        A task snapshot is not an authority to import an arbitrary provider
+        thread.  Explicit IDs are compatibility assertions and are accepted
+        only when the store already has the identical binding; unbound and
+        foreign IDs fail before the task can reach a runtime.
+        """
+
+        bound_thread_id = cls._thread_binding_tx(
+            conn,
+            conversation_id=conversation_id,
+            mode_id=mode_id,
+            profile_version=profile_version,
+            policy_version=policy_version,
+            role_version=role_version,
+            role_snapshot_hash=role_snapshot_hash,
+            persona_composition_version=persona_composition_version,
+        )
+        if supplied_thread_id:
+            supplied = str(supplied_thread_id)
+            if bound_thread_id is None:
+                raise StoreError(
+                    "explicit task thread is not bound to its exact context"
+                )
+            if supplied != bound_thread_id:
+                raise StoreError("explicit task thread binding conflicts")
+        return bound_thread_id
 
     @staticmethod
     def _transition_inbound_tx(
@@ -4633,12 +11296,28 @@ class SQLiteStore:
                     session_id=session_value,
                     now=now,
                 )
-                thread_id = task_snapshot.thread_id or self._thread_binding_tx(
+                role_snapshot = self._task_role_snapshot_tx(
                     conn,
+                    metadata=task_snapshot.metadata,
+                    channel=channel_value,
+                    bot_id=bot_value,
+                    external_user_id=user_value,
+                    session_id=session_value,
+                    agent_id=task_snapshot.agent_id,
+                )
+                role_version, role_hash, persona_version = role_binding_key(
+                    role_snapshot
+                )
+                thread_id = self._resolve_task_thread_tx(
+                    conn,
+                    supplied_thread_id=task_snapshot.thread_id,
                     conversation_id=conversation_id,
                     mode_id=task_snapshot.mode_id,
                     profile_version=task_snapshot.profile_version,
                     policy_version=task_snapshot.policy_version,
+                    role_version=role_version,
+                    role_snapshot_hash=role_hash,
+                    persona_composition_version=persona_version,
                 )
                 existing = self._fetch_task_by_dedupe_tx(conn, dedupe)
                 if existing is not None:
@@ -4771,16 +11450,21 @@ class SQLiteStore:
                     external_user_id=user_value,
                     session_id=session_value,
                 )
+                agent_incarnation = self._current_agent_incarnation_tx(
+                    conn,
+                    task_snapshot.agent_id,
+                    int(task_snapshot.profile_version),
+                )
                 conn.execute(
                     """INSERT INTO tasks
                        (task_id, dedupe_key, inbound_message_id, channel, bot_id,
-                        external_user_id, session_id, agent_id, conversation_id,
+                        external_user_id, session_id, agent_id, agent_incarnation, conversation_id,
                         thread_id, mode_id, profile_version, policy_version,
                         model, reasoning_effort, reply_target_json, inputs_json,
                         metadata_json,
                         state, attempts, next_attempt_at, parent_task_id,
                         child_depth, request_id, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                'queued', 0, ?, ?, ?, ?, ?, ?)""",
                     (
                         task_id,
@@ -4791,6 +11475,7 @@ class SQLiteStore:
                         user_value,
                         session_value,
                         task_snapshot.agent_id,
+                        agent_incarnation,
                         conversation_id,
                         thread_id,
                         task_snapshot.mode_id,
@@ -4841,6 +11526,13 @@ class SQLiteStore:
                     task_id=task_id,
                     inputs=task_snapshot.inputs,
                     created_at=now,
+                )
+                self._create_queued_task_invocation_tx(
+                    conn,
+                    task_id=task_id,
+                    now=now,
+                    max_agent_queue=self.max_agent_queue,
+                    max_global_queue=self.max_global_queue,
                 )
                 created = self._fetch_task_tx(conn, task_id)
                 if created is None:
@@ -4977,6 +11669,11 @@ class SQLiteStore:
         command_values: Mapping[str, Any] = (
             command_snapshot if isinstance(command_snapshot, Mapping) else {}
         )
+        synthetic_command_name = str(
+            command_values.get("synthetic_command_name") or ""
+        )
+        if synthetic_command_name not in {"", "__queue_full__"}:
+            raise StoreError("unsupported synthetic command snapshot")
         candidate_route_values: Mapping[str, Any] = (
             candidate_specs[0] if candidate_specs else {}
         )
@@ -5346,12 +12043,28 @@ class SQLiteStore:
                     session_id=session_value,
                     now=now,
                 )
-                thread_id = snapshot.thread_id or self._thread_binding_tx(
+                role_snapshot = self._task_role_snapshot_tx(
                     conn,
+                    metadata=snapshot.metadata,
+                    channel=channel_value,
+                    bot_id=bot_value,
+                    external_user_id=user_value,
+                    session_id=session_value,
+                    agent_id=snapshot.agent_id,
+                )
+                role_version, role_hash, persona_version = role_binding_key(
+                    role_snapshot
+                )
+                thread_id = self._resolve_task_thread_tx(
+                    conn,
+                    supplied_thread_id=snapshot.thread_id,
                     conversation_id=conversation_id,
                     mode_id=snapshot.mode_id,
                     profile_version=snapshot.profile_version,
                     policy_version=snapshot.policy_version,
+                    role_version=role_version,
+                    role_snapshot_hash=role_hash,
+                    persona_composition_version=persona_version,
                 )
                 dedupe = snapshot.dedupe_key or f"inbound:{persisted.message_id}"
                 existing = self._fetch_task_by_dedupe_tx(conn, dedupe)
@@ -5386,20 +12099,24 @@ class SQLiteStore:
                         external_user_id=persisted.external_user_id,
                         session_id=persisted.session_id,
                     )
+                    agent_incarnation = self._current_agent_incarnation_tx(
+                        conn, snapshot.agent_id, int(snapshot.profile_version)
+                    )
                     conn.execute(
                         """INSERT INTO tasks
                            (task_id, dedupe_key, inbound_message_id, channel, bot_id,
-                            external_user_id, session_id, agent_id, conversation_id,
+                            external_user_id, session_id, agent_id, agent_incarnation, conversation_id,
                             thread_id, mode_id, profile_version, policy_version,
                             model, reasoning_effort, reply_target_json, inputs_json,
                             metadata_json,
                             state, attempts, next_attempt_at, parent_task_id,
                             child_depth, request_id, created_at, updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                    'queued', 0, ?, ?, ?, ?, ?, ?)""",
                         (
                             task_id, dedupe, persisted.message_id, channel_value,
                             bot_value, user_value, session_value, snapshot.agent_id,
+                            agent_incarnation,
                             conversation_id, thread_id, snapshot.mode_id,
                             int(snapshot.profile_version), int(snapshot.policy_version),
                             snapshot.model, snapshot.reasoning_effort,
@@ -5437,6 +12154,13 @@ class SQLiteStore:
                         self._update_child_counter_tx(
                             conn, child_parent_id, now=now
                         )
+                    self._create_queued_task_invocation_tx(
+                        conn,
+                        task_id=task_id,
+                        now=now,
+                        max_agent_queue=self.max_agent_queue,
+                        max_global_queue=self.max_global_queue,
+                    )
                     existing = self._fetch_task_tx(conn, task_id)
                     return InboundAcceptance(
                         self._inbound_from_row(
@@ -5646,6 +12370,1693 @@ class SQLiteStore:
 
     get_task_execution = get_execution
 
+    async def get_agent_invocation(
+        self, invocation_id: str
+    ) -> AgentInvocationRecord | None:
+        return await self._call(
+            lambda conn: self._invocation_from_row(
+                conn.execute(
+                    "SELECT * FROM agent_invocations WHERE invocation_id=?",
+                    (str(invocation_id),),
+                ).fetchone()
+            )
+        )
+
+    async def list_agent_invocations(
+        self,
+        *,
+        agent_id: str | None = None,
+        agent_incarnation: int | None = None,
+        state: InvocationState | str | None = None,
+        work_kind: InvocationWorkKind | str | None = None,
+        limit: int = 100,
+    ) -> list[AgentInvocationRecord]:
+        filters: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("agent_id", agent_id),
+            ("agent_incarnation", agent_incarnation),
+            ("state", _enum_value(state) if state is not None else None),
+            ("work_kind", _enum_value(work_kind) if work_kind is not None else None),
+        ):
+            if value is not None:
+                filters.append(f"{column}=?")
+                params.append(value)
+        where = " WHERE " + " AND ".join(filters) if filters else ""
+        params.append(max(0, int(limit)))
+        return await self._call(
+            lambda conn: [
+                item
+                for row in conn.execute(
+                    "SELECT * FROM agent_invocations" + where
+                    + " ORDER BY created_at,invocation_id LIMIT ?",
+                    params,
+                ).fetchall()
+                if (item := self._invocation_from_row(row)) is not None
+            ]
+        )
+
+    async def list_agent_invocation_events(
+        self,
+        invocation_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[AgentInvocationEventRecord]:
+        invocation_value = self._process_required_text(
+            invocation_id,
+            "invocation_id",
+        )
+        return await self._call(
+            lambda conn: [
+                event
+                for row in conn.execute(
+                    "SELECT * FROM agent_invocation_events "
+                    "WHERE invocation_id=? ORDER BY event_sequence LIMIT ?",
+                    (invocation_value, max(0, int(limit))),
+                ).fetchall()
+                if (event := self._invocation_event_from_row(row)) is not None
+            ]
+        )
+
+    async def get_agent_admission_counter(
+        self,
+        agent_id: str,
+        agent_incarnation: int,
+    ) -> AgentAdmissionCounterRecord | None:
+        """Read the exact per-incarnation admission debit and sequence."""
+
+        agent_value = self._process_required_text(agent_id, "agent_id")
+        incarnation_value = self._process_positive_integer(
+            agent_incarnation,
+            "agent_incarnation",
+        )
+        return await self._call(
+            lambda conn: self._agent_admission_counter_from_row(
+                conn.execute(
+                    "SELECT * FROM agent_admission_counters "
+                    "WHERE agent_id=? AND agent_incarnation=?",
+                    (agent_value, incarnation_value),
+                ).fetchone()
+            )
+        )
+
+    async def list_agent_admission_counters(
+        self,
+        *,
+        agent_id: str | None = None,
+        agent_incarnation: int | None = None,
+    ) -> list[AgentAdmissionCounterRecord]:
+        """List per-incarnation admission counters in deterministic order."""
+
+        if agent_incarnation is not None and agent_id is None:
+            raise ValueError("agent_id is required with agent_incarnation")
+        agent_value = (
+            self._process_required_text(agent_id, "agent_id")
+            if agent_id is not None
+            else None
+        )
+        incarnation_value = (
+            self._process_positive_integer(
+                agent_incarnation,
+                "agent_incarnation",
+            )
+            if agent_incarnation is not None
+            else None
+        )
+
+        def op(conn: sqlite3.Connection) -> list[AgentAdmissionCounterRecord]:
+            predicates: list[str] = []
+            parameters: list[Any] = []
+            if agent_value is not None:
+                predicates.append("agent_id=?")
+                parameters.append(agent_value)
+            if incarnation_value is not None:
+                predicates.append("agent_incarnation=?")
+                parameters.append(incarnation_value)
+            sql = "SELECT * FROM agent_admission_counters"
+            if predicates:
+                sql += " WHERE " + " AND ".join(predicates)
+            sql += " ORDER BY agent_id,agent_incarnation"
+            return [
+                record
+                for row in conn.execute(sql, parameters).fetchall()
+                if (
+                    record := self._agent_admission_counter_from_row(row)
+                )
+                is not None
+            ]
+
+        return await self._call(op)
+
+    async def get_global_agent_admission_counter(
+        self,
+    ) -> GlobalAgentAdmissionCounterRecord | None:
+        """Read the singleton account-wide unfinished invocation debit."""
+
+        return await self._call(
+            lambda conn: self._global_agent_admission_counter_from_row(
+                conn.execute(
+                    "SELECT * FROM global_agent_admission_counter "
+                    "WHERE singleton=1"
+                ).fetchone()
+            )
+        )
+
+    async def get_agent_execution_slot(
+        self,
+        slot_id: str,
+    ) -> AgentExecutionSlotRecord | None:
+        """Read one retained shared-slot acquisition by stable identity."""
+
+        slot_value = self._process_required_text(slot_id, "slot_id")
+        return await self._call(
+            lambda conn: self._agent_execution_slot_from_row(
+                conn.execute(
+                    "SELECT * FROM agent_execution_slots WHERE slot_id=?",
+                    (slot_value,),
+                ).fetchone()
+            )
+        )
+
+    async def get_active_agent_execution_slot(
+        self,
+        agent_id: str,
+        agent_incarnation: int,
+    ) -> AgentExecutionSlotRecord | None:
+        """Read the unique active shared slot for an exact Agent incarnation."""
+
+        agent_value = self._process_required_text(agent_id, "agent_id")
+        incarnation_value = self._process_positive_integer(
+            agent_incarnation,
+            "agent_incarnation",
+        )
+        return await self._call(
+            lambda conn: self._agent_execution_slot_from_row(
+                conn.execute(
+                    "SELECT * FROM agent_execution_slots "
+                    "WHERE agent_id=? AND agent_incarnation=? AND state='active'",
+                    (agent_value, incarnation_value),
+                ).fetchone()
+            )
+        )
+
+    async def list_agent_execution_slots(
+        self,
+        *,
+        agent_id: str | None = None,
+        agent_incarnation: int | None = None,
+        state: ExecutionSlotState | str | None = None,
+        slot_kind: ExecutionSlotKind | str | None = None,
+        invocation_id: str | None = None,
+        worker_generation: int | None = None,
+        limit: int = 100,
+    ) -> list[AgentExecutionSlotRecord]:
+        """List retained slots without exposing a non-atomic slot mutator."""
+
+        if agent_incarnation is not None and agent_id is None:
+            raise ValueError("agent_id is required with agent_incarnation")
+        agent_value = (
+            self._process_required_text(agent_id, "agent_id")
+            if agent_id is not None
+            else None
+        )
+        incarnation_value = (
+            self._process_positive_integer(
+                agent_incarnation,
+                "agent_incarnation",
+            )
+            if agent_incarnation is not None
+            else None
+        )
+        state_value = (
+            ExecutionSlotState(_enum_value(state)).value
+            if state is not None
+            else None
+        )
+        kind_value = (
+            ExecutionSlotKind(_enum_value(slot_kind)).value
+            if slot_kind is not None
+            else None
+        )
+        invocation_value = (
+            self._process_required_text(invocation_id, "invocation_id")
+            if invocation_id is not None
+            else None
+        )
+        generation_value = (
+            self._process_positive_integer(
+                worker_generation,
+                "worker_generation",
+            )
+            if worker_generation is not None
+            else None
+        )
+
+        def op(conn: sqlite3.Connection) -> list[AgentExecutionSlotRecord]:
+            predicates: list[str] = []
+            parameters: list[Any] = []
+            for column, value in (
+                ("agent_id", agent_value),
+                ("agent_incarnation", incarnation_value),
+                ("state", state_value),
+                ("slot_kind", kind_value),
+                ("invocation_id", invocation_value),
+                ("worker_generation", generation_value),
+            ):
+                if value is not None:
+                    predicates.append(f"{column}=?")
+                    parameters.append(value)
+            sql = "SELECT * FROM agent_execution_slots"
+            if predicates:
+                sql += " WHERE " + " AND ".join(predicates)
+            sql += (
+                " ORDER BY agent_id,agent_incarnation,slot_sequence,slot_id "
+                "LIMIT ?"
+            )
+            parameters.append(max(0, int(limit)))
+            return [
+                record
+                for row in conn.execute(sql, parameters).fetchall()
+                if (record := self._agent_execution_slot_from_row(row))
+                is not None
+            ]
+
+        return await self._call(op)
+
+    async def get_agent_dispatch_attempt(
+        self,
+        dispatch_attempt_id: str,
+    ) -> AgentDispatchAttemptRecord | None:
+        """Read one immutable dispatch attempt and its decision evidence."""
+
+        attempt_value = self._process_required_text(
+            dispatch_attempt_id,
+            "dispatch_attempt_id",
+        )
+        return await self._call(
+            lambda conn: self._agent_dispatch_attempt_from_row(
+                conn.execute(
+                    "SELECT * FROM agent_dispatch_attempts "
+                    "WHERE dispatch_attempt_id=?",
+                    (attempt_value,),
+                ).fetchone()
+            )
+        )
+
+    async def list_agent_dispatch_attempts(
+        self,
+        *,
+        invocation_id: str | None = None,
+        slot_id: str | None = None,
+        agent_id: str | None = None,
+        agent_incarnation: int | None = None,
+        worker_generation: int | None = None,
+        supervisor_epoch: int | None = None,
+        limit: int = 100,
+    ) -> list[AgentDispatchAttemptRecord]:
+        """List dispatch attempts and cleanup evidence in creation order."""
+
+        if agent_incarnation is not None and agent_id is None:
+            raise ValueError("agent_id is required with agent_incarnation")
+        invocation_value = (
+            self._process_required_text(invocation_id, "invocation_id")
+            if invocation_id is not None
+            else None
+        )
+        slot_value = (
+            self._process_required_text(slot_id, "slot_id")
+            if slot_id is not None
+            else None
+        )
+        agent_value = (
+            self._process_required_text(agent_id, "agent_id")
+            if agent_id is not None
+            else None
+        )
+        incarnation_value = (
+            self._process_positive_integer(
+                agent_incarnation,
+                "agent_incarnation",
+            )
+            if agent_incarnation is not None
+            else None
+        )
+        generation_value = (
+            self._process_positive_integer(
+                worker_generation,
+                "worker_generation",
+            )
+            if worker_generation is not None
+            else None
+        )
+        epoch_value = (
+            self._process_positive_integer(
+                supervisor_epoch,
+                "supervisor_epoch",
+            )
+            if supervisor_epoch is not None
+            else None
+        )
+
+        def op(conn: sqlite3.Connection) -> list[AgentDispatchAttemptRecord]:
+            predicates: list[str] = []
+            parameters: list[Any] = []
+            for column, value in (
+                ("invocation_id", invocation_value),
+                ("slot_id", slot_value),
+                ("agent_id", agent_value),
+                ("agent_incarnation", incarnation_value),
+                ("worker_generation", generation_value),
+                ("supervisor_epoch", epoch_value),
+            ):
+                if value is not None:
+                    predicates.append(f"{column}=?")
+                    parameters.append(value)
+            sql = "SELECT * FROM agent_dispatch_attempts"
+            if predicates:
+                sql += " WHERE " + " AND ".join(predicates)
+            sql += " ORDER BY created_at,dispatch_attempt_id LIMIT ?"
+            parameters.append(max(0, int(limit)))
+            return [
+                record
+                for row in conn.execute(sql, parameters).fetchall()
+                if (record := self._agent_dispatch_attempt_from_row(row))
+                is not None
+            ]
+
+        return await self._call(op)
+
+    async def reserve_next_agent_invocation(
+        self,
+        *,
+        agent_id: str,
+        agent_incarnation: int,
+        worker_generation: int,
+        supervisor_epoch: int,
+        owner_instance_id: str,
+        generation_capability: str | bytes,
+        process_lease_identity: str,
+        process_lease_token: str | bytes,
+        dispatcher_id: str,
+        dispatch_attempt_id: str,
+        slot_id: str,
+        claim_token: str,
+        lease_identity: str,
+        lease_expires_at: datetime | str,
+        invocation_job_identity: str,
+        now: datetime | str | None = None,
+    ) -> AgentDispatchReservation | None:
+        """Atomically reserve one child slot and its lowest runnable work.
+
+        This is a store primitive only.  It does not send ``ASSIGN`` or make
+        the child runtime callable; the durable attempt remains pre-grant.
+        Stable caller-supplied identities make a lost transaction response
+        replayable without allocating a second slot or attempt.
+        """
+
+        agent_value = self._process_required_text(agent_id, "agent_id")
+        incarnation_value = self._process_positive_integer(
+            agent_incarnation, "agent_incarnation"
+        )
+        generation_value = self._process_positive_integer(
+            worker_generation, "worker_generation"
+        )
+        epoch_value = self._process_positive_integer(
+            supervisor_epoch, "supervisor_epoch"
+        )
+        owner_value = self._process_required_text(
+            owner_instance_id, "owner_instance_id"
+        )
+        process_lease_value = self._process_required_text(
+            process_lease_identity, "process_lease_identity"
+        )
+        dispatcher_value = self._process_required_text(
+            dispatcher_id, "dispatcher_id"
+        )
+        attempt_value = self._process_required_text(
+            dispatch_attempt_id, "dispatch_attempt_id"
+        )
+        slot_value = self._process_required_text(slot_id, "slot_id")
+        claim_value = self._process_required_text(
+            claim_token, "claim_token", max_length=4096
+        )
+        claim_hash = self._process_secret_hash(claim_value, "claim_token")
+        lease_value = self._process_required_text(
+            lease_identity, "lease_identity"
+        )
+        job_value = self._process_required_text(
+            invocation_job_identity, "invocation_job_identity"
+        )
+        created_was_supplied = now is not None
+        created_text, created_time = self._process_timestamp(
+            self.clock() if now is None else now,
+            "now",
+        )
+        lease_text, lease_time = self._process_timestamp(
+            lease_expires_at,
+            "lease_expires_at",
+        )
+        if lease_time <= created_time:
+            raise ValueError("dispatch lease must expire after reservation")
+        domain_identities = {
+            attempt_value,
+            slot_value,
+            lease_value,
+            job_value,
+            process_lease_value,
+        }
+        if len(domain_identities) != 5:
+            raise ValueError("dispatch domain identities must be distinct")
+
+        def op(conn: sqlite3.Connection) -> AgentDispatchReservation | None:
+            with _transaction(conn):
+                epoch = self._require_active_supervisor_epoch_tx(
+                    conn,
+                    supervisor_epoch=epoch_value,
+                    owner_instance_id=owner_value,
+                )
+                process = self._agent_process_row_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                    worker_generation=generation_value,
+                )
+                self._validate_agent_process_secret_fences(
+                    process,
+                    expected_supervisor_epoch=epoch_value,
+                    process_lease_identity=process_lease_value,
+                    process_lease_token=process_lease_token,
+                    generation_capability=generation_capability,
+                )
+
+                existing = conn.execute(
+                    "SELECT * FROM agent_dispatch_attempts "
+                    "WHERE dispatch_attempt_id=?",
+                    (attempt_value,),
+                ).fetchone()
+                if existing is not None:
+                    attempt, slot, invocation = (
+                        self._require_dispatch_attempt_fences_tx(
+                            conn,
+                            dispatch_attempt_id=attempt_value,
+                            invocation_id=str(existing["invocation_id"]),
+                            slot_id=slot_value,
+                            agent_id=agent_value,
+                            agent_incarnation=incarnation_value,
+                            worker_generation=generation_value,
+                            supervisor_epoch=epoch_value,
+                            claim_token_hash=claim_hash,
+                            lease_identity=lease_value,
+                            invocation_job_identity=job_value,
+                        )
+                    )
+                    conflicts: list[str] = []
+                    if str(attempt["lease_expires_at"]) != lease_text:
+                        conflicts.append("lease_expires_at")
+                    if created_was_supplied and str(attempt["created_at"]) != created_text:
+                        conflicts.append("created_at")
+                    if str(slot["state"]) != ExecutionSlotState.ACTIVE.value:
+                        conflicts.append("slot_state")
+                    if str(invocation["state"]) != InvocationState.DISPATCHING.value:
+                        conflicts.append("invocation_state")
+                    if str(invocation["claimed_by"] or "") != dispatcher_value:
+                        conflicts.append("dispatcher_id")
+                    stored_claim = str(invocation["claim_token"] or "")
+                    if not hmac.compare_digest(stored_claim, claim_value):
+                        conflicts.append("claim_token")
+                    if any(
+                        attempt[column] is not None
+                        for column in (
+                            "grant_issued_at",
+                            "abort_committed_at",
+                            "rejection_committed_at",
+                        )
+                    ):
+                        conflicts.append("decision")
+                    if str(process["observed_state"]) != AgentProcessState.BUSY.value:
+                        conflicts.append("process_state")
+                    if conflicts:
+                        raise StoreError(
+                            "Agent dispatch reservation replay conflicts: "
+                            + ", ".join(conflicts)
+                        )
+                    return self._dispatch_reservation_from_attempt_tx(
+                        conn,
+                        attempt=attempt,
+                        claim_token=claim_value,
+                        replayed=True,
+                    )
+
+                identity_collision = conn.execute(
+                    """SELECT dispatch_attempt_id FROM agent_dispatch_attempts
+                       WHERE slot_id=? OR lease_identity=?
+                          OR invocation_job_identity=? LIMIT 1""",
+                    (slot_value, lease_value, job_value),
+                ).fetchone()
+                if identity_collision is not None or conn.execute(
+                    "SELECT 1 FROM agent_execution_slots WHERE slot_id=?",
+                    (slot_value,),
+                ).fetchone() is not None:
+                    raise StoreError("Agent dispatch identity is already in use")
+
+                self._require_enabled_agent_lifecycle_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                )
+                if str(process["observed_state"]) != AgentProcessState.READY.value:
+                    return None
+                if process["ready_at"] is None or process["handshake_committed_at"] is None:
+                    raise StoreError("READY Agent process lacks handshake evidence")
+                process_expiry = text_to_datetime(process["lease_expires_at"])
+                if process_expiry is None or process_expiry <= created_time:
+                    raise InvalidTransition("Agent process lease has expired")
+                if lease_time > process_expiry:
+                    raise ValueError("dispatch lease exceeds Agent process lease")
+                ready_time = text_to_datetime(process["ready_at"])
+                epoch_time = text_to_datetime(epoch["started_at"])
+                if ready_time is None or created_time < ready_time:
+                    raise ValueError("dispatch reservation predates child READY")
+                if epoch_time is None or created_time < epoch_time:
+                    raise ValueError("dispatch reservation predates supervisor epoch")
+                if conn.execute(
+                    """SELECT 1 FROM agent_execution_slots
+                       WHERE agent_id=? AND agent_incarnation=?
+                         AND state='active' LIMIT 1""",
+                    (agent_value, incarnation_value),
+                ).fetchone() is not None:
+                    return None
+                if conn.execute(
+                    """SELECT 1 FROM agent_invocations
+                       WHERE agent_id=? AND agent_incarnation=?
+                         AND state IN ('dispatching','running','cancel_requested')
+                       LIMIT 1""",
+                    (agent_value, incarnation_value),
+                ).fetchone() is not None:
+                    return None
+
+                invocation = conn.execute(
+                    """SELECT ai.* FROM agent_invocations AS ai
+                       WHERE ai.agent_id=? AND ai.agent_incarnation=?
+                         AND ai.state='queued'
+                         AND ai.dispatch_backend='child'
+                         AND (ai.next_attempt_at IS NULL
+                              OR ai.next_attempt_at<=?)
+                         AND (
+                           (
+                             ai.work_kind='task'
+                             AND EXISTS (
+                               SELECT 1 FROM tasks AS t
+                               JOIN task_executions AS te
+                                 ON te.execution_id=ai.invocation_id
+                                AND te.task_id=t.task_id
+                                AND te.agent_id=t.agent_id
+                                AND te.agent_incarnation=t.agent_incarnation
+                                AND te.dispatch_backend=ai.dispatch_backend
+                              WHERE t.task_id=ai.task_id
+                                AND t.current_execution_id=ai.invocation_id
+                                AND t.agent_id=ai.agent_id
+                                AND t.agent_incarnation=ai.agent_incarnation
+                                AND t.state='queued' AND te.state='queued'
+                                AND (t.next_attempt_at IS NULL
+                                     OR t.next_attempt_at<=?)
+                                AND NOT EXISTS (
+                                  SELECT 1 FROM attachment_refs AS ar
+                                  LEFT JOIN attachments AS a
+                                    ON a.attachment_id=ar.attachment_id
+                                 WHERE ar.owner_kind='task'
+                                   AND ar.owner_id=t.task_id
+                                   AND (a.attachment_id IS NULL
+                                        OR a.state<>'ready')
+                                )
+                             )
+                           )
+                           OR (
+                             ai.work_kind='mailbox'
+                             AND EXISTS (
+                               SELECT 1 FROM agent_mailbox AS m
+                                WHERE m.mailbox_id=ai.mailbox_id
+                                  AND m.current_invocation_id=ai.invocation_id
+                                  AND m.message_id=ai.work_id
+                                  AND m.destination_agent_id=ai.agent_id
+                                  AND m.destination_agent_incarnation=
+                                      ai.agent_incarnation
+                                  AND m.state='pending'
+                                  AND m.expires_at>?
+                                  AND ai.expires_at=m.expires_at
+                                  AND (m.next_attempt_at IS NULL
+                                       OR m.next_attempt_at<=?)
+                             )
+                           )
+                         )
+                       ORDER BY ai.ready_sequence,ai.invocation_id LIMIT 1""",
+                    (
+                        agent_value,
+                        incarnation_value,
+                        created_text,
+                        created_text,
+                        created_text,
+                        created_text,
+                    ),
+                ).fetchone()
+                if invocation is None:
+                    return None
+                invocation_id = str(invocation["invocation_id"])
+                if invocation_id in domain_identities:
+                    raise StoreError("dispatch identity aliases invocation identity")
+
+                work_kind = InvocationWorkKind(str(invocation["work_kind"]))
+                if work_kind is InvocationWorkKind.TASK:
+                    if conn.execute(
+                        """UPDATE tasks SET state='dispatching',claimed_by=?,
+                                  claim_token=?,lease_expires_at=?,attempts=attempts+1,
+                                  next_attempt_at=NULL,updated_at=?
+                           WHERE task_id=? AND current_execution_id=?
+                             AND agent_id=? AND agent_incarnation=?
+                             AND state='queued'""",
+                        (
+                            dispatcher_value,
+                            claim_value,
+                            lease_text,
+                            created_text,
+                            invocation["task_id"],
+                            invocation_id,
+                            agent_value,
+                            incarnation_value,
+                        ),
+                    ).rowcount != 1:
+                        raise StoreError("task dispatch projection lost its queue fence")
+                    if conn.execute(
+                        """UPDATE task_executions
+                           SET state='dispatching',
+                               worker_id=?,claim_token=?,lease_expires_at=?
+                           WHERE execution_id=? AND task_id=?
+                             AND agent_id=? AND agent_incarnation=?
+                             AND state='queued' AND dispatch_backend='child'""",
+                        (
+                            dispatcher_value,
+                            claim_value,
+                            lease_text,
+                            invocation_id,
+                            invocation["task_id"],
+                            agent_value,
+                            incarnation_value,
+                        ),
+                    ).rowcount != 1:
+                        raise StoreError("task execution lost its dispatch fence")
+                else:
+                    mailbox = conn.execute(
+                        "SELECT * FROM agent_mailbox WHERE mailbox_id=?",
+                        (invocation["mailbox_id"],),
+                    ).fetchone()
+                    if mailbox is None or not self._legacy_mailbox_snapshot_complete_v26(
+                        conn,
+                        json_loads(mailbox["execution_snapshot_json"], None),
+                        destination_agent_id=agent_value,
+                        request_id=str(mailbox["request_id"]),
+                    ):
+                        raise StoreError(
+                            "mailbox dispatch snapshot is incomplete or ambiguous"
+                        )
+                    if conn.execute(
+                        """UPDATE agent_mailbox
+                           SET state='dispatching',claimed_by=?,claim_token=?,
+                               lease_expires_at=?,attempts=attempts+1,
+                               next_attempt_at=NULL
+                           WHERE mailbox_id=? AND current_invocation_id=?
+                             AND destination_agent_id=?
+                             AND destination_agent_incarnation=?
+                             AND expires_at=? AND state='pending'""",
+                        (
+                            dispatcher_value,
+                            claim_value,
+                            lease_text,
+                            invocation["mailbox_id"],
+                            invocation_id,
+                            agent_value,
+                            incarnation_value,
+                            invocation["expires_at"],
+                        ),
+                    ).rowcount != 1:
+                        raise StoreError("mailbox dispatch projection lost its queue fence")
+
+                if conn.execute(
+                    """UPDATE agent_invocations
+                       SET state='dispatching',
+                           claimed_by=?,claim_token=?,lease_expires_at=?,
+                           next_attempt_at=NULL,updated_at=?
+                       WHERE invocation_id=? AND agent_id=?
+                         AND agent_incarnation=? AND state='queued'
+                         AND dispatch_backend='child'""",
+                    (
+                        dispatcher_value,
+                        claim_value,
+                        lease_text,
+                        created_text,
+                        invocation_id,
+                        agent_value,
+                        incarnation_value,
+                    ),
+                ).rowcount != 1:
+                    raise StoreError("Agent invocation lost its dispatch fence")
+                if conn.execute(
+                    """UPDATE agent_processes SET observed_state='busy'
+                       WHERE agent_id=? AND agent_incarnation=?
+                         AND worker_generation=? AND supervisor_epoch=?
+                         AND observed_state='ready'""",
+                    (
+                        agent_value,
+                        incarnation_value,
+                        generation_value,
+                        epoch_value,
+                    ),
+                ).rowcount != 1:
+                    raise StoreError("Agent process lost its READY dispatch fence")
+
+                slot_sequence = int(
+                    conn.execute(
+                        """SELECT COALESCE(MAX(slot_sequence),0)+1
+                           FROM agent_execution_slots
+                           WHERE agent_id=? AND agent_incarnation=?""",
+                        (agent_value, incarnation_value),
+                    ).fetchone()[0]
+                )
+                conn.execute(
+                    """INSERT INTO agent_execution_slots (
+                           slot_id,agent_id,agent_incarnation,slot_sequence,
+                           slot_kind,state,dispatch_backend,invocation_id,
+                           worker_generation,acquired_at)
+                       VALUES (?,?,?,?,'invocation','active','child',?,?,?)""",
+                    (
+                        slot_value,
+                        agent_value,
+                        incarnation_value,
+                        slot_sequence,
+                        invocation_id,
+                        generation_value,
+                        created_text,
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO agent_dispatch_attempts (
+                           dispatch_attempt_id,invocation_id,slot_id,agent_id,
+                           agent_incarnation,worker_generation,supervisor_epoch,
+                           dispatch_backend,claim_token_hash,lease_identity,
+                           lease_expires_at,invocation_job_identity,created_at)
+                       VALUES (?,?,?,?,?,?,?,'child',?,?,?,?,?)""",
+                    (
+                        attempt_value,
+                        invocation_id,
+                        slot_value,
+                        agent_value,
+                        incarnation_value,
+                        generation_value,
+                        epoch_value,
+                        claim_hash,
+                        lease_value,
+                        lease_text,
+                        job_value,
+                        created_text,
+                    ),
+                )
+                attempt = conn.execute(
+                    "SELECT * FROM agent_dispatch_attempts "
+                    "WHERE dispatch_attempt_id=?",
+                    (attempt_value,),
+                ).fetchone()
+                if attempt is None:  # pragma: no cover - INSERT just succeeded.
+                    raise StoreError("Agent dispatch attempt disappeared")
+                return self._dispatch_reservation_from_attempt_tx(
+                    conn,
+                    attempt=attempt,
+                    claim_token=claim_value,
+                    replayed=False,
+                )
+
+        return await self._call(op)
+
+    begin_agent_dispatch = reserve_next_agent_invocation
+    claim_next_agent_invocation = reserve_next_agent_invocation
+
+    async def _commit_agent_dispatch_pregrant_decision(
+        self,
+        *,
+        decision_kind: DispatchDecisionKind,
+        agent_id: str,
+        agent_incarnation: int,
+        worker_generation: int,
+        supervisor_epoch: int,
+        owner_instance_id: str,
+        generation_capability: str | bytes,
+        process_lease_identity: str,
+        process_lease_token: str | bytes,
+        dispatch_attempt_id: str,
+        invocation_id: str,
+        slot_id: str,
+        claim_token: str,
+        lease_identity: str,
+        invocation_job_identity: str,
+        decision_code: str,
+        outcome_state: InvocationState | str,
+        source_state: DispatchSourceState | str,
+        next_attempt_at: datetime | str | None = None,
+        decided_at: datetime | str | None = None,
+    ) -> AgentDispatchAttemptRecord:
+        agent_value = self._process_required_text(agent_id, "agent_id")
+        incarnation_value = self._process_positive_integer(
+            agent_incarnation, "agent_incarnation"
+        )
+        generation_value = self._process_positive_integer(
+            worker_generation, "worker_generation"
+        )
+        epoch_value = self._process_positive_integer(
+            supervisor_epoch, "supervisor_epoch"
+        )
+        owner_value = self._process_required_text(
+            owner_instance_id, "owner_instance_id"
+        )
+        process_lease_value = self._process_required_text(
+            process_lease_identity, "process_lease_identity"
+        )
+        attempt_value = self._process_required_text(
+            dispatch_attempt_id, "dispatch_attempt_id"
+        )
+        invocation_value = self._process_required_text(
+            invocation_id, "invocation_id"
+        )
+        slot_value = self._process_required_text(slot_id, "slot_id")
+        claim_value = self._process_required_text(
+            claim_token, "claim_token", max_length=4096
+        )
+        claim_hash = self._process_secret_hash(claim_value, "claim_token")
+        lease_value = self._process_required_text(
+            lease_identity, "lease_identity"
+        )
+        job_value = self._process_required_text(
+            invocation_job_identity, "invocation_job_identity"
+        )
+        code_value = self._process_required_text(
+            decision_code, "decision_code", max_length=128
+        )
+        if not re.fullmatch(r"[a-z][a-z0-9_.:-]{0,127}", code_value):
+            raise ValueError("decision_code must be a canonical lowercase token")
+        try:
+            outcome_value = InvocationState(_enum_value(outcome_state))
+        except ValueError as exc:
+            raise ValueError("unsupported pre-grant outcome_state") from exc
+        try:
+            source_value = DispatchSourceState(_enum_value(source_state))
+        except ValueError as exc:
+            raise ValueError("unsupported pre-grant source_state") from exc
+        allowed_outcomes = {
+            DispatchDecisionKind.ABORT: {
+                InvocationState.QUEUED,
+                InvocationState.CANCELLED,
+                InvocationState.FAILED,
+            },
+            DispatchDecisionKind.REJECTION: {
+                InvocationState.QUEUED,
+                InvocationState.FAILED,
+            },
+        }
+        if decision_kind not in allowed_outcomes:
+            raise ValueError("pre-grant decision must be abort or rejection")
+        if outcome_value not in allowed_outcomes[decision_kind]:
+            raise ValueError(
+                f"{decision_kind.value} cannot produce {outcome_value.value}"
+            )
+        decision_was_supplied = decided_at is not None
+        decision_text, decision_time = self._process_timestamp(
+            self.clock() if decided_at is None else decided_at,
+            "decided_at",
+        )
+        retry_text: str | None = None
+        if next_attempt_at is not None:
+            if outcome_value is not InvocationState.QUEUED:
+                raise ValueError(
+                    "next_attempt_at is valid only for a queued outcome"
+                )
+            retry_text, _retry_time = self._process_timestamp(
+                next_attempt_at,
+                "next_attempt_at",
+            )
+
+        def op(conn: sqlite3.Connection) -> AgentDispatchAttemptRecord:
+            with _transaction(conn):
+                self._require_active_supervisor_epoch_tx(
+                    conn,
+                    supervisor_epoch=epoch_value,
+                    owner_instance_id=owner_value,
+                )
+                process = self._agent_process_row_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                    worker_generation=generation_value,
+                )
+                self._validate_agent_process_secret_fences(
+                    process,
+                    expected_supervisor_epoch=epoch_value,
+                    process_lease_identity=process_lease_value,
+                    process_lease_token=process_lease_token,
+                    generation_capability=generation_capability,
+                )
+                attempt, slot, invocation = (
+                    self._require_dispatch_attempt_fences_tx(
+                        conn,
+                        dispatch_attempt_id=attempt_value,
+                        invocation_id=invocation_value,
+                        slot_id=slot_value,
+                        agent_id=agent_value,
+                        agent_incarnation=incarnation_value,
+                        worker_generation=generation_value,
+                        supervisor_epoch=epoch_value,
+                        claim_token_hash=claim_hash,
+                        lease_identity=lease_value,
+                        invocation_job_identity=job_value,
+                    )
+                )
+                existing_decision = any(
+                    attempt[column] is not None
+                    for column in (
+                        "grant_issued_at",
+                        "abort_committed_at",
+                        "rejection_committed_at",
+                    )
+                )
+                if existing_decision:
+                    if bool(int(attempt["decision_metadata_legacy"])):
+                        raise StoreError(
+                            "legacy Agent dispatch decision cannot be replayed exactly"
+                        )
+                    committed_kind = {
+                        "grant_issued_at": DispatchDecisionKind.GRANT,
+                        "abort_committed_at": DispatchDecisionKind.ABORT,
+                        "rejection_committed_at": DispatchDecisionKind.REJECTION,
+                    }[
+                        next(
+                            column
+                            for column in (
+                                "grant_issued_at",
+                                "abort_committed_at",
+                                "rejection_committed_at",
+                            )
+                            if attempt[column] is not None
+                        )
+                    ]
+                    committed_at = attempt[
+                        {
+                            DispatchDecisionKind.GRANT: "grant_issued_at",
+                            DispatchDecisionKind.ABORT: "abort_committed_at",
+                            DispatchDecisionKind.REJECTION: "rejection_committed_at",
+                        }[committed_kind]
+                    ]
+                    replay_conflicts: list[str] = []
+                    if committed_kind is not decision_kind:
+                        replay_conflicts.append("decision_kind")
+                    if str(attempt["decision_code"] or "") != code_value:
+                        replay_conflicts.append("decision_code")
+                    if str(attempt["decision_outcome_state"] or "") != outcome_value.value:
+                        replay_conflicts.append("outcome_state")
+                    if str(attempt["decision_source_state"] or "") != source_value.value:
+                        replay_conflicts.append("source_state")
+                    if str(attempt["decision_next_attempt_at"] or "") != str(
+                        retry_text or ""
+                    ):
+                        replay_conflicts.append("next_attempt_at")
+                    if decision_was_supplied and str(committed_at) != decision_text:
+                        replay_conflicts.append("decided_at")
+                    if replay_conflicts:
+                        raise StoreError(
+                            "Agent dispatch decision replay conflicts: "
+                            + ", ".join(replay_conflicts)
+                        )
+                    record = self._agent_dispatch_attempt_from_row(attempt)
+                    assert record is not None
+                    return record
+                attempt_created = text_to_datetime(attempt["created_at"])
+                if attempt_created is None or decision_time < attempt_created:
+                    raise ValueError("dispatch decision predates its attempt")
+                if str(slot["state"]) != ExecutionSlotState.ACTIVE.value:
+                    raise InvalidTransition("pre-grant dispatch slot is not active")
+                if str(process["observed_state"]) not in {
+                    AgentProcessState.BUSY.value,
+                    AgentProcessState.QUIESCING.value,
+                    AgentProcessState.STOPPING.value,
+                }:
+                    raise InvalidTransition(
+                        "pre-grant decision requires the owning busy generation"
+                    )
+                invocation_state = InvocationState(str(invocation["state"]))
+                if invocation_state not in {
+                    InvocationState.DISPATCHING,
+                    InvocationState.CANCEL_REQUESTED,
+                }:
+                    raise InvalidTransition(
+                        "pre-grant invocation is no longer dispatching"
+                    )
+                stored_claim = str(invocation["claim_token"] or "")
+                if not hmac.compare_digest(stored_claim, claim_value):
+                    raise StoreError("Agent invocation claim token conflicts")
+
+                work_kind = InvocationWorkKind(str(invocation["work_kind"]))
+                allowed_source_outcomes = {
+                    InvocationWorkKind.TASK: {
+                        DispatchDecisionKind.ABORT: {
+                            (
+                                InvocationState.QUEUED,
+                                DispatchSourceState.QUEUED,
+                            ),
+                            (
+                                InvocationState.CANCELLED,
+                                DispatchSourceState.CANCELLED,
+                            ),
+                            (
+                                InvocationState.FAILED,
+                                DispatchSourceState.FAILED,
+                            ),
+                        },
+                        DispatchDecisionKind.REJECTION: {
+                            (
+                                InvocationState.QUEUED,
+                                DispatchSourceState.QUEUED,
+                            ),
+                            (
+                                InvocationState.FAILED,
+                                DispatchSourceState.FAILED,
+                            ),
+                        },
+                    },
+                    InvocationWorkKind.MAILBOX: {
+                        DispatchDecisionKind.ABORT: {
+                            (
+                                InvocationState.QUEUED,
+                                DispatchSourceState.PENDING,
+                            ),
+                            (
+                                InvocationState.FAILED,
+                                DispatchSourceState.EXPIRED,
+                            ),
+                            (
+                                InvocationState.FAILED,
+                                DispatchSourceState.REJECTED,
+                            ),
+                        },
+                        DispatchDecisionKind.REJECTION: {
+                            (
+                                InvocationState.QUEUED,
+                                DispatchSourceState.PENDING,
+                            ),
+                            (
+                                InvocationState.FAILED,
+                                DispatchSourceState.REJECTED,
+                            ),
+                        },
+                    },
+                }
+                if (outcome_value, source_value) not in (
+                    allowed_source_outcomes[work_kind][decision_kind]
+                ):
+                    raise ValueError(
+                        "pre-grant decision source/outcome conflicts with work kind"
+                    )
+                cancellation_decision = (
+                    decision_kind is DispatchDecisionKind.ABORT
+                    and outcome_value is InvocationState.CANCELLED
+                    and source_value is DispatchSourceState.CANCELLED
+                )
+                if (
+                    invocation_state is InvocationState.CANCEL_REQUESTED
+                    and not cancellation_decision
+                ):
+                    raise InvalidTransition(
+                        "cancel-requested work requires an abort-to-cancelled decision"
+                    )
+                if (
+                    invocation_state is InvocationState.DISPATCHING
+                    and cancellation_decision
+                ):
+                    raise InvalidTransition(
+                        "uncancelled dispatching work cannot become cancelled"
+                    )
+
+                decision_column = {
+                    DispatchDecisionKind.ABORT: "abort_committed_at",
+                    DispatchDecisionKind.REJECTION: "rejection_committed_at",
+                }[decision_kind]
+                if conn.execute(
+                    f"""UPDATE agent_dispatch_attempts
+                        SET {decision_column}=?,decision_code=?,
+                            decision_outcome_state=?,decision_source_state=?,
+                            decision_next_attempt_at=?
+                        WHERE dispatch_attempt_id=?
+                          AND grant_issued_at IS NULL
+                          AND abort_committed_at IS NULL
+                          AND rejection_committed_at IS NULL""",
+                    (
+                        decision_text,
+                        code_value,
+                        outcome_value.value,
+                        source_value.value,
+                        retry_text,
+                        attempt_value,
+                    ),
+                ).rowcount != 1:
+                    raise StoreError("dispatch decision lost its attempt fence")
+
+                if work_kind is InvocationWorkKind.TASK:
+                    task_id = str(invocation["task_id"] or "")
+                    task = conn.execute(
+                        "SELECT * FROM tasks WHERE task_id=?",
+                        (task_id,),
+                    ).fetchone()
+                    execution = conn.execute(
+                        "SELECT * FROM task_executions WHERE execution_id=?",
+                        (invocation_value,),
+                    ).fetchone()
+                    if task is None or execution is None:
+                        raise StoreError("task dispatch source projection is missing")
+                    if (
+                        str(task["current_execution_id"] or "")
+                        != invocation_value
+                        or str(execution["task_id"]) != task_id
+                        or str(task["agent_id"]) != agent_value
+                        or int(task["agent_incarnation"]) != incarnation_value
+                        or str(execution["agent_id"]) != agent_value
+                        or int(execution["agent_incarnation"]) != incarnation_value
+                        or str(execution["dispatch_backend"])
+                        != DispatchBackend.CHILD.value
+                        or str(task["state"]) != invocation_state.value
+                        or str(execution["state"]) != invocation_state.value
+                        or not hmac.compare_digest(
+                            str(task["claim_token"] or ""), claim_value
+                        )
+                        or not hmac.compare_digest(
+                            str(execution["claim_token"] or ""), claim_value
+                        )
+                        or str(task["lease_expires_at"] or "")
+                        != str(attempt["lease_expires_at"])
+                        or str(execution["lease_expires_at"] or "")
+                        != str(attempt["lease_expires_at"])
+                    ):
+                        raise StoreError("task dispatch source state conflicts")
+                    if outcome_value is InvocationState.QUEUED:
+                        if conn.execute(
+                            """UPDATE tasks SET state='queued',claimed_by=NULL,
+                                      claim_token=NULL,lease_expires_at=NULL,
+                                      next_attempt_at=?,last_error=?,updated_at=?
+                               WHERE task_id=? AND current_execution_id=?
+                                 AND state='dispatching'""",
+                            (
+                                retry_text,
+                                code_value,
+                                decision_text,
+                                task_id,
+                                invocation_value,
+                            ),
+                        ).rowcount != 1:
+                            raise StoreError("task requeue lost its dispatch fence")
+                        if conn.execute(
+                            """UPDATE task_executions
+                               SET state='queued',worker_id=NULL,claim_token=NULL,
+                                   lease_expires_at=NULL,last_error=?
+                               WHERE execution_id=? AND task_id=?
+                                 AND state='dispatching'
+                                 AND dispatch_backend='child'""",
+                            (code_value, invocation_value, task_id),
+                        ).rowcount != 1:
+                            raise StoreError(
+                                "task execution requeue lost its dispatch fence"
+                            )
+                    else:
+                        if conn.execute(
+                            """UPDATE tasks SET state=?,claimed_by=NULL,
+                                      claim_token=NULL,lease_expires_at=NULL,
+                                      next_attempt_at=NULL,last_error=?,
+                                      result_json=NULL,terminal_at=?,updated_at=?
+                               WHERE task_id=? AND current_execution_id=?
+                                 AND state IN ('dispatching','cancel_requested')""",
+                            (
+                                source_value.value,
+                                code_value,
+                                decision_text,
+                                decision_text,
+                                task_id,
+                                invocation_value,
+                            ),
+                        ).rowcount != 1:
+                            raise StoreError(
+                                "task terminal decision lost its dispatch fence"
+                            )
+                        if conn.execute(
+                            """UPDATE task_executions
+                               SET state=?,worker_id=NULL,claim_token=NULL,
+                                   lease_expires_at=NULL,finished_at=?,last_error=?
+                               WHERE execution_id=? AND task_id=?
+                                 AND state IN ('dispatching','cancel_requested')
+                                 AND dispatch_backend='child'""",
+                            (
+                                source_value.value,
+                                decision_text,
+                                code_value,
+                                invocation_value,
+                                task_id,
+                            ),
+                        ).rowcount != 1:
+                            raise StoreError(
+                                "task execution terminal decision lost its fence"
+                            )
+                else:
+                    mailbox_id = str(invocation["mailbox_id"] or "")
+                    mailbox = conn.execute(
+                        "SELECT * FROM agent_mailbox WHERE mailbox_id=?",
+                        (mailbox_id,),
+                    ).fetchone()
+                    if mailbox is None:
+                        raise StoreError("mailbox dispatch source projection is missing")
+                    mailbox_source_expected = {
+                        "current_invocation_id": invocation_value,
+                        "message_id": str(invocation["work_id"]),
+                        "destination_agent_id": agent_value,
+                        "destination_agent_incarnation": incarnation_value,
+                        "state": MailboxState.DISPATCHING.value,
+                        "claim_token": claim_value,
+                        "lease_expires_at": attempt["lease_expires_at"],
+                        "expires_at": invocation["expires_at"],
+                    }
+                    source_conflicts = [
+                        column
+                        for column, expected in mailbox_source_expected.items()
+                        if str(mailbox[column] or "") != str(expected or "")
+                    ]
+                    if invocation["expires_at"] is None:
+                        source_conflicts.append("invocation.expires_at")
+                    if source_conflicts:
+                        raise StoreError(
+                            "mailbox dispatch source state conflicts: "
+                            + ", ".join(dict.fromkeys(source_conflicts))
+                        )
+                    if source_value is DispatchSourceState.PENDING:
+                        if conn.execute(
+                            """UPDATE agent_mailbox
+                               SET state='pending',claimed_by=NULL,claim_token=NULL,
+                                   lease_expires_at=NULL,next_attempt_at=?,last_error=?
+                               WHERE mailbox_id=? AND current_invocation_id=?
+                                 AND expires_at=? AND state='dispatching'""",
+                            (
+                                retry_text,
+                                code_value,
+                                mailbox_id,
+                                invocation_value,
+                                invocation["expires_at"],
+                            ),
+                        ).rowcount != 1:
+                            raise StoreError(
+                                "mailbox requeue lost its dispatch fence"
+                            )
+                    elif source_value is DispatchSourceState.REJECTED:
+                        if conn.execute(
+                            """UPDATE agent_mailbox
+                               SET state='rejected',claimed_by=NULL,claim_token=NULL,
+                                   lease_expires_at=NULL,next_attempt_at=NULL,
+                                   last_error=?,processed_at=?
+                               WHERE mailbox_id=? AND current_invocation_id=?
+                                 AND expires_at=? AND state='dispatching'""",
+                            (
+                                code_value,
+                                decision_text,
+                                mailbox_id,
+                                invocation_value,
+                                invocation["expires_at"],
+                            ),
+                        ).rowcount != 1:
+                            raise StoreError(
+                                "mailbox rejection lost its dispatch fence"
+                            )
+                    else:
+                        expiry_time = text_to_datetime(mailbox["expires_at"])
+                        if expiry_time is None:
+                            raise StoreError("mailbox dispatch expiry is invalid")
+                        if decision_time < expiry_time:
+                            raise InvalidTransition(
+                                "mailbox dispatch cannot expire before expires_at"
+                            )
+                        if conn.execute(
+                            """UPDATE agent_mailbox
+                               SET state='expired',claimed_by=NULL,claim_token=NULL,
+                                   lease_expires_at=NULL,next_attempt_at=NULL,
+                                   last_error=?,processed_at=?
+                               WHERE mailbox_id=? AND current_invocation_id=?
+                                 AND expires_at=? AND expires_at<=?
+                                 AND state='dispatching'""",
+                            (
+                                code_value,
+                                decision_text,
+                                mailbox_id,
+                                invocation_value,
+                                invocation["expires_at"],
+                                decision_text,
+                            ),
+                        ).rowcount != 1:
+                            raise StoreError(
+                                "mailbox expiry lost its dispatch fence"
+                            )
+
+                if outcome_value is InvocationState.QUEUED:
+                    if conn.execute(
+                        """UPDATE agent_invocations
+                           SET state='queued',claimed_by=NULL,claim_token=NULL,
+                               lease_expires_at=NULL,next_attempt_at=?,
+                               updated_at=?,last_error=?
+                           WHERE invocation_id=? AND state='dispatching'
+                             AND dispatch_backend='child'""",
+                        (
+                            retry_text,
+                            decision_text,
+                            code_value,
+                            invocation_value,
+                        ),
+                    ).rowcount != 1:
+                        raise StoreError("invocation requeue lost its dispatch fence")
+                elif not self._release_invocation_tx(
+                    conn,
+                    invocation_id=invocation_value,
+                    state=outcome_value.value,
+                    now=decision_text,
+                    last_error=code_value,
+                ):
+                    raise StoreError("invocation admission was already released")
+
+                if conn.execute(
+                    """UPDATE agent_execution_slots
+                       SET state='released',released_at=?
+                       WHERE slot_id=? AND invocation_id=?
+                         AND agent_id=? AND agent_incarnation=?
+                         AND worker_generation=? AND state='active'""",
+                    (
+                        decision_text,
+                        slot_value,
+                        invocation_value,
+                        agent_value,
+                        incarnation_value,
+                        generation_value,
+                    ),
+                ).rowcount != 1:
+                    raise StoreError("dispatch decision lost its active slot fence")
+                decided = conn.execute(
+                    "SELECT * FROM agent_dispatch_attempts "
+                    "WHERE dispatch_attempt_id=?",
+                    (attempt_value,),
+                ).fetchone()
+                record = self._agent_dispatch_attempt_from_row(decided)
+                if record is None:  # pragma: no cover - row is immutable.
+                    raise StoreError("dispatch decision disappeared")
+                return record
+
+        return await self._call(op)
+
+    async def commit_agent_dispatch_abort(
+        self,
+        **kwargs: Any,
+    ) -> AgentDispatchAttemptRecord:
+        """Commit the immutable winner for one supervisor pre-grant abort."""
+
+        return await self._commit_agent_dispatch_pregrant_decision(
+            decision_kind=DispatchDecisionKind.ABORT,
+            **kwargs,
+        )
+
+    async def commit_agent_dispatch_rejection(
+        self,
+        **kwargs: Any,
+    ) -> AgentDispatchAttemptRecord:
+        """Commit a child's typed pre-grant assignment rejection."""
+
+        return await self._commit_agent_dispatch_pregrant_decision(
+            decision_kind=DispatchDecisionKind.REJECTION,
+            **kwargs,
+        )
+
+    async def record_agent_dispatch_cleanup(
+        self,
+        *,
+        agent_id: str,
+        agent_incarnation: int,
+        worker_generation: int,
+        supervisor_epoch: int,
+        owner_instance_id: str,
+        generation_capability: str | bytes,
+        process_lease_identity: str,
+        process_lease_token: str | bytes,
+        dispatch_attempt_id: str,
+        invocation_id: str,
+        slot_id: str,
+        claim_token: str,
+        lease_identity: str,
+        invocation_job_identity: str,
+        cleanup_proof: Mapping[str, Any],
+        cleanup_proof_hash: str | None = None,
+        recorded_at: datetime | str | None = None,
+    ) -> AgentDispatchAttemptRecord:
+        """Record exact pre-grant runtime/job cleanup after abort/rejection.
+
+        Cleanup does not make the process READY.  A later correlated child
+        acknowledgement/IDLE primitive must do that after checking lifecycle,
+        shutdown, and every retained invocation job for this generation.
+        """
+
+        agent_value = self._process_required_text(agent_id, "agent_id")
+        incarnation_value = self._process_positive_integer(
+            agent_incarnation, "agent_incarnation"
+        )
+        generation_value = self._process_positive_integer(
+            worker_generation, "worker_generation"
+        )
+        epoch_value = self._process_positive_integer(
+            supervisor_epoch, "supervisor_epoch"
+        )
+        owner_value = self._process_required_text(
+            owner_instance_id, "owner_instance_id"
+        )
+        process_lease_value = self._process_required_text(
+            process_lease_identity, "process_lease_identity"
+        )
+        attempt_value = self._process_required_text(
+            dispatch_attempt_id, "dispatch_attempt_id"
+        )
+        invocation_value = self._process_required_text(
+            invocation_id, "invocation_id"
+        )
+        slot_value = self._process_required_text(slot_id, "slot_id")
+        claim_value = self._process_required_text(
+            claim_token, "claim_token", max_length=4096
+        )
+        claim_hash = self._process_secret_hash(claim_value, "claim_token")
+        lease_value = self._process_required_text(
+            lease_identity, "lease_identity"
+        )
+        job_value = self._process_required_text(
+            invocation_job_identity, "invocation_job_identity"
+        )
+        if not isinstance(cleanup_proof, Mapping):
+            raise ValueError("cleanup_proof must be a mapping")
+        proof = dict(cleanup_proof)
+        if proof.get("proof_kind") != "invocation-cleanup-v1":
+            raise ValueError("cleanup_proof.proof_kind is unsupported")
+        required_identity: dict[str, Any] = {
+            "dispatch_attempt_id": attempt_value,
+            "invocation_id": invocation_value,
+            "slot_id": slot_value,
+            "agent_id": agent_value,
+            "agent_incarnation": incarnation_value,
+            "worker_generation": generation_value,
+            "supervisor_epoch": epoch_value,
+            "process_lease_identity": process_lease_value,
+            "lease_identity": lease_value,
+            "invocation_job_identity": job_value,
+        }
+        proof_conflicts = [
+            name
+            for name, value in required_identity.items()
+            if proof.get(name) != value
+        ]
+        if proof_conflicts:
+            raise ValueError(
+                "cleanup proof identity conflicts: "
+                + ", ".join(proof_conflicts)
+            )
+        if proof.get("runtime_stopped") is not True:
+            raise ValueError("cleanup_proof.runtime_stopped must be true")
+        if proof.get("invocation_job_empty") is not True:
+            raise ValueError("cleanup_proof.invocation_job_empty must be true")
+        runtime_text, runtime_time = self._process_timestamp(
+            proof.get("runtime_stopped_at"),
+            "cleanup_proof.runtime_stopped_at",
+        )
+        job_empty_text, job_empty_time = self._process_timestamp(
+            proof.get("invocation_job_empty_at"),
+            "cleanup_proof.invocation_job_empty_at",
+        )
+        checked_text, checked_time = self._process_timestamp(
+            proof.get("checked_at"),
+            "cleanup_proof.checked_at",
+        )
+        _recorded_text, recorded_time = self._process_timestamp(
+            self.clock() if recorded_at is None else recorded_at,
+            "recorded_at",
+        )
+        if checked_time < max(runtime_time, job_empty_time):
+            raise ValueError("cleanup proof was checked before cleanup completed")
+        if recorded_time < checked_time:
+            raise ValueError("cleanup proof postdates its durable record")
+        proof.update(
+            {
+                "runtime_stopped_at": runtime_text,
+                "invocation_job_empty_at": job_empty_text,
+                "checked_at": checked_text,
+            }
+        )
+        proof_json = json_dumps(proof)
+        if len(proof_json.encode("utf-8")) > 65536:
+            raise ValueError("cleanup_proof is too large")
+        computed_hash = hashlib.sha256(proof_json.encode("utf-8")).hexdigest()
+        if cleanup_proof_hash is not None:
+            supplied_hash = self._process_sha256_text(
+                cleanup_proof_hash, "cleanup_proof_hash"
+            )
+            if not hmac.compare_digest(supplied_hash, computed_hash):
+                raise ValueError(
+                    "cleanup_proof_hash does not match cleanup_proof"
+                )
+
+        def op(conn: sqlite3.Connection) -> AgentDispatchAttemptRecord:
+            with _transaction(conn):
+                self._require_active_supervisor_epoch_tx(
+                    conn,
+                    supervisor_epoch=epoch_value,
+                    owner_instance_id=owner_value,
+                )
+                process = self._agent_process_row_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                    worker_generation=generation_value,
+                )
+                self._validate_agent_process_secret_fences(
+                    process,
+                    expected_supervisor_epoch=epoch_value,
+                    process_lease_identity=process_lease_value,
+                    process_lease_token=process_lease_token,
+                    generation_capability=generation_capability,
+                )
+                attempt, slot, _invocation = (
+                    self._require_dispatch_attempt_fences_tx(
+                        conn,
+                        dispatch_attempt_id=attempt_value,
+                        invocation_id=invocation_value,
+                        slot_id=slot_value,
+                        agent_id=agent_value,
+                        agent_incarnation=incarnation_value,
+                        worker_generation=generation_value,
+                        supervisor_epoch=epoch_value,
+                        claim_token_hash=claim_hash,
+                        lease_identity=lease_value,
+                        invocation_job_identity=job_value,
+                    )
+                )
+                if attempt["grant_issued_at"] is not None:
+                    raise InvalidTransition(
+                        "granted dispatch cleanup is not a pre-grant outcome"
+                    )
+                if (
+                    attempt["abort_committed_at"] is None
+                    and attempt["rejection_committed_at"] is None
+                ):
+                    raise InvalidTransition(
+                        "dispatch cleanup requires an abort or rejection decision"
+                    )
+                if str(slot["state"]) != ExecutionSlotState.RELEASED.value:
+                    raise InvalidTransition(
+                        "dispatch cleanup requires a released decision slot"
+                    )
+                created_time = text_to_datetime(attempt["created_at"])
+                if created_time is None or min(runtime_time, job_empty_time) < created_time:
+                    raise ValueError("dispatch cleanup predates its attempt")
+                if attempt["cleanup_proof_hash"] is not None:
+                    conflicts: list[str] = []
+                    if str(attempt["runtime_stopped_at"]) != runtime_text:
+                        conflicts.append("runtime_stopped_at")
+                    if str(attempt["invocation_job_empty_at"]) != job_empty_text:
+                        conflicts.append("invocation_job_empty_at")
+                    if not hmac.compare_digest(
+                        str(attempt["cleanup_proof_hash"]),
+                        computed_hash,
+                    ):
+                        conflicts.append("cleanup_proof_hash")
+                    if conflicts:
+                        raise StoreError(
+                            "dispatch cleanup proof conflicts: "
+                            + ", ".join(conflicts)
+                        )
+                    record = self._agent_dispatch_attempt_from_row(attempt)
+                    assert record is not None
+                    return record
+                if any(
+                    attempt[column] is not None
+                    for column in (
+                        "runtime_stopped_at",
+                        "invocation_job_empty_at",
+                    )
+                ):
+                    raise StoreError("dispatch cleanup evidence is partial")
+                newer_slot = conn.execute(
+                    """SELECT slot_id FROM agent_execution_slots
+                       WHERE agent_id=? AND agent_incarnation=?
+                         AND state='active' AND slot_id<>? LIMIT 1""",
+                    (agent_value, incarnation_value, slot_value),
+                ).fetchone()
+                if newer_slot is not None:
+                    raise InvalidTransition(
+                        "stale dispatch cleanup cannot cross a newer active slot"
+                    )
+                if str(process["observed_state"]) not in {
+                    AgentProcessState.BUSY.value,
+                    AgentProcessState.QUIESCING.value,
+                    AgentProcessState.STOPPING.value,
+                }:
+                    raise InvalidTransition(
+                        "dispatch cleanup requires the owning busy generation"
+                    )
+                if conn.execute(
+                    """UPDATE agent_dispatch_attempts
+                       SET runtime_stopped_at=?,invocation_job_empty_at=?,
+                           cleanup_proof_hash=?
+                       WHERE dispatch_attempt_id=?
+                         AND runtime_stopped_at IS NULL
+                         AND invocation_job_empty_at IS NULL
+                         AND cleanup_proof_hash IS NULL""",
+                    (
+                        runtime_text,
+                        job_empty_text,
+                        computed_hash,
+                        attempt_value,
+                    ),
+                ).rowcount != 1:
+                    raise StoreError("dispatch cleanup lost its attempt fence")
+                cleaned = conn.execute(
+                    "SELECT * FROM agent_dispatch_attempts "
+                    "WHERE dispatch_attempt_id=?",
+                    (attempt_value,),
+                ).fetchone()
+                record = self._agent_dispatch_attempt_from_row(cleaned)
+                if record is None:  # pragma: no cover - row is immutable.
+                    raise StoreError("dispatch cleanup disappeared")
+                return record
+
+        return await self._call(op)
+
+    commit_agent_dispatch_pregrant_cleanup = record_agent_dispatch_cleanup
+
     async def list_task_executions(
         self,
         task_id: str,
@@ -5706,7 +14117,12 @@ class SQLiteStore:
         if state is not None:
             states = [state]
         if states is not None:
-            state_values = [_enum_value(value) for value in states]
+            state_values = [
+                "dispatching"
+                if _enum_value(value) == TaskState.CLAIMED.value
+                else _enum_value(value)
+                for value in states
+            ]
             if not state_values:
                 return []
             filters.append("t.state IN (" + ",".join("?" for _ in state_values) + ")")
@@ -5760,6 +14176,90 @@ class SQLiteStore:
         current = text_to_datetime(now)
         return expiry is not None and current is not None and expiry > current
 
+    @staticmethod
+    def _unified_invocation_claim_guard(candidate_alias: str = "ai") -> str:
+        """SQL guard for one active invocation and per-Agent ready FIFO.
+
+        The compatibility task and mailbox loops are separate coroutines, so
+        source-table ordering alone cannot serialize them.  Both claim paths
+        use this correlated predicate inside their ``BEGIN IMMEDIATE`` write
+        transaction.  A delayed invocation or a task whose managed inputs are
+        not ready is not runnable and therefore does not block later work.
+
+        The returned fragment contains one positional parameter: the current
+        durable timestamp used for the earlier invocation's retry deadline.
+        """
+
+        alias = str(candidate_alias)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", alias):
+            raise ValueError("invalid SQL alias")
+        return f"""
+            NOT EXISTS (
+                SELECT 1 FROM agent_invocations AS active
+                 WHERE active.agent_id={alias}.agent_id
+                   AND active.agent_incarnation={alias}.agent_incarnation
+                   AND active.invocation_id<>{alias}.invocation_id
+                   AND active.state IN
+                       ('dispatching','running','cancel_requested')
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM agent_invocations AS earlier
+                 WHERE earlier.agent_id={alias}.agent_id
+                   AND earlier.agent_incarnation={alias}.agent_incarnation
+                   AND earlier.ready_sequence<{alias}.ready_sequence
+                   AND earlier.state='queued'
+                   AND earlier.dispatch_backend='compatibility'
+                   AND (earlier.next_attempt_at IS NULL
+                        OR earlier.next_attempt_at<=?)
+                   AND (
+                       (
+                           earlier.work_kind='task'
+                           AND EXISTS (
+                               SELECT 1 FROM tasks AS earlier_task
+                                WHERE earlier_task.task_id=earlier.task_id
+                                  AND earlier_task.current_execution_id=
+                                      earlier.invocation_id
+                                  AND earlier_task.agent_id=earlier.agent_id
+                                  AND earlier_task.agent_incarnation=
+                                      earlier.agent_incarnation
+                                  AND earlier_task.state='queued'
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                        FROM attachment_refs AS earlier_ref
+                                        LEFT JOIN attachments AS earlier_attachment
+                                          ON earlier_attachment.attachment_id=
+                                             earlier_ref.attachment_id
+                                       WHERE earlier_ref.owner_kind='task'
+                                         AND earlier_ref.owner_id=
+                                             earlier_task.task_id
+                                         AND (
+                                             earlier_attachment.attachment_id
+                                                 IS NULL
+                                             OR earlier_attachment.state<>'ready'
+                                         )
+                                  )
+                           )
+                       )
+                       OR (
+                           earlier.work_kind='mailbox'
+                           AND EXISTS (
+                               SELECT 1 FROM agent_mailbox AS earlier_mailbox
+                                WHERE earlier_mailbox.mailbox_id=
+                                      earlier.mailbox_id
+                                  AND earlier_mailbox.current_invocation_id=
+                                      earlier.invocation_id
+                                  AND earlier_mailbox.message_id=earlier.work_id
+                                  AND earlier_mailbox.destination_agent_id=
+                                      earlier.agent_id
+                                  AND earlier_mailbox.destination_agent_incarnation=
+                                      earlier.agent_incarnation
+                                  AND earlier_mailbox.state='pending'
+                           )
+                       )
+                   )
+            )
+        """
+
     @classmethod
     def _claim_selected_task_tx(
         cls,
@@ -5771,9 +14271,62 @@ class SQLiteStore:
         lease_expires_at: str,
     ) -> TaskClaim | None:
         task_id = row["task_id"]
+        cls._task_role_snapshot_tx(
+            conn,
+            metadata=json_loads(row["metadata_json"], {}) or {},
+            channel=str(row["channel"] or ""),
+            bot_id=str(row["bot_id"] or ""),
+            external_user_id=str(row["external_user_id"] or ""),
+            session_id=str(row["session_id"] or "default"),
+            agent_id=str(row["agent_id"] or ""),
+        )
         token = _uuid()
-        execution_id = _uuid()
-        attempt = int(row["attempts"]) + 1
+        execution_id = str(row["current_execution_id"] or "")
+        if not execution_id:
+            raise StoreError("queued task has no current execution")
+        execution_row = conn.execute(
+            "SELECT * FROM task_executions WHERE execution_id=? AND task_id=?",
+            (execution_id, task_id),
+        ).fetchone()
+        if execution_row is None or str(execution_row["state"]) != "queued":
+            raise StoreError("queued task execution truth conflicts")
+        invocation_row = conn.execute(
+            "SELECT * FROM agent_invocations WHERE invocation_id=?",
+            (execution_id,),
+        ).fetchone()
+        if invocation_row is None:
+            raise StoreError("queued task invocation truth is missing")
+        invocation_identity = {
+            "work_kind": "task",
+            "work_id": execution_id,
+            "task_id": str(task_id),
+            "execution_id": execution_id,
+            "agent_id": str(row["agent_id"]),
+            "agent_incarnation": str(row["agent_incarnation"]),
+            "state": "queued",
+            "dispatch_backend": "compatibility",
+        }
+        for field, expected in invocation_identity.items():
+            if str(invocation_row[field] or "") != expected:
+                raise StoreError(
+                    f"queued task invocation ownership conflicts ({field})"
+                )
+        lifecycle = conn.execute(
+            "SELECT lifecycle_state FROM agent_lifecycle "
+            "WHERE agent_id=? AND agent_incarnation=?",
+            (row["agent_id"], row["agent_incarnation"]),
+        ).fetchone()
+        if lifecycle is None or str(lifecycle["lifecycle_state"]) != "enabled":
+            return None
+        claimable = conn.execute(
+            "SELECT 1 FROM agent_invocations AS ai "
+            "WHERE ai.invocation_id=? AND "
+            + cls._unified_invocation_claim_guard("ai"),
+            (execution_id, now),
+        ).fetchone()
+        if claimable is None:
+            return None
+        attempt = int(execution_row["attempt"])
         scope_row = conn.execute(
             """SELECT COALESCE(
                        t.pending_delivery_reply_scope_id,
@@ -5790,7 +14343,7 @@ class SQLiteStore:
         )
         changed = conn.execute(
             """UPDATE tasks
-               SET state = 'claimed', claimed_by = ?, claim_token = ?,
+               SET state = 'dispatching', claimed_by = ?, claim_token = ?,
                    lease_expires_at = ?, attempts = ?, updated_at = ?,
                    last_error = NULL, pending_delivery_reply_scope_id = NULL
                WHERE task_id = ? AND state = 'queued'
@@ -5808,22 +14361,28 @@ class SQLiteStore:
         ).rowcount
         if changed != 1:
             return None
-        conn.execute(
-            """INSERT INTO task_executions
-               (execution_id, task_id, attempt, state, worker_id, claim_token,
-                lease_expires_at, delivery_reply_scope_id, created_at)
-               VALUES (?, ?, ?, 'claimed', ?, ?, ?, ?, ?)""",
+        execution_changed = conn.execute(
+            """UPDATE task_executions SET state='dispatching',worker_id=?,
+                   claim_token=?,lease_expires_at=?,delivery_reply_scope_id=?
+               WHERE execution_id=? AND task_id=? AND state='queued'""",
+            (worker_id, token, lease_expires_at, delivery_reply_scope_id,
+             execution_id, task_id),
+        ).rowcount
+        invocation_changed = conn.execute(
+            """UPDATE agent_invocations SET state='dispatching',claimed_by=?,
+                   claim_token=?,lease_expires_at=?,updated_at=?
+               WHERE invocation_id=? AND state='queued'
+                 AND dispatch_backend='compatibility' AND work_kind='task'
+                 AND task_id=? AND execution_id=? AND agent_id=?
+                 AND agent_incarnation=?""",
             (
-                execution_id,
-                task_id,
-                attempt,
-                worker_id,
-                token,
-                lease_expires_at,
-                delivery_reply_scope_id,
-                now,
+                worker_id, token, lease_expires_at, now, execution_id,
+                task_id, execution_id, row["agent_id"],
+                row["agent_incarnation"],
             ),
-        )
+        ).rowcount
+        if execution_changed != 1 or invocation_changed != 1:
+            raise StoreError("task dispatch projection could not be claimed")
         task = cls._fetch_task_tx(conn, task_id)
         execution = cls._execution_from_row(
             conn.execute("SELECT * FROM task_executions WHERE execution_id = ?", (execution_id,)).fetchone()
@@ -5852,7 +14411,19 @@ class SQLiteStore:
             with _transaction(conn):
                 now_text = self._now(now)
                 lease = self._lease_deadline(now_text, lease_seconds)
-                filters = ["t.state = 'queued'", "(t.next_attempt_at IS NULL OR t.next_attempt_at <= ?)"]
+                filters = [
+                    "t.state = 'queued'",
+                    "(t.next_attempt_at IS NULL OR t.next_attempt_at <= ?)",
+                    "ai.state = 'queued'",
+                    "ai.dispatch_backend = 'compatibility'",
+                    "ai.work_kind = 'task'",
+                    "ai.work_id = ai.invocation_id",
+                    "ai.task_id = t.task_id",
+                    "ai.execution_id = t.current_execution_id",
+                    "ai.agent_id = t.agent_id",
+                    "ai.agent_incarnation = t.agent_incarnation",
+                    "lifecycle.lifecycle_state = 'enabled'",
+                ]
                 params: list[Any] = [now_text]
                 if agent_id is not None:
                     filters.append("t.agent_id = ?")
@@ -5867,7 +14438,7 @@ class SQLiteStore:
                               AND active.external_user_id = t.external_user_id
                               AND active.session_id = t.session_id
                               AND active.agent_id = t.agent_id
-                              AND active.state IN ('claimed', 'running', 'cancel_requested')
+                              AND active.state IN ('dispatching', 'running', 'cancel_requested')
                         )"""
                     )
                 filters.append(
@@ -5881,9 +14452,19 @@ class SQLiteStore:
                           AND (a.attachment_id IS NULL OR a.state <> 'ready')
                     )"""
                 )
+                filters.append(self._unified_invocation_claim_guard("ai"))
+                params.append(now_text)
                 row = conn.execute(
-                    "SELECT t.* FROM tasks t WHERE " + " AND ".join(filters) +
-                    " ORDER BY t.created_at ASC, t.task_id ASC LIMIT 1",
+                    """SELECT t.* FROM tasks AS t
+                       JOIN agent_invocations AS ai
+                         ON ai.invocation_id=t.current_execution_id
+                       JOIN agent_lifecycle AS lifecycle
+                         ON lifecycle.agent_id=t.agent_id
+                        AND lifecycle.agent_incarnation=t.agent_incarnation
+                       WHERE """
+                    + " AND ".join(filters)
+                    + " ORDER BY ai.created_at ASC, ai.ready_sequence ASC, "
+                      "t.task_id ASC LIMIT 1",
                     params,
                 ).fetchone()
                 if row is None:
@@ -5936,6 +14517,15 @@ class SQLiteStore:
                     "t.task_id = ?",
                     "t.state = 'queued'",
                     "(t.next_attempt_at IS NULL OR t.next_attempt_at <= ?)",
+                    "ai.state = 'queued'",
+                    "ai.dispatch_backend = 'compatibility'",
+                    "ai.work_kind = 'task'",
+                    "ai.work_id = ai.invocation_id",
+                    "ai.task_id = t.task_id",
+                    "ai.execution_id = t.current_execution_id",
+                    "ai.agent_id = t.agent_id",
+                    "ai.agent_incarnation = t.agent_incarnation",
+                    "lifecycle.lifecycle_state = 'enabled'",
                 ]
                 params: list[Any] = [task_id, now_text]
                 if enforce_serialization:
@@ -5948,7 +14538,7 @@ class SQLiteStore:
                               AND active.external_user_id = t.external_user_id
                               AND active.session_id = t.session_id
                               AND active.agent_id = t.agent_id
-                              AND active.state IN ('claimed', 'running', 'cancel_requested')
+                              AND active.state IN ('dispatching', 'running', 'cancel_requested')
                         )"""
                     )
                 filters.append(
@@ -5962,8 +14552,17 @@ class SQLiteStore:
                           AND (a.attachment_id IS NULL OR a.state <> 'ready')
                     )"""
                 )
+                filters.append(self._unified_invocation_claim_guard("ai"))
+                params.append(now_text)
                 row = conn.execute(
-                    "SELECT * FROM tasks t WHERE " + " AND ".join(filters),
+                    """SELECT t.* FROM tasks AS t
+                       JOIN agent_invocations AS ai
+                         ON ai.invocation_id=t.current_execution_id
+                       JOIN agent_lifecycle AS lifecycle
+                         ON lifecycle.agent_id=t.agent_id
+                        AND lifecycle.agent_incarnation=t.agent_incarnation
+                       WHERE """
+                    + " AND ".join(filters),
                     params,
                 ).fetchone()
                 if row is None:
@@ -5989,7 +14588,7 @@ class SQLiteStore:
                 changed = conn.execute(
                     """UPDATE tasks SET lease_expires_at = ?, updated_at = ?
                        WHERE task_id = ? AND claim_token = ?
-                         AND state IN ('claimed', 'running', 'cancel_requested')
+                         AND state IN ('dispatching', 'running', 'cancel_requested')
                          AND lease_expires_at IS NOT NULL
                          AND lease_expires_at > ?""",
                     (lease, now_text, task_id, claim_token, now_text),
@@ -6004,6 +14603,16 @@ class SQLiteStore:
                     ).rowcount
                     if execution_changed != 1:
                         raise StoreError("active task execution lease could not be renewed")
+                    invocation_changed = conn.execute(
+                        """UPDATE agent_invocations SET lease_expires_at=?,updated_at=?
+                           WHERE invocation_id=(SELECT current_execution_id FROM tasks WHERE task_id=?)
+                             AND claim_token=? AND state IN
+                                 ('dispatching','running','cancel_requested')
+                             AND lease_expires_at>?""",
+                        (lease, now_text, task_id, claim_token, now_text),
+                    ).rowcount
+                    if invocation_changed != 1:
+                        raise StoreError("active task invocation lease could not be renewed")
                 return changed == 1
 
         return await self._call(op)
@@ -6024,7 +14633,7 @@ class SQLiteStore:
                 now_text = self._now(now)
                 changed = conn.execute(
                     """UPDATE tasks SET state = 'running', updated_at = ?
-                       WHERE task_id = ? AND claim_token = ? AND state = 'claimed'
+                       WHERE task_id = ? AND claim_token = ? AND state = 'dispatching'
                          AND lease_expires_at IS NOT NULL
                          AND lease_expires_at > ?""",
                     (now_text, task_id, claim_token, now_text),
@@ -6034,7 +14643,7 @@ class SQLiteStore:
                         """UPDATE task_executions
                            SET state = 'running', started_at = COALESCE(started_at, ?),
                                external_turn_id = COALESCE(?, external_turn_id)
-                           WHERE task_id = ? AND claim_token = ? AND state = 'claimed'
+                           WHERE task_id = ? AND claim_token = ? AND state = 'dispatching'
                              AND lease_expires_at IS NOT NULL
                              AND lease_expires_at > ?
                              AND (? IS NULL OR execution_id = ?)""",
@@ -6050,6 +14659,17 @@ class SQLiteStore:
                     ).rowcount
                     if execution_changed != 1:
                         raise StoreError("task execution could not be marked running")
+                    invocation_changed = conn.execute(
+                        """UPDATE agent_invocations SET state='running',updated_at=?
+                           WHERE invocation_id=? AND state='dispatching'
+                             AND claim_token=? AND lease_expires_at>?""",
+                        (now_text, execution_id or conn.execute(
+                            "SELECT current_execution_id FROM tasks WHERE task_id=?",
+                            (task_id,),
+                        ).fetchone()[0], claim_token, now_text),
+                    ).rowcount
+                    if invocation_changed != 1:
+                        raise StoreError("task invocation could not be marked running")
                 return changed == 1
 
         return await self._call(op)
@@ -6072,7 +14692,8 @@ class SQLiteStore:
                 now_text = self._now(now)
                 row = conn.execute(
                     "SELECT conversation_id, mode_id, profile_version, policy_version, "
-                    "thread_id, claim_token, state, lease_expires_at "
+                    "thread_id, claim_token, state, lease_expires_at, metadata_json, "
+                    "channel, bot_id, external_user_id, session_id, agent_id "
                     "FROM tasks WHERE task_id=?",
                     (task_id,),
                 ).fetchone()
@@ -6126,6 +14747,65 @@ class SQLiteStore:
                     existing_thread = row["thread_id"]
                     if existing_thread and str(existing_thread) != str(thread_id):
                         return False
+                role_snapshot = self._task_role_snapshot_tx(
+                    conn,
+                    metadata=json_loads(row["metadata_json"], {}) or {},
+                    channel=str(row["channel"] or ""),
+                    bot_id=str(row["bot_id"] or ""),
+                    external_user_id=str(row["external_user_id"] or ""),
+                    session_id=str(row["session_id"] or "default"),
+                    agent_id=str(row["agent_id"] or ""),
+                )
+                role_version, role_hash, persona_version = role_binding_key(
+                    role_snapshot
+                )
+                conflicting_binding = conn.execute(
+                    """SELECT 1 FROM thread_bindings
+                       WHERE thread_id=? AND NOT (
+                           conversation_id=? AND mode_id=?
+                           AND profile_version=? AND policy_version=?
+                           AND role_version=? AND role_snapshot_hash=?
+                           AND persona_composition_version=?
+                       ) LIMIT 1""",
+                    (
+                        str(thread_id),
+                        row["conversation_id"],
+                        row["mode_id"],
+                        int(row["profile_version"]),
+                        int(row["policy_version"]),
+                        role_version,
+                        role_hash,
+                        persona_version,
+                    ),
+                ).fetchone()
+                if conflicting_binding is not None:
+                    raise StoreError(
+                        "provider thread is already bound to different task context"
+                    )
+                existing_binding = conn.execute(
+                    """SELECT thread_id FROM thread_bindings
+                       WHERE conversation_id=? AND mode_id=?
+                         AND profile_version=? AND policy_version=?
+                         AND role_version=? AND role_snapshot_hash=?
+                         AND persona_composition_version=?""",
+                    (
+                        row["conversation_id"],
+                        row["mode_id"],
+                        int(row["profile_version"]),
+                        int(row["policy_version"]),
+                        role_version,
+                        role_hash,
+                        persona_version,
+                    ),
+                ).fetchone()
+                if (
+                    existing_binding is not None
+                    and str(existing_binding["thread_id"] or "")
+                    != str(thread_id)
+                ):
+                    raise StoreError(
+                        "task context is already bound to a different provider thread"
+                    )
                 changed = conn.execute(
                     "UPDATE tasks SET thread_id=?, updated_at=? WHERE task_id=?",
                     (str(thread_id), now_text, task_id),
@@ -6133,13 +14813,19 @@ class SQLiteStore:
                 conn.execute(
                     """INSERT INTO thread_bindings
                        (conversation_id, mode_id, profile_version, policy_version,
-                        thread_id, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(conversation_id, mode_id, profile_version, policy_version)
-                       DO UPDATE SET thread_id=excluded.thread_id, updated_at=excluded.updated_at""",
+                        role_version, role_snapshot_hash,
+                        persona_composition_version, thread_id, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(
+                           conversation_id, mode_id, profile_version,
+                           policy_version, role_version, role_snapshot_hash,
+                           persona_composition_version
+                       )
+                       DO NOTHING""",
                     (
                         row["conversation_id"], row["mode_id"],
                         int(row["profile_version"]), int(row["policy_version"]),
+                        role_version, role_hash, persona_version,
                         str(thread_id), now_text,
                     ),
                 )
@@ -6156,7 +14842,31 @@ class SQLiteStore:
         mode_id: str,
         profile_version: int = 1,
         policy_version: int = 1,
+        session_role: Mapping[str, Any] | None = None,
+        role_version: int = 0,
+        role_snapshot_hash: str | None = None,
+        persona_composition_version: str = ROLE_PERSONA_COMPOSITION_VERSION,
     ) -> str | None:
+        if session_role is not None:
+            try:
+                role_version, resolved_hash, persona_composition_version = (
+                    role_binding_key(session_role)
+                )
+            except RoleValidationError as exc:
+                raise StoreError("thread session role snapshot is invalid") from exc
+            if (
+                role_snapshot_hash is not None
+                and str(role_snapshot_hash) != resolved_hash
+            ):
+                raise StoreError("thread session role identity conflicts")
+            role_snapshot_hash = resolved_hash
+        elif role_snapshot_hash is None:
+            if int(role_version) != 0:
+                raise StoreError(
+                    "custom thread role identity requires a snapshot hash"
+                )
+            role_snapshot_hash = str(_IMPLICIT_DEFAULT_ROLE["snapshot_hash"])
+
         def op(conn: sqlite3.Connection) -> str | None:
             return self._thread_binding_tx(
                 conn,
@@ -6164,6 +14874,9 @@ class SQLiteStore:
                 mode_id=mode_id,
                 profile_version=profile_version,
                 policy_version=policy_version,
+                role_version=role_version,
+                role_snapshot_hash=str(role_snapshot_hash),
+                persona_composition_version=persona_composition_version,
             )
 
         return await self._call(op)
@@ -6197,7 +14910,9 @@ class SQLiteStore:
     clear_conversation_threads = clear_thread_bindings
 
     _ALLOWED_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
-        TaskState.QUEUED: frozenset({TaskState.CLAIMED, TaskState.CANCELLED}),
+        TaskState.QUEUED: frozenset(
+            {TaskState.CLAIMED, TaskState.FAILED, TaskState.CANCELLED}
+        ),
         TaskState.CLAIMED: frozenset({TaskState.RUNNING, TaskState.ORPHANED, TaskState.CANCEL_REQUESTED}),
         TaskState.RUNNING: frozenset({TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCEL_REQUESTED, TaskState.ORPHANED}),
         TaskState.CANCEL_REQUESTED: frozenset({TaskState.INTERRUPTED, TaskState.CANCELLED, TaskState.ORPHANED}),
@@ -6225,19 +14940,33 @@ class SQLiteStore:
         """Conditionally transition a task and return whether it changed."""
 
         target = TaskState(_enum_value(to_state))
+        if target is TaskState.DISPATCHING:
+            target = TaskState.CLAIMED
         if from_states is None:
             sources = [state for state, allowed in self._ALLOWED_TRANSITIONS.items() if target in allowed]
         elif isinstance(from_states, (str, TaskState)):
             sources = [TaskState(_enum_value(from_states))]
         else:
             sources = [TaskState(_enum_value(value)) for value in from_states]
+        sources = [
+            TaskState.CLAIMED if source is TaskState.DISPATCHING else source
+            for source in sources
+        ]
         if any(target not in self._ALLOWED_TRANSITIONS[source] for source in sources):
             raise InvalidTransition(f"invalid task transition {sources!r} -> {target.value}")
+        if target is TaskState.CLAIMED:
+            raise InvalidTransition(
+                "task dispatch requires the atomic claim API"
+            )
         terminal = target in {TaskState.COMPLETED, TaskState.FAILED, TaskState.INTERRUPTED, TaskState.CANCELLED}
         release_claim = terminal or target == TaskState.ORPHANED
+        target_store_value = (
+            "dispatching" if target == TaskState.CLAIMED else target.value
+        )
         execution_state_for = {
-            TaskState.CLAIMED: ExecutionState.CLAIMED,
+            TaskState.CLAIMED: ExecutionState.DISPATCHING,
             TaskState.RUNNING: ExecutionState.RUNNING,
+            TaskState.CANCEL_REQUESTED: ExecutionState.CANCEL_REQUESTED,
             TaskState.COMPLETED: ExecutionState.COMPLETED,
             TaskState.FAILED: ExecutionState.FAILED,
             TaskState.INTERRUPTED: ExecutionState.INTERRUPTED,
@@ -6251,6 +14980,91 @@ class SQLiteStore:
                 current = self._fetch_task_tx(conn, task_id)
                 if current is None or current.state not in sources:
                     return False
+                if target is TaskState.QUEUED:
+                    current_execution_id = str(current.execution_id or "")
+                    if not current_execution_id:
+                        raise StoreError("retry task has no current execution")
+                    retained = conn.execute(
+                        """SELECT e.task_id,e.finished_at,e.agent_id,
+                                  e.agent_incarnation,i.state AS invocation_state,
+                                  i.admission_released_at
+                           FROM task_executions AS e
+                           JOIN agent_invocations AS i
+                             ON i.invocation_id=e.execution_id
+                           WHERE e.execution_id=?""",
+                        (current_execution_id,),
+                    ).fetchone()
+                    if (
+                        retained is None
+                        or str(retained["task_id"]) != str(task_id)
+                        or retained["finished_at"] is None
+                        or retained["admission_released_at"] is None
+                        or str(retained["invocation_state"])
+                        not in {
+                            "completed",
+                            "failed",
+                            "interrupted",
+                            "cancelled",
+                            "orphaned",
+                        }
+                        or str(retained["agent_id"]) != current.agent_id
+                        or int(retained["agent_incarnation"])
+                        != current.agent_incarnation
+                    ):
+                        raise StoreError(
+                            "retry execution/invocation truth conflicts"
+                        )
+                    lifecycle = conn.execute(
+                        """SELECT lifecycle_state,desired_process_state
+                           FROM agent_lifecycle
+                           WHERE agent_id=? AND agent_incarnation=?""",
+                        (current.agent_id, current.agent_incarnation),
+                    ).fetchone()
+                    if (
+                        lifecycle is None
+                        or str(lifecycle["lifecycle_state"]) != "enabled"
+                        or str(lifecycle["desired_process_state"]) != "running"
+                    ):
+                        raise InvalidTransition(
+                            "cannot retry work for an inactive Agent incarnation"
+                        )
+                    changed = conn.execute(
+                        """UPDATE tasks SET state='queued',claimed_by=NULL,
+                                  claim_token=NULL,lease_expires_at=NULL,
+                                  next_attempt_at=?,last_error=NULL,updated_at=?,
+                                  result_json=NULL,terminal_at=NULL,
+                                  cancel_requested_at=NULL,
+                                  current_execution_id=NULL
+                           WHERE task_id=? AND state=?
+                             AND current_execution_id=?""",
+                        (
+                            now_text,
+                            now_text,
+                            task_id,
+                            current.state.value,
+                            current_execution_id,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        return False
+                    self._append_event_tx(
+                        conn,
+                        task_id,
+                        event_type="retry_requested",
+                        visibility=EventVisibility.INTERNAL,
+                        priority=EventPriority.SILENT,
+                        content="retry requested",
+                        execution_id=current_execution_id,
+                        created_at=now_text,
+                    )
+                    self._create_queued_task_invocation_tx(
+                        conn,
+                        task_id=task_id,
+                        now=now_text,
+                        max_agent_queue=self.max_agent_queue,
+                        max_global_queue=self.max_global_queue,
+                    )
+                    return True
                 # Active state transitions are execution-owned.  Keep the
                 # boolean/conditional API for callers that probe a transition,
                 # but fail closed when the token is omitted or stale.  Recovery
@@ -6279,7 +15093,35 @@ class SQLiteStore:
                 # owner (or can finish several unfinished attempts at once).
                 active_execution_id: str | None = None
                 active_execution_row: sqlite3.Row | None = None
-                if current.state in active_states:
+                queued_terminal_execution_id: str | None = None
+                if current.state is TaskState.QUEUED and target in {
+                    TaskState.FAILED,
+                    TaskState.CANCELLED,
+                }:
+                    queued_terminal_execution_id = str(
+                        current.execution_id or ""
+                    )
+                    queued_projection = conn.execute(
+                        """SELECT e.task_id,e.state,i.state AS invocation_state,
+                                  i.admission_released_at
+                           FROM task_executions AS e
+                           JOIN agent_invocations AS i
+                             ON i.invocation_id=e.execution_id
+                           WHERE e.execution_id=?""",
+                        (queued_terminal_execution_id,),
+                    ).fetchone()
+                    if (
+                        not queued_terminal_execution_id
+                        or queued_projection is None
+                        or str(queued_projection["task_id"]) != str(task_id)
+                        or str(queued_projection["state"]) != "queued"
+                        or str(queued_projection["invocation_state"]) != "queued"
+                        or queued_projection["admission_released_at"] is not None
+                    ):
+                        raise StoreError(
+                            "queued execution/invocation truth conflicts"
+                        )
+                elif current.state in active_states:
                     active_execution_id = str(execution_id or current.execution_id or "")
                     if not active_execution_id:
                         raise StoreError("active task has no execution record")
@@ -6370,10 +15212,18 @@ class SQLiteStore:
                         terminal_event,
                         task=current,
                         allow_compatibility_final=user_visible,
+                        max_agent_queue=self.max_agent_queue,
+                        max_global_queue=self.max_global_queue,
                     )
                 placeholders = ",".join("?" for _ in sources)
                 filters = ["task_id = ?", f"state IN ({placeholders})"]
-                params: list[Any] = [task_id, *[state.value for state in sources]]
+                params: list[Any] = [
+                    task_id,
+                    *[
+                        "dispatching" if state == TaskState.CLAIMED else state.value
+                        for state in sources
+                    ],
+                ]
                 if claim_token is not None:
                     filters.append("claim_token = ?")
                     params.append(claim_token)
@@ -6390,7 +15240,7 @@ class SQLiteStore:
                           lease_expires_at = CASE WHEN ? THEN NULL ELSE lease_expires_at END
                           WHERE {' AND '.join(filters)}""",
                     (
-                        target.value, now_text, last_error,
+                        target_store_value, now_text, last_error,
                         json_dumps(result) if result is not None else None,
                         now_text if terminal else None,
                         int(release_claim), int(release_claim), int(release_claim), *params,
@@ -6403,7 +15253,36 @@ class SQLiteStore:
                     if terminal:
                         raise InvalidTransition(f"cannot transition task {task_id}")
                     return False
-                if execution_state_for is not None and active_execution_id is not None:
+                if queued_terminal_execution_id is not None:
+                    execution_changed = conn.execute(
+                        """UPDATE task_executions SET state=?,finished_at=?,
+                                  lease_expires_at=NULL,
+                                  last_error=COALESCE(?,last_error)
+                           WHERE execution_id=? AND task_id=? AND state='queued'
+                             AND finished_at IS NULL""",
+                        (
+                            target_store_value,
+                            now_text,
+                            last_error,
+                            queued_terminal_execution_id,
+                            task_id,
+                        ),
+                    ).rowcount
+                    if execution_changed != 1:
+                        raise InvalidTransition(
+                            "queued execution could not be finalized"
+                        )
+                    if not self._release_invocation_tx(
+                        conn,
+                        invocation_id=queued_terminal_execution_id,
+                        state=target_store_value,
+                        now=now_text,
+                        last_error=last_error,
+                    ):
+                        raise StoreError(
+                            "queued invocation was already released"
+                        )
+                elif execution_state_for is not None and active_execution_id is not None:
                     # Active execution validation above guarantees that this
                     # exact row is the sole owner.  Keep the same fence on the
                     # write and require exactly one affected row so a partial
@@ -6433,6 +15312,23 @@ class SQLiteStore:
                         raise InvalidTransition(
                             "active execution could not be finalized"
                         )
+                    if release_claim:
+                        if not self._release_invocation_tx(
+                            conn,
+                            invocation_id=active_execution_id,
+                            state=target_store_value,
+                            now=now_text,
+                            last_error=last_error,
+                        ):
+                            raise StoreError(
+                                "active invocation was already released"
+                            )
+                    elif conn.execute(
+                        "UPDATE agent_invocations SET state=?,updated_at=? "
+                        "WHERE invocation_id=? AND admission_released_at IS NULL",
+                        (target_store_value, now_text, active_execution_id),
+                    ).rowcount != 1:
+                        raise StoreError("task invocation transition conflicts")
                 return True
 
         return await self._call(op)
@@ -6447,7 +15343,8 @@ class SQLiteStore:
                 row = conn.execute("SELECT state FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
                 if row is None:
                     return False
-                state = TaskState(row["state"])
+                stored_state = str(row["state"])
+                state = TaskState.CLAIMED if stored_state == "dispatching" else TaskState(stored_state)
                 if state == TaskState.QUEUED:
                     changed = conn.execute(
                         """UPDATE tasks SET state = 'cancelled', updated_at = ?,
@@ -6455,6 +15352,23 @@ class SQLiteStore:
                         (now_text, now_text, now_text, task_id),
                     ).rowcount == 1
                     if changed:
+                        current_execution_id = conn.execute(
+                            "SELECT current_execution_id FROM tasks WHERE task_id=?",
+                            (task_id,),
+                        ).fetchone()[0]
+                        if conn.execute(
+                            """UPDATE task_executions SET state='cancelled',
+                                   finished_at=? WHERE execution_id=? AND state='queued'""",
+                            (now_text, current_execution_id),
+                        ).rowcount != 1:
+                            raise StoreError("queued execution cancellation conflicts")
+                        if not self._release_invocation_tx(
+                            conn, invocation_id=str(current_execution_id),
+                            state="cancelled", now=now_text,
+                        ):
+                            raise StoreError(
+                                "queued cancellation invocation was already released"
+                            )
                         # Keep cancellation auditable even when no worker ever
                         # claimed the queued task.  This is part of the same
                         # transaction as the terminal state transition.
@@ -6469,12 +15383,36 @@ class SQLiteStore:
                         )
                     return changed
                 if state in {TaskState.CLAIMED, TaskState.RUNNING}:
-                    return conn.execute(
+                    changed = conn.execute(
                         """UPDATE tasks SET state = 'cancel_requested', updated_at = ?,
-                           cancel_requested_at = ? WHERE task_id = ? AND state IN ('claimed', 'running')""",
+                           cancel_requested_at = ? WHERE task_id = ? AND state IN ('dispatching', 'running')""",
                         (now_text, now_text, task_id),
                     ).rowcount == 1
-                return state == TaskState.CANCEL_REQUESTED
+                    if changed:
+                        current_id = conn.execute(
+                            "SELECT current_execution_id FROM tasks WHERE task_id=?",
+                            (task_id,),
+                        ).fetchone()[0]
+                        if conn.execute(
+                            "UPDATE task_executions SET state='cancel_requested' "
+                            "WHERE execution_id=? AND state IN ('dispatching','running')",
+                            (current_id,),
+                        ).rowcount != 1:
+                            raise StoreError("execution cancellation projection conflicts")
+                        if conn.execute(
+                            "UPDATE agent_invocations SET state='cancel_requested',updated_at=? "
+                            "WHERE invocation_id=? AND state IN ('dispatching','running')",
+                            (now_text, current_id),
+                        ).rowcount != 1:
+                            raise StoreError("invocation cancellation projection conflicts")
+                    return changed
+                # Cancellation commands are replay-safe.  Once the exact task
+                # is already cancelled, acknowledge the durable outcome rather
+                # than reporting a fresh failure to a redelivered command.
+                return state in {
+                    TaskState.CANCEL_REQUESTED,
+                    TaskState.CANCELLED,
+                }
 
         return await self._call(op)
 
@@ -6492,6 +15430,7 @@ class SQLiteStore:
             raw_snapshot = json_loads(row["execution_snapshot_json"], {})
             if isinstance(raw_snapshot, Mapping):
                 snapshot = dict(raw_snapshot)
+        stored_state = str(row["state"])
         return AgentMailboxItem(
             mailbox_id=row["mailbox_id"],
             message_id=row["message_id"],
@@ -6499,7 +15438,11 @@ class SQLiteStore:
             source_agent_id=row["source_agent_id"],
             destination_agent_id=row["destination_agent_id"],
             content=row["content"],
-            state=MailboxState(row["state"]),
+            state=(
+                MailboxState.CLAIMED
+                if stored_state == "dispatching"
+                else MailboxState(stored_state)
+            ),
             claim_token=row["claim_token"],
             claimed_by=row["claimed_by"],
             lease_expires_at=text_to_datetime(row["lease_expires_at"]),
@@ -6511,6 +15454,11 @@ class SQLiteStore:
             task_id=row["task_id"],
             payload=json_loads(row["payload_json"], {}) or {},
             execution_snapshot=snapshot,
+            destination_agent_incarnation=int(row["destination_agent_incarnation"]),
+            current_invocation_id=row["current_invocation_id"],
+            expires_at=text_to_datetime(
+                row["expires_at"] if "expires_at" in row.keys() else None
+            ),
         )
 
     @classmethod
@@ -6541,6 +15489,7 @@ class SQLiteStore:
         destination = str(destination_agent_id or "").strip()
         if not destination:
             raise StoreError("mailbox destination Agent is required")
+        mailbox_conversation = mailbox_conversation_id(destination, request_id)
 
         def value(source: Any, name: str, default: Any = None) -> Any:
             if source is None:
@@ -6585,7 +15534,10 @@ class SQLiteStore:
                 raw_metadata = json_loads(raw_metadata, {})
             supplied_map = {
                 "agent_id": destination,
-                "conversation_id": str(value(task_scope, "conversation_id", "")),
+                # A correlated response may reuse the destination Agent's
+                # immutable policy tuple, but never its foreground provider
+                # thread.  Mailbox execution is isolated per logical request.
+                "conversation_id": mailbox_conversation,
                 "reply_target": owner_target.to_dict(),
                 "mode_id": str(value(task_scope, "mode_id", "chat") or "chat"),
                 "profile_version": int(
@@ -6636,34 +15588,12 @@ class SQLiteStore:
         has_complete_route = bool(
             target.channel and target.bot_id and target.external_user_id
         )
-        canonical_conversation = (
-            canonical_conversation_id(
-                target.channel,
-                target.bot_id,
-                target.external_user_id,
-                target.session_id,
-                destination,
-            )
-            if has_complete_route
-            else ""
-        )
         supplied_conversation = str(
             supplied_map.get("conversation_id", "") or ""
         ).strip()
-        conversation_id = (
-            cls._resolve_scoped_conversation_tx(
-                conn,
-                supplied_conversation,
-                channel=target.channel,
-                bot_id=target.bot_id,
-                external_user_id=target.external_user_id,
-                session_id=target.session_id,
-                agent_id=destination,
-            )
-            if canonical_conversation
-            else supplied_conversation
-            or mailbox_conversation_id(destination, request_id)
-        )
+        if supplied_conversation and supplied_conversation != mailbox_conversation:
+            raise StoreError("mailbox conversation identity conflicts")
+        conversation_id = mailbox_conversation
 
         # Resolve destination mode/profile versions from durable definitions
         # only when the manager did not provide a complete immutable snapshot.
@@ -6752,6 +15682,7 @@ class SQLiteStore:
 
         metadata = supplied_map.get("metadata")
         metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+        metadata.pop("session_role", None)
 
         def profile_snapshot(row: Any) -> dict[str, Any] | None:
             if row is None:
@@ -6835,8 +15766,9 @@ class SQLiteStore:
         external_user_id: str,
         session_id: str,
         agent_id: str,
+        mailbox_request_id: str | None = None,
     ) -> str:
-        """Resolve a canonical conversation, preserving only proven legacy rows."""
+        """Resolve a user or exact request-scoped mailbox conversation."""
 
         candidates = conversation_id_candidates(
             channel,
@@ -6847,6 +15779,15 @@ class SQLiteStore:
         )
         canonical_id = candidates[0]
         requested = str(conversation_id or "").strip()
+        if requested.startswith("agent-mailbox:"):
+            expected_mailbox_id = (
+                mailbox_conversation_id(agent_id, mailbox_request_id)
+                if mailbox_request_id
+                else ""
+            )
+            if not expected_mailbox_id or requested != expected_mailbox_id:
+                raise StoreError("mailbox conversation identity conflicts")
+            return requested
         if not requested or requested == canonical_id:
             return canonical_id
         legacy_id = candidates[-1]
@@ -8134,6 +17075,8 @@ class SQLiteStore:
         delivery_mode: DeliveryMode | str = DeliveryMode.PUSH_ELIGIBLE,
         execution_snapshot: Mapping[str, Any] | None = None,
         allow_compatibility_final: bool = False,
+        max_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
+        max_global_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
     ) -> None:
         """Create user/mailbox projections for an already-appended event."""
         visibility = _enum_value(event.visibility, EventVisibility.INTERNAL.value)
@@ -8243,12 +17186,35 @@ class SQLiteStore:
                     )
                 return
             mailbox_id = _uuid()
+            cls._ensure_profile_mode_tx(
+                conn,
+                agent_id=str(event.destination_agent_id),
+                profile_version=int(mailbox_snapshot["profile_version"]),
+                mode_id=str(mailbox_snapshot["mode_id"]),
+                policy_version=int(mailbox_snapshot["policy_version"]),
+                now=_utc_text(event.created_at),
+                metadata=mailbox_snapshot.get("metadata", {}),
+            )
+            destination_incarnation = cls._current_agent_incarnation_tx(
+                conn,
+                str(event.destination_agent_id),
+                int(mailbox_snapshot["profile_version"]),
+            )
+            mailbox_created_at = _utc_text(event.created_at)
+            mailbox_created_time = text_to_datetime(mailbox_created_at)
+            if mailbox_created_time is None:  # pragma: no cover - canonical helper.
+                raise StoreError("mailbox event creation timestamp is invalid")
+            mailbox_expires_at = datetime_to_text(
+                mailbox_created_time
+                + timedelta(seconds=DEFAULT_MAILBOX_TTL_SECONDS)
+            )
             conn.execute(
                 """INSERT OR IGNORE INTO agent_mailbox
                    (mailbox_id, message_id, request_id, reply_to_id, causation_id,
-                    source_agent_id, destination_agent_id, task_id, content,
-                    payload_json, execution_snapshot_json, state, attempts, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)""",
+                    source_agent_id, destination_agent_id, destination_agent_incarnation, task_id, content,
+                    payload_json, execution_snapshot_json, state, attempts,
+                    created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)""",
                 (
                     mailbox_id,
                     event.event_id,
@@ -8257,12 +17223,21 @@ class SQLiteStore:
                     event.causation_id,
                     task.agent_id,
                     event.destination_agent_id,
+                    destination_incarnation,
                     task.task_id,
                     event.content,
                     mailbox_payload,
                     json_dumps(mailbox_snapshot),
-                    _utc_text(event.created_at),
+                    mailbox_created_at,
+                    mailbox_expires_at,
                 ),
+            )
+            cls._create_queued_mailbox_invocation_tx(
+                conn,
+                mailbox_id=mailbox_id,
+                now=mailbox_created_at,
+                max_agent_queue=max_agent_queue,
+                max_global_queue=max_global_queue,
             )
             # Keep managed attachments alive for the mailbox lifetime.  The
             # event payload still retains unknown/channel-only references, but
@@ -8764,7 +17739,13 @@ class SQLiteStore:
                     and result.visibility == EventVisibility.USER
                     and not result.destination_agent_id
                 ):
-                    self._project_event_tx(conn, result, task=task)
+                    self._project_event_tx(
+                        conn,
+                        result,
+                        task=task,
+                        max_agent_queue=self.max_agent_queue,
+                        max_global_queue=self.max_global_queue,
+                    )
                 return result
 
         return await self._call(op)
@@ -9211,6 +18192,8 @@ class SQLiteStore:
                         allow_compatibility_final=(
                             item.event_id in terminal_reply_event_ids
                         ),
+                        max_agent_queue=self.max_agent_queue,
+                        max_global_queue=self.max_global_queue,
                     )
                 changed = conn.execute(
                     """UPDATE tasks SET state = ?, updated_at = ?, terminal_at = ?,
@@ -9261,6 +18244,16 @@ class SQLiteStore:
                     ).rowcount
                     if execution_changed != 1:
                         raise InvalidTransition("active execution could not be finalized")
+                    if not self._release_invocation_tx(
+                        conn,
+                        invocation_id=str(execution_id_value),
+                        state=target_state.value,
+                        now=now_text,
+                        last_error=error,
+                    ):
+                        raise StoreError(
+                            "task completion invocation was already released"
+                        )
                 refreshed = self._fetch_task_tx(conn, task_id)
                 if refreshed is None:
                     raise StoreError("completed task disappeared")
@@ -9338,13 +18331,58 @@ class SQLiteStore:
                             "task was claimed before its retry reply reservation"
                         )
                     return row
+                retained_execution_id = str(row.execution_id or "")
+                retained = conn.execute(
+                    """SELECT e.task_id,e.agent_id,e.agent_incarnation,
+                              e.state AS execution_state,e.finished_at,
+                              i.state AS invocation_state,
+                              i.admission_released_at
+                       FROM task_executions AS e
+                       JOIN agent_invocations AS i
+                         ON i.invocation_id=e.execution_id
+                       WHERE e.execution_id=?""",
+                    (retained_execution_id,),
+                ).fetchone()
+                expected_terminal_state = row.state.value
+                if (
+                    not retained_execution_id
+                    or retained is None
+                    or str(retained["task_id"]) != str(task_id)
+                    or str(retained["agent_id"]) != row.agent_id
+                    or int(retained["agent_incarnation"])
+                    != row.agent_incarnation
+                    or str(retained["execution_state"])
+                    != expected_terminal_state
+                    or str(retained["invocation_state"])
+                    != expected_terminal_state
+                    or retained["finished_at"] is None
+                    or retained["admission_released_at"] is None
+                ):
+                    raise StoreError(
+                        "retry execution/invocation truth conflicts"
+                    )
+                lifecycle = conn.execute(
+                    """SELECT lifecycle_state,desired_process_state
+                       FROM agent_lifecycle
+                       WHERE agent_id=? AND agent_incarnation=?""",
+                    (row.agent_id, row.agent_incarnation),
+                ).fetchone()
+                if (
+                    lifecycle is None
+                    or str(lifecycle["lifecycle_state"]) != "enabled"
+                    or str(lifecycle["desired_process_state"]) != "running"
+                ):
+                    raise InvalidTransition(
+                        "cannot retry work for an inactive Agent incarnation"
+                    )
                 conn.execute(
                     """UPDATE tasks SET state = 'queued', claimed_by = NULL,
                            claim_token = NULL, lease_expires_at = NULL,
                            next_attempt_at = ?, last_error = NULL, updated_at = ?,
                            result_json = NULL, terminal_at = NULL,
                            cancel_requested_at = NULL,
-                           pending_delivery_reply_scope_id=? WHERE task_id = ?""",
+                           pending_delivery_reply_scope_id=?,
+                           current_execution_id=NULL WHERE task_id = ?""",
                     (next_at, now_text, pending_scope_id, task_id),
                 )
                 # Preserve history and make the explicit retry auditable.
@@ -9355,7 +18393,15 @@ class SQLiteStore:
                     visibility=EventVisibility.INTERNAL,
                     priority=EventPriority.SILENT,
                     content=f"retry requested by {actor}" if actor else "retry requested",
+                    execution_id=retained_execution_id,
                     created_at=now_text,
+                )
+                self._create_queued_task_invocation_tx(
+                    conn,
+                    task_id=task_id,
+                    now=now_text,
+                    max_agent_queue=self.max_agent_queue,
+                    max_global_queue=self.max_global_queue,
                 )
                 return self._fetch_task_tx(conn, task_id)
 
@@ -9365,13 +18411,19 @@ class SQLiteStore:
 
     async def cancel_task(self, task_id: str, *, actor: str = "", now: datetime | str | None = None) -> bool:
         """Cancel a queued task or request cancellation for an active one."""
+        snapshot = await self.get_task(task_id)
+        if snapshot is None:
+            return False
+        if snapshot.state != TaskState.ORPHANED:
+            return await self.request_cancel(task_id, now=now)
         now_text = self._now(now)
         def op(conn: sqlite3.Connection) -> bool:
             with _transaction(conn):
                 row = conn.execute("SELECT state FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
                 if row is None:
                     return False
-                state = TaskState(row["state"])
+                stored_state = str(row["state"])
+                state = TaskState.CLAIMED if stored_state == "dispatching" else TaskState(stored_state)
                 if state in {TaskState.QUEUED, TaskState.ORPHANED}:
                     changed = conn.execute(
                         "UPDATE tasks SET state='cancelled', updated_at=?, terminal_at=? WHERE task_id=? AND state=?",
@@ -9541,7 +18593,9 @@ class SQLiteStore:
                 changed = conn.execute(
                     "UPDATE command_receipts SET state='started', "
                     "interrupted_at=NULL, completed_at=NULL, response_text=NULL, "
-                    "response_agent_id=NULL, presentation_ids_json='[]' "
+                    "response_agent_id=NULL, presentation_ids_json='[]', "
+                    "response_fragments_json='[]', "
+                    "outcome_json='{}' "
                     "WHERE command_id=? AND state='interrupted'",
                     (command_id,),
                 ).rowcount
@@ -9565,6 +18619,7 @@ class SQLiteStore:
         response_text: str,
         response_agent_id: str = "",
         presentation_ids: Iterable[str] = (),
+        response_fragments: Iterable[Mapping[str, Any]] = (),
         allow_interrupted: bool = False,
         now: datetime | str | None = None,
     ) -> dict[str, Any]:
@@ -9577,6 +18632,9 @@ class SQLiteStore:
         response_agent_id = str(response_agent_id or "")
         presentation_values = tuple(
             dict.fromkeys(str(value) for value in (presentation_ids or ()) if value)
+        )
+        fragment_values = self._normalize_command_response_fragments(
+            response_fragments
         )
         now_text = self._now(now)
 
@@ -9597,11 +18655,43 @@ class SQLiteStore:
                         != response_agent_id
                         or tuple(existing.get("presentation_ids", ()))
                         != presentation_values
+                        or tuple(existing.get("response_fragments", ()))
+                        != fragment_values
                     ):
                         raise StoreError(
                             f"command receipt completion conflicts: {command_id}"
                         )
                     return existing
+                if (
+                    str(row["command_name"] or "").strip().lower() == "system"
+                ):
+                    # Read-form and invalid `/system` commands have no role
+                    # effect and may use ordinary receipt completion.  A valid
+                    # mutation must go through set_session_role so the role and
+                    # acknowledgement cannot be split across transactions.
+                    command_text = str(row["command_text"] or "")
+                    match = re.match(
+                        r"^\s*/system(?=$|\s)",
+                        command_text,
+                        flags=re.IGNORECASE,
+                    )
+                    system_mutation = False
+                    if match is not None:
+                        raw_tail = re.sub(
+                            r"^[ \t]*",
+                            "",
+                            command_text[match.end() :],
+                            count=1,
+                        )
+                        try:
+                            system_mutation = bool(normalize_role_text(raw_tail))
+                        except RoleValidationError:
+                            system_mutation = False
+                    if system_mutation:
+                        raise StoreError(
+                            "system role mutation receipt requires atomic completion: "
+                            f"{command_id}"
+                        )
                 if existing_state == "interrupted" and allow_interrupted:
                     if str(row["command_name"] or "").strip().lower() not in {
                         "ask",
@@ -9621,12 +18711,14 @@ class SQLiteStore:
                     """UPDATE command_receipts
                        SET state='completed', response_text=?,
                            response_agent_id=?, presentation_ids_json=?,
+                           response_fragments_json=?,
                            completed_at=?
                        WHERE command_id=? AND state=?""",
                     (
                         response_text,
                         response_agent_id,
                         json_dumps(list(presentation_values)),
+                        json_dumps(list(fragment_values)),
                         now_text,
                         command_id,
                         existing_state,
@@ -10695,6 +19787,7 @@ class SQLiteStore:
         client_id: str | None = None,
         contextless_client_id: str | None = None,
         from_user_id: str | None = None,
+        present_outbox_ids: Iterable[str] = (),
         now: datetime | str | None = None,
     ) -> ReplyProjectionResult:
         """Idempotently retain and allocate one completed reply item."""
@@ -10702,10 +19795,16 @@ class SQLiteStore:
         reply_target = self._coerce_reply_target(target)
         attachment_values = tuple(attachments or ())
         fragment_values = tuple(fragments) if fragments is not None else None
+        presentation_values = tuple(
+            dict.fromkeys(
+                str(value) for value in (present_outbox_ids or ()) if value
+            )
+        )
+        now_text = self._now(now)
 
         def op(conn: sqlite3.Connection) -> ReplyProjectionResult:
             with _transaction(conn):
-                return self._project_reply_candidate_tx(
+                projection = self._project_reply_candidate_tx(
                     conn,
                     target=reply_target,
                     source_key=source_key,
@@ -10728,8 +19827,16 @@ class SQLiteStore:
                     preferred_client_id=client_id,
                     preferred_contextless_client_id=contextless_client_id,
                     from_user_id=from_user_id,
-                    now=self._now(now),
+                    now=now_text,
                 )
+                if presentation_values:
+                    self._present_projection_ids_tx(
+                        conn,
+                        presentation_ids=presentation_values,
+                        target=reply_target,
+                        now=now_text,
+                    )
+                return projection
 
         return await self._call(op)
 
@@ -10936,6 +20043,81 @@ class SQLiteStore:
                 )
 
         return await self._call(op)
+
+    @classmethod
+    def _present_projection_ids_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        presentation_ids: Sequence[str],
+        target: ReplyTarget,
+        now: str,
+    ) -> None:
+        """Atomically mark outbox or inbox-candidate identities presented."""
+
+        values = tuple(dict.fromkeys(str(value) for value in presentation_ids if value))
+        if not values:
+            return
+        placeholders = ",".join("?" for _ in values)
+        outbox_rows = conn.execute(
+            f"SELECT outbox_id AS presentation_id, channel, bot_id, "
+            f"external_user_id, session_id FROM user_outbox "
+            f"WHERE outbox_id IN ({placeholders})",
+            values,
+        ).fetchall()
+        candidate_rows = conn.execute(
+            f"SELECT reply_candidate_id AS presentation_id, channel, bot_id, "
+            f"external_user_id, session_id FROM reply_candidates "
+            f"WHERE reply_candidate_id IN ({placeholders})",
+            values,
+        ).fetchall()
+        rows = [*outbox_rows, *candidate_rows]
+        found = [str(row["presentation_id"]) for row in rows]
+        if len(found) != len(values) or set(found) != set(values):
+            raise StoreError(
+                "command presentation references an unavailable or ambiguous item"
+            )
+        expected_scope = (
+            str(target.channel),
+            str(target.bot_id),
+            str(target.external_user_id),
+            str(target.session_id or "default"),
+        )
+        if any(
+            (
+                str(row["channel"] or ""),
+                str(row["bot_id"] or ""),
+                str(row["external_user_id"] or ""),
+                str(row["session_id"] or "default"),
+            )
+            != expected_scope
+            for row in rows
+        ):
+            raise StoreError(
+                "command presentation conflicts with user/session ownership"
+            )
+        if outbox_rows:
+            outbox_ids = [str(row["presentation_id"]) for row in outbox_rows]
+            outbox_placeholders = ",".join("?" for _ in outbox_ids)
+            conn.execute(
+                f"UPDATE user_outbox SET presentation='presented', "
+                f"presented_at=COALESCE(presented_at, ?) "
+                f"WHERE outbox_id IN ({outbox_placeholders}) "
+                f"AND presentation='unseen'",
+                (now, *outbox_ids),
+            )
+        if candidate_rows:
+            candidate_ids = [
+                str(row["presentation_id"]) for row in candidate_rows
+            ]
+            candidate_placeholders = ",".join("?" for _ in candidate_ids)
+            conn.execute(
+                f"UPDATE reply_candidates SET presentation='presented', "
+                f"presented_at=COALESCE(presented_at, ?) "
+                f"WHERE reply_candidate_id IN ({candidate_placeholders}) "
+                f"AND presentation='unseen'",
+                (now, *candidate_ids),
+            )
 
     async def create_user_outbox(
         self,
@@ -11235,41 +20417,11 @@ class SQLiteStore:
                         now=now_text,
                     )
                     if presentation_values:
-                        placeholders = ",".join("?" for _ in presentation_values)
-                        presentation_rows = conn.execute(
-                            f"SELECT outbox_id, channel, bot_id, external_user_id, "
-                            f"session_id FROM user_outbox WHERE outbox_id IN ({placeholders})",
-                            presentation_values,
-                        ).fetchall()
-                        if len(presentation_rows) != len(presentation_values):
-                            raise StoreError(
-                                "command presentation references an unavailable outbox item"
-                            )
-                        expected_scope = (
-                            str(target.channel),
-                            str(target.bot_id),
-                            str(target.external_user_id),
-                            str(target.session_id or "default"),
-                        )
-                        if any(
-                            tuple(
-                                str(row[name] or ("default" if name == "session_id" else ""))
-                                for name in (
-                                    "channel", "bot_id", "external_user_id", "session_id"
-                                )
-                            )
-                            != expected_scope
-                            for row in presentation_rows
-                        ):
-                            raise StoreError(
-                                "command presentation conflicts with user/session ownership"
-                            )
-                        conn.execute(
-                            f"UPDATE user_outbox SET presentation='presented', "
-                            f"presented_at=COALESCE(presented_at, ?) "
-                            f"WHERE outbox_id IN ({placeholders}) "
-                            f"AND presentation='unseen'",
-                            (now_text, *presentation_values),
+                        self._present_projection_ids_tx(
+                            conn,
+                            presentation_ids=presentation_values,
+                            target=target,
+                            now=now_text,
                         )
                     return projection
                 self._assert_reply_wire_ids_available_tx(
@@ -11362,39 +20514,11 @@ class SQLiteStore:
                 ):
                     raise StoreError(f"outbox identity conflicts: {outbox_value} (attachments)")
                 if presentation_values:
-                    placeholders = ",".join("?" for _ in presentation_values)
-                    presentation_rows = conn.execute(
-                        f"SELECT outbox_id, channel, bot_id, external_user_id, "
-                        f"session_id FROM user_outbox WHERE outbox_id IN ({placeholders})",
-                        presentation_values,
-                    ).fetchall()
-                    if len(presentation_rows) != len(presentation_values):
-                        raise StoreError(
-                            "command presentation references an unavailable outbox item"
-                        )
-                    expected_scope = (
-                        str(target.channel),
-                        str(target.bot_id),
-                        str(target.external_user_id),
-                        str(target.session_id or "default"),
-                    )
-                    for presentation_row in presentation_rows:
-                        actual_scope = (
-                            str(presentation_row["channel"] or ""),
-                            str(presentation_row["bot_id"] or ""),
-                            str(presentation_row["external_user_id"] or ""),
-                            str(presentation_row["session_id"] or "default"),
-                        )
-                        if actual_scope != expected_scope:
-                            raise StoreError(
-                                "command presentation conflicts with user/session ownership"
-                            )
-                    conn.execute(
-                        f"UPDATE user_outbox SET presentation='presented', "
-                        f"presented_at=COALESCE(presented_at, ?) "
-                        f"WHERE outbox_id IN ({placeholders}) "
-                        f"AND presentation='unseen'",
-                        (now_text, *presentation_values),
+                    self._present_projection_ids_tx(
+                        conn,
+                        presentation_ids=presentation_values,
+                        target=target,
+                        now=now_text,
                     )
                 durable = self._outbox_from_row(row)
                 if durable is None:
@@ -11987,7 +21111,7 @@ class SQLiteStore:
         now_text = self._now(now)
         def op(conn: sqlite3.Connection) -> bool:
             with _transaction(conn):
-                return conn.execute(
+                changed = conn.execute(
                     """UPDATE user_outbox SET state='pending', next_attempt_at=?,
                            last_error=NULL WHERE outbox_id=? AND state IN ('delivery_unknown','failed_permanent')""",
                     (now_text, outbox_id),
@@ -12975,6 +22099,86 @@ class SQLiteStore:
                 ).rowcount == 1
         return await self._call(op)
 
+    async def present_inbox_candidates(
+        self,
+        *,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str,
+        agent_id: str,
+        limit: int = 100,
+        present: bool = True,
+        switch_only: bool = False,
+    ) -> list[ReplyCandidateRecord]:
+        """Select completed items retained exclusively for explicit inbox use.
+
+        Candidate identity is the item-based reply boundary.  Requiring every
+        fragment to remain ``inbox_only`` excludes allocated/wire-sent output
+        and quota-deferred output (which belongs solely to ``/recv``).
+        ``switch_only`` additionally selects the immutable background class
+        captured while another Agent owned the front route.
+        """
+
+        def op(conn: sqlite3.Connection) -> list[ReplyCandidateRecord]:
+            with _transaction(conn):
+                filters = [
+                    "c.channel=?",
+                    "c.bot_id=?",
+                    "c.external_user_id=?",
+                    "c.session_id=?",
+                    "c.agent_id=?",
+                    "c.presentation='unseen'",
+                    "length(trim(c.content)) > 0",
+                    "EXISTS (SELECT 1 FROM reply_fragments AS f "
+                    "WHERE f.reply_candidate_id=c.reply_candidate_id)",
+                    "NOT EXISTS (SELECT 1 FROM reply_fragments AS f "
+                    "WHERE f.reply_candidate_id=c.reply_candidate_id "
+                    "AND f.state <> 'inbox_only')",
+                ]
+                params: list[Any] = [
+                    str(channel),
+                    str(bot_id),
+                    str(external_user_id),
+                    str(session_id or "default"),
+                    str(agent_id),
+                ]
+                if switch_only:
+                    filters.append("c.foreground=0")
+                params.append(max(0, int(limit)))
+                rows = conn.execute(
+                    "SELECT c.* FROM reply_candidates AS c WHERE "
+                    + " AND ".join(filters)
+                    + " ORDER BY c.priority DESC, c.created_at ASC, "
+                    "c.reply_candidate_id ASC LIMIT ?",
+                    params,
+                ).fetchall()
+                ids = [str(row["reply_candidate_id"]) for row in rows]
+                if ids and present:
+                    placeholders = ",".join("?" for _ in ids)
+                    conn.execute(
+                        f"UPDATE reply_candidates SET presentation='presented', "
+                        f"presented_at=COALESCE(presented_at, ?) "
+                        f"WHERE reply_candidate_id IN ({placeholders}) "
+                        f"AND presentation='unseen'",
+                        (self._now(), *ids),
+                    )
+                    rows = conn.execute(
+                        f"SELECT * FROM reply_candidates WHERE "
+                        f"reply_candidate_id IN ({placeholders}) "
+                        f"ORDER BY priority DESC, created_at ASC, "
+                        f"reply_candidate_id ASC",
+                        ids,
+                    ).fetchall()
+                return [
+                    candidate
+                    for row in rows
+                    if (candidate := self._reply_candidate_from_row(row))
+                    is not None
+                ]
+
+        return await self._call(op)
+
     async def present_unseen(
         self,
         *,
@@ -13099,7 +22303,12 @@ class SQLiteStore:
     ) -> list[AgentMailboxItem]:
         filters = ["destination_agent_id = ?"]; params: list[Any] = [destination_agent_id]
         if states is not None:
-            values = [_enum_value(item) for item in states]
+            values = [
+                "dispatching"
+                if _enum_value(item) == MailboxState.CLAIMED.value
+                else _enum_value(item)
+                for item in states
+            ]
             if not values:
                 return []
             filters.append("state IN (" + ",".join("?" for _ in values) + ")"); params.extend(values)
@@ -13121,6 +22330,464 @@ class SQLiteStore:
         return await self._call(op)
 
     get_agent_mailbox_item = get_mailbox_item
+
+    async def get_mailbox_orphan_review(
+        self,
+        mailbox_maintenance_id: str,
+    ) -> MailboxOrphanReviewRecord | None:
+        maintenance_id = self._process_required_text(
+            mailbox_maintenance_id,
+            "mailbox_maintenance_id",
+            max_length=128,
+        )
+        return await self._call(
+            lambda conn: self._mailbox_orphan_review_from_row(
+                conn.execute(
+                    "SELECT * FROM mailbox_orphan_reviews "
+                    "WHERE mailbox_maintenance_id=?",
+                    (maintenance_id,),
+                ).fetchone()
+            )
+        )
+
+    async def list_mailbox_orphan_reviews(
+        self,
+        *,
+        mailbox_message_id: str | None = None,
+        limit: int = 100,
+    ) -> list[MailboxOrphanReviewRecord]:
+        filters: list[str] = []
+        params: list[Any] = []
+        if mailbox_message_id is not None:
+            filters.append("mailbox_message_id=?")
+            params.append(str(mailbox_message_id))
+        where = " WHERE " + " AND ".join(filters) if filters else ""
+        params.append(max(0, int(limit)))
+        return await self._call(
+            lambda conn: [
+                review
+                for row in conn.execute(
+                    "SELECT * FROM mailbox_orphan_reviews"
+                    + where
+                    + " ORDER BY reviewed_at,mailbox_maintenance_id LIMIT ?",
+                    params,
+                ).fetchall()
+                if (
+                    review := self._mailbox_orphan_review_from_row(row)
+                )
+                is not None
+            ]
+        )
+
+    @staticmethod
+    def _mailbox_retry_destination_is_eligible_tx(
+        conn: sqlite3.Connection,
+        mailbox: sqlite3.Row,
+    ) -> bool:
+        """Return whether current durable policy still permits this retry.
+
+        The mailbox keeps its immutable execution snapshot, but retry is a new
+        admission decision.  Resolve the exact destination incarnation's
+        current Profile through the lifecycle foreign key.  Request envelopes
+        must still be accepted by that Profile; correlated responses retain
+        the authority established by their original request and therefore do
+        not acquire a new request-ACL requirement.
+        """
+
+        destination = conn.execute(
+            """SELECT lifecycle.lifecycle_state,
+                      lifecycle.desired_process_state,
+                      profile.enabled,
+                      profile.allowed_request_types_json,
+                      profile.denied_request_types_json
+                 FROM agent_lifecycle AS lifecycle
+                 JOIN agent_profiles AS profile
+                   ON profile.agent_id=lifecycle.agent_id
+                  AND profile.profile_version=lifecycle.profile_version
+                WHERE lifecycle.agent_id=?
+                  AND lifecycle.agent_incarnation=?""",
+            (
+                mailbox["destination_agent_id"],
+                mailbox["destination_agent_incarnation"],
+            ),
+        ).fetchone()
+        if (
+            destination is None
+            or str(destination["lifecycle_state"])
+            != AgentLifecycleState.ENABLED.value
+            or str(destination["desired_process_state"])
+            != AgentDesiredProcessState.RUNNING.value
+            or destination["enabled"] != 1
+        ):
+            return False
+
+        if str(mailbox["reply_to_id"] or "").strip():
+            return True
+
+        payload = json_loads(mailbox["payload_json"], None)
+        if not isinstance(payload, Mapping):
+            return False
+        raw_request_type = payload.get("request_type")
+        if not isinstance(raw_request_type, str):
+            return False
+        request_type = raw_request_type.strip()
+        if not request_type:
+            return False
+
+        allowed_values = json_loads(
+            destination["allowed_request_types_json"],
+            None,
+        )
+        denied_values = json_loads(
+            destination["denied_request_types_json"],
+            None,
+        )
+        if not isinstance(allowed_values, list) or not isinstance(
+            denied_values,
+            list,
+        ):
+            return False
+        if not all(isinstance(value, str) for value in allowed_values):
+            return False
+        if not all(isinstance(value, str) for value in denied_values):
+            return False
+        allowed = {value.strip() for value in allowed_values if value.strip()}
+        denied = {value.strip() for value in denied_values if value.strip()}
+        return request_type in allowed and request_type not in denied
+
+    async def review_mailbox_orphan(
+        self,
+        mailbox_message_id: str,
+        expected_current_invocation_id: str,
+        mailbox_maintenance_id: str,
+        action: MailboxOrphanReviewAction | str,
+        *,
+        actor: str,
+        reason: str,
+        maintenance_grant: MailboxMaintenanceGrant | None = None,
+        authorized_at: datetime | str | None = None,
+        authorization_source: str | None = None,
+        administrator_authorized: bool | None = None,
+        now: datetime | str | None = None,
+    ) -> MailboxOrphanReviewRecord:
+        """Resolve one exact orphan incident under a supervisor grant.
+
+        A retry creates a fresh invocation and admission debit.  The old
+        invocation remains terminal and append-only; dead-letter likewise
+        resolves only the mailbox aggregate and review history.  Legacy
+        caller-supplied authorization fields are accepted only to fail closed;
+        they never substitute for the injected process-local authority.  A
+        live grant is deliberately non-consuming so the exact mutation can be
+        replayed in its issuing process.  After supervisor restart, recover a
+        lost response with :meth:`get_mailbox_orphan_review`; a newly timed
+        grant cannot reauthorize the old maintenance identity.
+        """
+
+        message_id = self._process_required_text(
+            mailbox_message_id,
+            "mailbox_message_id",
+        )
+        expected_invocation_id = self._process_required_text(
+            expected_current_invocation_id,
+            "expected_current_invocation_id",
+        )
+        maintenance_id = self._process_required_text(
+            mailbox_maintenance_id,
+            "mailbox_maintenance_id",
+            max_length=128,
+        )
+        try:
+            normalized_action = MailboxOrphanReviewAction(
+                str(_enum_value(action)).strip().lower()
+            )
+        except ValueError as exc:
+            raise ValueError("action must be retry or dead_letter") from exc
+        actor_text = self._process_required_text(actor, "actor")
+        reason_text = self._process_required_text(reason, "reason", max_length=4096)
+        authority = self._mailbox_maintenance_authority
+        if authority is None:
+            raise StoreError(
+                "mailbox orphan review maintenance is disabled"
+            )
+        if (
+            authorized_at is not None
+            or authorization_source is not None
+            or administrator_authorized is not None
+        ):
+            raise StoreError(
+                "caller-supplied mailbox maintenance authorization is not accepted"
+            )
+        try:
+            trusted_grant = authority.validate_mailbox_orphan_review(
+                maintenance_grant,
+                message_id,
+                expected_invocation_id,
+                maintenance_id,
+                normalized_action.value,
+                actor=actor_text,
+                reason=reason_text,
+            )
+        except (MaintenanceAuthorizationError, ValueError) as exc:
+            raise StoreError(str(exc)) from exc
+        payload_hash = canonical_mailbox_review_payload_hash(
+            message_id,
+            expected_invocation_id,
+            normalized_action.value,
+        )
+        if not hmac.compare_digest(payload_hash, trusted_grant.payload_hash):
+            raise StoreError("mailbox maintenance grant payload hash conflicts")
+        authorization_source_text = trusted_grant.authorization_source
+        authorized_at_text, authorized_at_time = self._process_timestamp(
+            trusted_grant.authorized_at,
+            "authorized_at",
+        )
+
+        def op(conn: sqlite3.Connection) -> MailboxOrphanReviewRecord:
+            with _transaction(conn):
+                now_text = self._now(now)
+                now_time = text_to_datetime(now_text)
+                if now_time is None:
+                    raise StoreError("mailbox review time is invalid")
+                if authorized_at_time > now_time:
+                    raise StoreError(
+                        "mailbox maintenance authorization is in the future"
+                    )
+                existing = conn.execute(
+                    "SELECT * FROM mailbox_orphan_reviews "
+                    "WHERE mailbox_maintenance_id=?",
+                    (maintenance_id,),
+                ).fetchone()
+                if existing is not None:
+                    expected_fields = {
+                        "payload_hash": payload_hash,
+                        "authorization_scheme": "process_grant_v1",
+                        "authorization_grant_digest": (
+                            trusted_grant.payload_digest
+                        ),
+                        "mailbox_message_id": message_id,
+                        "expected_current_invocation_id": expected_invocation_id,
+                        "action": normalized_action.value,
+                        "actor": actor_text,
+                        "reason": reason_text,
+                        "authorized_at": authorized_at_text,
+                        "authorization_source": authorization_source_text,
+                        "administrator_authorized": 1,
+                    }
+                    if any(
+                        str(existing[column]) != str(value)
+                        for column, value in expected_fields.items()
+                    ):
+                        raise StoreError(
+                            "mailbox maintenance identity conflicts: "
+                            + maintenance_id
+                        )
+                    replay = self._mailbox_orphan_review_from_row(
+                        existing,
+                        replayed=True,
+                    )
+                    if replay is None:  # pragma: no cover - row is present.
+                        raise StoreError("mailbox review replay disappeared")
+                    return replay
+
+                mailbox = conn.execute(
+                    "SELECT * FROM agent_mailbox WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()
+                if mailbox is None:
+                    raise NotFoundError(
+                        f"mailbox message not found: {message_id}"
+                    )
+                if (
+                    str(mailbox["state"]) != MailboxState.ORPHANED_MAILBOX.value
+                    or str(mailbox["current_invocation_id"] or "")
+                    != expected_invocation_id
+                ):
+                    raise InvalidTransition(
+                        "mailbox orphan review current invocation conflicts"
+                    )
+                old_invocation = conn.execute(
+                    """SELECT * FROM agent_invocations
+                        WHERE invocation_id=? AND work_kind='mailbox'
+                          AND mailbox_id=? AND work_id=? AND agent_id=?
+                          AND agent_incarnation=? AND state='orphaned'
+                          AND expires_at IS ?""",
+                    (
+                        expected_invocation_id,
+                        mailbox["mailbox_id"],
+                        mailbox["message_id"],
+                        mailbox["destination_agent_id"],
+                        mailbox["destination_agent_incarnation"],
+                        mailbox["expires_at"],
+                    ),
+                ).fetchone()
+                if old_invocation is None:
+                    raise StoreError(
+                        "mailbox orphan review invocation identity conflicts"
+                    )
+                old_updated_at = text_to_datetime(old_invocation["updated_at"])
+                old_terminal_at = text_to_datetime(old_invocation["terminal_at"])
+                if (
+                    old_updated_at is None
+                    or old_terminal_at is None
+                    or now_time < old_updated_at
+                    or now_time < old_terminal_at
+                ):
+                    raise StoreError(
+                        "mailbox review predates orphan terminalization"
+                    )
+
+                replacement_invocation_id: str | None = None
+                if normalized_action is MailboxOrphanReviewAction.DEAD_LETTER:
+                    outcome = MailboxOrphanReviewOutcome.DEAD_LETTERED
+                else:
+                    expiry_time = text_to_datetime(mailbox["expires_at"])
+                    if expiry_time is None:
+                        raise StoreError("mailbox expiry is invalid")
+                    if expiry_time <= now_time:
+                        outcome = (
+                            MailboxOrphanReviewOutcome.REJECTED_EXPIRED
+                        )
+                    elif not self._mailbox_retry_destination_is_eligible_tx(
+                        conn,
+                        mailbox,
+                    ):
+                        outcome = (
+                            MailboxOrphanReviewOutcome.REJECTED_AGENT_UNAVAILABLE
+                        )
+                    else:
+                        conn.execute("SAVEPOINT mailbox_retry_admission")
+                        try:
+                            sequence = self._reserve_invocation_admission_tx(
+                                conn,
+                                agent_id=str(mailbox["destination_agent_id"]),
+                                agent_incarnation=int(
+                                    mailbox["destination_agent_incarnation"]
+                                ),
+                                now=now_text,
+                                max_agent_queue=self.max_agent_queue,
+                                max_global_queue=self.max_global_queue,
+                            )
+                        except QueueFullError:
+                            conn.execute(
+                                "ROLLBACK TO SAVEPOINT mailbox_retry_admission"
+                            )
+                            conn.execute(
+                                "RELEASE SAVEPOINT mailbox_retry_admission"
+                            )
+                            outcome = (
+                                MailboxOrphanReviewOutcome.REJECTED_QUEUE_FULL
+                            )
+                        else:
+                            conn.execute(
+                                "RELEASE SAVEPOINT mailbox_retry_admission"
+                            )
+                            replacement_invocation_id = _uuid()
+                            conn.execute(
+                                """INSERT INTO agent_invocations (
+                                       invocation_id,work_kind,work_id,agent_id,
+                                       agent_incarnation,state,dispatch_backend,
+                                       ready_sequence,mailbox_id,next_attempt_at,
+                                       created_at,updated_at,expires_at)
+                                   VALUES (?,'mailbox',?,?,?,'queued',
+                                           'compatibility',?,?,NULL,?,?,?)""",
+                                (
+                                    replacement_invocation_id,
+                                    mailbox["message_id"],
+                                    mailbox["destination_agent_id"],
+                                    mailbox["destination_agent_incarnation"],
+                                    sequence,
+                                    mailbox["mailbox_id"],
+                                    now_text,
+                                    now_text,
+                                    mailbox["expires_at"],
+                                ),
+                            )
+                            outcome = MailboxOrphanReviewOutcome.RETRIED
+
+                conn.execute(
+                    """INSERT INTO mailbox_orphan_reviews (
+                           mailbox_maintenance_id,payload_hash,
+                           authorization_grant_digest,authorization_scheme,
+                           mailbox_id,
+                           mailbox_message_id,expected_current_invocation_id,
+                           action,actor,reason,authorized_at,
+                           authorization_source,administrator_authorized,
+                           outcome,replacement_invocation_id,reviewed_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)""",
+                    (
+                        maintenance_id,
+                        payload_hash,
+                        trusted_grant.payload_digest,
+                        "process_grant_v1",
+                        mailbox["mailbox_id"],
+                        message_id,
+                        expected_invocation_id,
+                        normalized_action.value,
+                        actor_text,
+                        reason_text,
+                        authorized_at_text,
+                        authorization_source_text,
+                        outcome.value,
+                        replacement_invocation_id,
+                        now_text,
+                    ),
+                )
+                if outcome is MailboxOrphanReviewOutcome.RETRIED:
+                    changed = conn.execute(
+                        """UPDATE agent_mailbox
+                              SET state='pending',current_invocation_id=?,
+                                  claimed_by=NULL,claim_token=NULL,
+                                  lease_expires_at=NULL,next_attempt_at=NULL,
+                                  processed_at=NULL,last_error=NULL
+                            WHERE mailbox_id=? AND message_id=?
+                              AND state='orphaned_mailbox'
+                              AND current_invocation_id=?""",
+                        (
+                            replacement_invocation_id,
+                            mailbox["mailbox_id"],
+                            message_id,
+                            expected_invocation_id,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise StoreError(
+                            "mailbox reviewed retry lost its current fence"
+                        )
+                elif outcome is MailboxOrphanReviewOutcome.DEAD_LETTERED:
+                    changed = conn.execute(
+                        """UPDATE agent_mailbox
+                              SET state='dead_letter',processed_at=?,
+                                  claimed_by=NULL,claim_token=NULL,
+                                  lease_expires_at=NULL,next_attempt_at=NULL,
+                                  last_error=COALESCE(last_error,?)
+                            WHERE mailbox_id=? AND message_id=?
+                              AND state='orphaned_mailbox'
+                              AND current_invocation_id=?""",
+                        (
+                            now_text,
+                            reason_text,
+                            mailbox["mailbox_id"],
+                            message_id,
+                            expected_invocation_id,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise StoreError(
+                            "mailbox reviewed dead-letter lost its current fence"
+                        )
+                stored = conn.execute(
+                    "SELECT * FROM mailbox_orphan_reviews "
+                    "WHERE mailbox_maintenance_id=?",
+                    (maintenance_id,),
+                ).fetchone()
+                result = self._mailbox_orphan_review_from_row(stored)
+                if result is None:  # pragma: no cover - insert is authoritative.
+                    raise StoreError("mailbox orphan review insert failed")
+                return result
+
+        return await self._call(op)
+
+    review_orphaned_mailbox = review_mailbox_orphan
 
     async def get_correlated_mailbox_response(
         self, mailbox_id: str
@@ -13170,18 +22837,54 @@ class SQLiteStore:
                 now_text = self._now(now)
                 lease = self._lease_deadline(now_text, lease_seconds)
                 rows = conn.execute(
-                    """SELECT * FROM agent_mailbox WHERE destination_agent_id=?
-                       AND state IN ('pending') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                       ORDER BY created_at ASC LIMIT ?""",
-                    (destination_agent_id, now_text, max(1, int(limit))),
+                    """SELECT mailbox.*
+                         FROM agent_mailbox AS mailbox
+                         JOIN agent_invocations AS ai
+                           ON ai.invocation_id=mailbox.current_invocation_id
+                          AND ai.work_kind='mailbox'
+                          AND ai.work_id=mailbox.message_id
+                          AND ai.mailbox_id=mailbox.mailbox_id
+                          AND ai.agent_id=mailbox.destination_agent_id
+                          AND ai.agent_incarnation=
+                              mailbox.destination_agent_incarnation
+                         JOIN agent_lifecycle AS lifecycle
+                           ON lifecycle.agent_id=mailbox.destination_agent_id
+                          AND lifecycle.agent_incarnation=
+                              mailbox.destination_agent_incarnation
+                        WHERE mailbox.destination_agent_id=?
+                          AND mailbox.state='pending'
+                          AND (mailbox.next_attempt_at IS NULL
+                               OR mailbox.next_attempt_at<=?)
+                          AND mailbox.expires_at>?
+                          AND ai.state='queued'
+                          AND ai.expires_at=mailbox.expires_at
+                          AND ai.dispatch_backend='compatibility'
+                          AND lifecycle.lifecycle_state='enabled'
+                          AND """
+                    + self._unified_invocation_claim_guard("ai")
+                    + " ORDER BY ai.ready_sequence ASC LIMIT 1",
+                    (destination_agent_id, now_text, now_text, now_text),
                 ).fetchall()
                 result: list[AgentMailboxItem] = []
                 for row in rows:
                     token = _uuid()
                     if conn.execute(
-                        "UPDATE agent_mailbox SET state='claimed', claimed_by=?, claim_token=?, lease_expires_at=?, attempts=attempts+1 WHERE mailbox_id=? AND state='pending'",
+                        "UPDATE agent_mailbox SET state='dispatching', claimed_by=?, claim_token=?, lease_expires_at=?, attempts=attempts+1 WHERE mailbox_id=? AND state='pending'",
                         (worker_id, token, lease, row["mailbox_id"]),
                     ).rowcount:
+                        if conn.execute(
+                            """UPDATE agent_invocations SET state='dispatching',
+                                   claimed_by=?,claim_token=?,lease_expires_at=?,updated_at=?
+                               WHERE invocation_id=? AND state='queued'
+                                 AND dispatch_backend='compatibility'
+                                 AND work_kind='mailbox' AND mailbox_id=?
+                                 AND agent_id=? AND agent_incarnation=?""",
+                            (worker_id, token, lease, now_text,
+                             row["current_invocation_id"], row["mailbox_id"],
+                             row["destination_agent_id"],
+                             row["destination_agent_incarnation"]),
+                        ).rowcount != 1:
+                            raise StoreError("mailbox invocation claim conflicts")
                         fresh = conn.execute("SELECT * FROM agent_mailbox WHERE mailbox_id=?", (row["mailbox_id"],)).fetchone()
                         item = self._mailbox_from_row(fresh)
                         if item is not None:
@@ -13205,11 +22908,23 @@ class SQLiteStore:
             with _transaction(conn):
                 now_text = self._now(now)
                 filters = (
-                    "mailbox_id=? AND state='claimed' AND claim_token=? "
+                    "mailbox_id=? AND state='dispatching' AND claim_token=? "
                     "AND lease_expires_at IS NOT NULL AND lease_expires_at > ?"
                 )
                 params: list[Any] = [mailbox_id, claim_token, now_text]
-                return conn.execute("UPDATE agent_mailbox SET state='processing' WHERE " + filters, params).rowcount == 1
+                changed = conn.execute("UPDATE agent_mailbox SET state='processing' WHERE " + filters, params).rowcount == 1
+                if changed:
+                    invocation = conn.execute(
+                        "SELECT current_invocation_id FROM agent_mailbox WHERE mailbox_id=?",
+                        (mailbox_id,),
+                    ).fetchone()[0]
+                    if conn.execute(
+                        "UPDATE agent_invocations SET state='running',updated_at=? "
+                        "WHERE invocation_id=? AND state='dispatching' AND claim_token=?",
+                        (now_text, invocation, claim_token),
+                    ).rowcount != 1:
+                        raise StoreError("mailbox invocation start conflicts")
+                return changed
         return await self._call(op)
 
     async def renew_mailbox_lease(
@@ -13235,14 +22950,26 @@ class SQLiteStore:
             with _transaction(conn):
                 now_text = self._now(now)
                 lease = self._lease_deadline(now_text, lease_seconds)
-                return conn.execute(
+                changed = conn.execute(
                     """UPDATE agent_mailbox SET lease_expires_at=?
                        WHERE mailbox_id=? AND claim_token=?
-                         AND state IN ('claimed','processing')
+                         AND state IN ('dispatching','processing')
                          AND lease_expires_at IS NOT NULL
                          AND lease_expires_at > ?""",
                     (lease, mailbox_id, claim_token, now_text),
                 ).rowcount == 1
+                if changed:
+                    invocation = conn.execute(
+                        "SELECT current_invocation_id FROM agent_mailbox WHERE mailbox_id=?",
+                        (mailbox_id,),
+                    ).fetchone()[0]
+                    if conn.execute(
+                        "UPDATE agent_invocations SET lease_expires_at=?,updated_at=? "
+                        "WHERE invocation_id=? AND claim_token=? AND state IN ('dispatching','running')",
+                        (lease, now_text, invocation, claim_token),
+                    ).rowcount != 1:
+                        raise StoreError("mailbox invocation lease conflicts")
+                return changed
 
         return await self._call(op)
 
@@ -13260,7 +22987,20 @@ class SQLiteStore:
                     "AND lease_expires_at IS NOT NULL AND lease_expires_at > ?"
                 )
                 params: list[Any] = [mailbox_id, claim_token, now_text]
-                return conn.execute("UPDATE agent_mailbox SET state='processed', processed_at=?, lease_expires_at=NULL, claim_token=NULL, claimed_by=NULL WHERE " + filters, [now_text, *params]).rowcount == 1
+                invocation = conn.execute(
+                    "SELECT current_invocation_id FROM agent_mailbox WHERE mailbox_id=?",
+                    (mailbox_id,),
+                ).fetchone()
+                changed = conn.execute("UPDATE agent_mailbox SET state='processed', processed_at=?, lease_expires_at=NULL, claim_token=NULL, claimed_by=NULL WHERE " + filters, [now_text, *params]).rowcount == 1
+                if changed:
+                    if not self._release_invocation_tx(
+                        conn, invocation_id=str(invocation[0]),
+                        state="completed", now=now_text,
+                    ):
+                        raise StoreError(
+                            "mailbox completion invocation was already released"
+                        )
+                return changed
         return await self._call(op)
 
     async def mark_mailbox_failed(
@@ -13268,7 +23008,7 @@ class SQLiteStore:
     ) -> bool:
         if not claim_token:
             return False
-        state = MailboxState.DEAD_LETTER if dead_letter else MailboxState.PENDING
+        state = MailboxState.DEAD_LETTER if dead_letter else MailboxState.ORPHANED_MAILBOX
         def op(conn: sqlite3.Connection) -> bool:
             with _transaction(conn):
                 now_text = self._now(now)
@@ -13277,7 +23017,21 @@ class SQLiteStore:
                     "AND lease_expires_at IS NOT NULL AND lease_expires_at > ?"
                 )
                 params: list[Any] = [mailbox_id, claim_token, now_text]
-                return conn.execute("UPDATE agent_mailbox SET state=?, last_error=?, next_attempt_at=?, lease_expires_at=NULL, claim_token=NULL, claimed_by=NULL WHERE " + filters, [state.value, error, now_text, *params]).rowcount == 1
+                invocation = conn.execute(
+                    "SELECT current_invocation_id FROM agent_mailbox WHERE mailbox_id=?",
+                    (mailbox_id,),
+                ).fetchone()
+                changed = conn.execute("UPDATE agent_mailbox SET state=?, last_error=?, next_attempt_at=NULL, lease_expires_at=NULL, claim_token=NULL, claimed_by=NULL WHERE " + filters, [state.value, error, *params]).rowcount == 1
+                if changed:
+                    if not self._release_invocation_tx(
+                        conn, invocation_id=str(invocation[0]),
+                        state="failed" if dead_letter else "orphaned",
+                        now=now_text, last_error=error,
+                    ):
+                        raise StoreError(
+                            "mailbox failure invocation was already released"
+                        )
+                return changed
         return await self._call(op)
 
     async def reject_mailbox(
@@ -13300,12 +23054,25 @@ class SQLiteStore:
                     "AND lease_expires_at IS NOT NULL AND lease_expires_at > ?"
                 )
                 params: list[Any] = [mailbox_id, claim_token, now_text]
-                return conn.execute(
+                invocation = conn.execute(
+                    "SELECT current_invocation_id FROM agent_mailbox WHERE mailbox_id=?",
+                    (mailbox_id,),
+                ).fetchone()
+                changed = conn.execute(
                     "UPDATE agent_mailbox SET state='rejected', last_error=?, "
                     "processed_at=?, next_attempt_at=NULL, lease_expires_at=NULL, "
                     "claim_token=NULL, claimed_by=NULL WHERE " + filters,
                     [error, now_text, *params],
                 ).rowcount == 1
+                if changed:
+                    if not self._release_invocation_tx(
+                        conn, invocation_id=str(invocation[0]), state="failed",
+                        now=now_text, last_error=error,
+                    ):
+                        raise StoreError(
+                            "mailbox rejection invocation was already released"
+                        )
+                return changed
 
         return await self._call(op)
 
@@ -13336,6 +23103,7 @@ class SQLiteStore:
         original_claim_token: str | None = None,
         require_active_task: bool = False,
         required_execution_id: str | None = None,
+        expires_at: datetime | str | None = None,
         now: datetime | str | None = None,
     ) -> AgentMailboxItem:
         """Create a correlated Agent mailbox message, never a user delivery."""
@@ -13356,6 +23124,22 @@ class SQLiteStore:
         def op(conn: sqlite3.Connection) -> AgentMailboxItem:
             with _transaction(conn):
                 now_text = self._now(now)
+                now_time = text_to_datetime(now_text)
+                if now_time is None:
+                    raise StoreError("mailbox creation time is invalid")
+                if expires_at is None:
+                    expiry_text = datetime_to_text(
+                        now_time + timedelta(seconds=self.mailbox_ttl_seconds)
+                    )
+                else:
+                    parsed_expiry = text_to_datetime(expires_at)
+                    expiry_text = (
+                        datetime_to_text(parsed_expiry)
+                        if parsed_expiry is not None
+                        else None
+                    )
+                    if expiry_text is None:
+                        raise ValueError("expires_at must be a valid timestamp")
                 if original_mailbox_id is not None:
                     original_claim = conn.execute(
                         """SELECT mailbox_id, message_id, request_id,
@@ -13396,12 +23180,7 @@ class SQLiteStore:
                     if task_id is None:
                         raise StoreError("Agent bridge requires a task ID")
                     active_task = conn.execute(
-                        """SELECT t.state, (
-                                   SELECT e.execution_id
-                                   FROM task_executions AS e
-                                   WHERE e.task_id=t.task_id
-                                   ORDER BY e.attempt DESC LIMIT 1
-                               ) AS execution_id
+                        """SELECT t.state, t.current_execution_id AS execution_id
                            FROM tasks AS t WHERE t.task_id=?""",
                         (task_id,),
                     ).fetchone()
@@ -13447,6 +23226,12 @@ class SQLiteStore:
                         )
                     if message_id is not None and str(existing["message_id"]) != str(mid):
                         raise StoreError("mailbox request message_id conflicts")
+                    if expires_at is not None and str(
+                        existing["expires_at"] or ""
+                    ) != str(expiry_text or ""):
+                        raise StoreError(
+                            "mailbox request expiry conflicts with existing request"
+                        )
                     if supplied_execution_snapshot is not None:
                         existing_snapshot = json_loads(
                             existing["execution_snapshot_json"]
@@ -13488,11 +23273,7 @@ class SQLiteStore:
                         "SELECT agent_id, channel, bot_id, external_user_id, "
                         "session_id, conversation_id, reply_target_json, mode_id, state, "
                         "profile_version, policy_version, model, reasoning_effort, "
-                        "metadata_json, ("
-                        "    SELECT e.execution_id FROM task_executions AS e "
-                        "    WHERE e.task_id=tasks.task_id "
-                        "    ORDER BY e.attempt DESC LIMIT 1"
-                        ") AS execution_id "
+                        "metadata_json, current_execution_id AS execution_id "
                         "FROM tasks WHERE task_id=?",
                         (task_id,),
                     ).fetchone()
@@ -13594,6 +23375,12 @@ class SQLiteStore:
                         "SELECT * FROM agent_mailbox WHERE message_id=?", (mid,)
                     ).fetchone()
                     if existing_mailbox is not None:
+                        if expires_at is not None and str(
+                            existing_mailbox["expires_at"] or ""
+                        ) != str(expiry_text or ""):
+                            raise StoreError(
+                                "mailbox message expiry conflicts with existing request"
+                            )
                         item = self._mailbox_from_row(existing_mailbox)
                         if item is not None:
                             return item
@@ -13604,12 +23391,27 @@ class SQLiteStore:
                     (mid, rid, reply_to_id, causation_id, task_id, source_agent_id, destination_agent_id, content, json_dumps(payload_snapshot), now_text),
                 )
                 mailbox_id = _uuid()
+                self._ensure_profile_mode_tx(
+                    conn,
+                    agent_id=destination_agent_id,
+                    profile_version=int(resolved_execution_snapshot["profile_version"]),
+                    mode_id=str(resolved_execution_snapshot["mode_id"]),
+                    policy_version=int(resolved_execution_snapshot["policy_version"]),
+                    now=now_text,
+                    metadata=resolved_execution_snapshot.get("metadata", {}),
+                )
+                destination_incarnation = self._current_agent_incarnation_tx(
+                    conn,
+                    destination_agent_id,
+                    int(resolved_execution_snapshot["profile_version"]),
+                )
                 conn.execute(
                     """INSERT INTO agent_mailbox
                        (mailbox_id, message_id, request_id, reply_to_id, causation_id,
-                        source_agent_id, destination_agent_id, task_id, content, payload_json,
-                        execution_snapshot_json, state, attempts, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)""",
+                        source_agent_id, destination_agent_id, destination_agent_incarnation, task_id, content, payload_json,
+                        execution_snapshot_json, state, attempts, created_at,
+                        expires_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)""",
                     (
                         mailbox_id,
                         mid,
@@ -13618,12 +23420,21 @@ class SQLiteStore:
                         causation_id,
                         source_agent_id,
                         destination_agent_id,
+                        destination_incarnation,
                         task_id,
                         content,
                         json_dumps(payload_snapshot),
                         json_dumps(resolved_execution_snapshot),
                         now_text,
+                        expiry_text,
                     ),
+                )
+                self._create_queued_mailbox_invocation_tx(
+                    conn,
+                    mailbox_id=mailbox_id,
+                    now=now_text,
+                    max_agent_queue=self.max_agent_queue,
+                    max_global_queue=self.max_global_queue,
                 )
                 # Retain managed attachments for the mailbox lifetime.  A
                 # channel-only/unknown reference stays in the structured
@@ -13715,6 +23526,541 @@ class SQLiteStore:
     # ------------------------------------------------------------------
     # Routes, profiles, modes, and conversations
     # ------------------------------------------------------------------
+    async def get_session_role(
+        self,
+        *,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str = "default",
+        agent_id: str,
+    ) -> dict[str, Any]:
+        """Return the selected immutable role without materializing default."""
+
+        scope = (
+            str(channel or ""),
+            str(bot_id or ""),
+            str(external_user_id or ""),
+            str(session_id or "default"),
+            str(agent_id or ""),
+        )
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any]:
+            row = conn.execute(
+                """SELECT selections.current_role_version AS selected_role_version,
+                          roles.*
+                   FROM session_agent_role_selections AS selections
+                   LEFT JOIN session_agent_roles AS roles
+                     ON roles.channel=selections.channel
+                    AND roles.bot_id=selections.bot_id
+                    AND roles.external_user_id=selections.external_user_id
+                    AND roles.session_id=selections.session_id
+                    AND roles.agent_id=selections.agent_id
+                    AND roles.role_version=selections.current_role_version
+                   WHERE selections.channel=? AND selections.bot_id=?
+                     AND selections.external_user_id=?
+                     AND selections.session_id=? AND selections.agent_id=?""",
+                scope,
+            ).fetchone()
+            if row is None:
+                return dict(_IMPLICIT_DEFAULT_ROLE)
+            if row["role_version"] is None:
+                raise StoreError(
+                    "session role selection references a missing version"
+                )
+            return self._role_snapshot_from_row(row)
+
+        return await self._call(op)
+
+    async def set_session_role(
+        self,
+        role_text: Any = "",
+        *,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str = "default",
+        agent_id: str,
+        kind: str | None = None,
+        normalized_content: Any | None = None,
+        actor: str = "",
+        created_by: str | None = None,
+        command_id: str | None = None,
+        now: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        """Select a new append-only role version for one session Agent.
+
+        Equality is checked against the current canonical bytes.  An
+        unchanged request performs no route, role, selection, or counter
+        write; a changed request materializes the implicit v0 row and current
+        front-Agent route in the same transaction.  When ``command_id`` names
+        a live ``/system`` receipt, the selection decision and its exact
+        acknowledgement are committed by this same transaction.
+        """
+
+        raw_content = role_text if normalized_content is None else normalized_content
+        try:
+            canonical_content = normalize_role_text(raw_content)
+        except RoleValidationError:
+            raise
+        if is_default_role_token(canonical_content) and (
+            kind is None or str(kind).strip().lower() == "default"
+        ):
+            canonical_content = ""
+            kind = "default"
+        requested_kind = str(kind or ("custom" if canonical_content else "default"))
+        requested_kind = requested_kind.strip().lower()
+        try:
+            # Version is replaced under the selection lock below.  Building a
+            # provisional snapshot here validates kind/content/reserved-token
+            # rules before opening a write transaction.
+            build_role_snapshot(
+                role_version=0,
+                kind=requested_kind,
+                normalized_content=canonical_content,
+            )
+        except RoleValidationError:
+            raise
+
+        scope = (
+            str(channel or ""),
+            str(bot_id or ""),
+            str(external_user_id or ""),
+            str(session_id or "default"),
+            str(agent_id or ""),
+        )
+        receipt_id = str(command_id or "").strip()
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any]:
+            with _transaction(conn):
+                receipt_row = None
+                if receipt_id:
+                    receipt_row = conn.execute(
+                        "SELECT * FROM command_receipts WHERE command_id=?",
+                        (receipt_id,),
+                    ).fetchone()
+                    if receipt_row is None:
+                        raise NotFoundError(
+                            f"command receipt not found: {receipt_id}"
+                        )
+                    expected_scope = {
+                        "channel": scope[0],
+                        "bot_id": scope[1],
+                        "external_user_id": scope[2],
+                        "session_id": scope[3],
+                    }
+                    for column, expected in expected_scope.items():
+                        if str(receipt_row[column] or "") != expected:
+                            raise StoreError(
+                                "system command receipt scope conflicts: "
+                                f"{receipt_id} ({column})"
+                            )
+                    if (
+                        str(receipt_row["command_name"] or "")
+                        .strip()
+                        .lower()
+                        != "system"
+                    ):
+                        raise StoreError(
+                            f"system command receipt name conflicts: {receipt_id}"
+                        )
+
+                    command_text = str(receipt_row["command_text"] or "")
+                    match = re.match(
+                        r"^\s*/system(?=$|\s)",
+                        command_text,
+                        flags=re.IGNORECASE,
+                    )
+                    if match is None:
+                        raise StoreError(
+                            f"system command receipt text conflicts: {receipt_id}"
+                        )
+                    raw_tail = re.sub(
+                        r"^[ \t]*", "", command_text[match.end() :], count=1
+                    )
+                    try:
+                        receipt_content = normalize_role_text(raw_tail)
+                    except RoleValidationError as exc:
+                        raise StoreError(
+                            "system command receipt mutation conflicts: "
+                            f"{receipt_id}"
+                        ) from exc
+                    if not receipt_content:
+                        raise StoreError(
+                            "system command receipt does not describe a mutation: "
+                            f"{receipt_id}"
+                        )
+                    receipt_kind = (
+                        "default"
+                        if is_default_role_token(receipt_content)
+                        else "custom"
+                    )
+                    if receipt_kind == "default":
+                        receipt_content = ""
+                    if (
+                        receipt_kind != requested_kind
+                        or receipt_content != canonical_content
+                    ):
+                        raise StoreError(
+                            "system command receipt mutation conflicts: "
+                            f"{receipt_id}"
+                        )
+                    parsed_tokens = tuple(command_text.strip()[1:].split())
+                    receipt_args = tuple(
+                        str(value)
+                        for value in (
+                            json_loads(receipt_row["command_args_json"], []) or []
+                        )
+                    )
+                    if (
+                        not parsed_tokens
+                        or parsed_tokens[0].lower() != "system"
+                        or receipt_args != parsed_tokens[1:]
+                    ):
+                        raise StoreError(
+                            "system command receipt identity conflicts: "
+                            f"{receipt_id} (command_args)"
+                        )
+                    receipt_state = str(receipt_row["state"] or "")
+                    if receipt_state not in {"started", "completed"}:
+                        raise StoreError(
+                            "system command receipt is not active: "
+                            f"{receipt_id} ({receipt_state or 'unknown'})"
+                        )
+
+                def finish(
+                    snapshot: Mapping[str, Any], *, changed: bool
+                ) -> dict[str, Any]:
+                    result = {**snapshot, "changed": bool(changed)}
+                    if receipt_row is None:
+                        return result
+
+                    state = str(receipt_row["state"] or "")
+                    if state == "completed":
+                        receipt = self._command_receipt_from_row(receipt_row) or {}
+                        response = str(receipt.get("response_text", "") or "")
+                        outcome = receipt.get("outcome")
+                        expected_outcome_keys = {
+                            "type",
+                            "version",
+                            "command_id",
+                            "scope",
+                            "role",
+                            "changed",
+                            "command_response",
+                            "response_agent_id",
+                            "presentation_ids",
+                        }
+                        if (
+                            not isinstance(outcome, Mapping)
+                            or set(outcome) != expected_outcome_keys
+                            or outcome.get("type") != "system_role"
+                            or type(outcome.get("version")) is not int
+                            or outcome.get("version") != 1
+                            or outcome.get("command_id") != receipt_id
+                            or outcome.get("scope")
+                            != {
+                                "channel": scope[0],
+                                "bot_id": scope[1],
+                                "external_user_id": scope[2],
+                                "session_id": scope[3],
+                                "agent_id": scope[4],
+                            }
+                            or type(outcome.get("changed")) is not bool
+                            or outcome.get("command_response") != response
+                            or outcome.get("response_agent_id") != scope[4]
+                            or outcome.get("presentation_ids") != []
+                            or str(receipt.get("response_agent_id", "") or "")
+                            != scope[4]
+                            or tuple(receipt.get("presentation_ids", ()))
+                            or tuple(receipt.get("response_fragments", ()))
+                        ):
+                            raise StoreError(
+                                "system command receipt completion conflicts: "
+                                f"{receipt_id}"
+                            )
+                        try:
+                            outcome_role = validate_role_snapshot(
+                                outcome.get("role")
+                            )
+                        except RoleValidationError as exc:
+                            raise StoreError(
+                                "system command receipt completion conflicts: "
+                                f"{receipt_id} (role snapshot)"
+                            ) from exc
+                        outcome_changed = bool(outcome["changed"])
+                        expected_response = (
+                            "system role: unchanged"
+                            if not outcome_changed
+                            else "system role: default"
+                            if outcome_role["kind"] == "default"
+                            else "system role: updated"
+                        )
+                        if (
+                            response != expected_response
+                            or outcome_role["kind"] != requested_kind
+                            or outcome_role["normalized_content"]
+                            != canonical_content
+                        ):
+                            raise StoreError(
+                                "system command receipt completion conflicts: "
+                                f"{receipt_id} (outcome)"
+                            )
+                        if int(outcome_role["role_version"]) == 0:
+                            if outcome_changed or outcome_role != _IMPLICIT_DEFAULT_ROLE:
+                                raise StoreError(
+                                    "system command receipt completion conflicts: "
+                                    f"{receipt_id} (implicit role)"
+                                )
+                        else:
+                            durable_role_row = conn.execute(
+                                """SELECT * FROM session_agent_roles
+                                   WHERE channel=? AND bot_id=?
+                                     AND external_user_id=? AND session_id=?
+                                     AND agent_id=? AND role_version=?""",
+                                (*scope, int(outcome_role["role_version"])),
+                            ).fetchone()
+                            if (
+                                durable_role_row is None
+                                or self._role_snapshot_from_row(durable_role_row)
+                                != outcome_role
+                            ):
+                                raise StoreError(
+                                    "system command receipt completion conflicts: "
+                                    f"{receipt_id} (durable role)"
+                                )
+                        return {
+                            **outcome_role,
+                            "changed": outcome_changed,
+                            "command_response": response,
+                            "command_receipt": receipt,
+                        }
+
+                    if any(
+                        (
+                            receipt_row["response_text"],
+                            receipt_row["response_agent_id"],
+                            receipt_row["completed_at"],
+                        )
+                    ) or tuple(
+                        str(value)
+                        for value in (
+                            json_loads(
+                                receipt_row["presentation_ids_json"], []
+                            )
+                            or []
+                        )
+                    ) or self._normalize_command_response_fragments(
+                        json_loads(
+                            receipt_row["response_fragments_json"], []
+                        )
+                        or []
+                    ) or json_loads(receipt_row["outcome_json"], {}) != {}:
+                        raise StoreError(
+                            "system command receipt completion conflicts: "
+                            f"{receipt_id}"
+                        )
+                    response = (
+                        "system role: unchanged"
+                        if not changed
+                        else "system role: default"
+                        if requested_kind == "default"
+                        else "system role: updated"
+                    )
+                    try:
+                        outcome_role = validate_role_snapshot(snapshot)
+                    except RoleValidationError as exc:
+                        raise StoreError(
+                            "system role outcome snapshot is invalid"
+                        ) from exc
+                    outcome = {
+                        "type": "system_role",
+                        "version": 1,
+                        "command_id": receipt_id,
+                        "scope": {
+                            "channel": scope[0],
+                            "bot_id": scope[1],
+                            "external_user_id": scope[2],
+                            "session_id": scope[3],
+                            "agent_id": scope[4],
+                        },
+                        "role": outcome_role,
+                        "changed": bool(changed),
+                        "command_response": response,
+                        "response_agent_id": scope[4],
+                        "presentation_ids": [],
+                    }
+                    updated = conn.execute(
+                        """UPDATE command_receipts
+                           SET state='completed', response_text=?,
+                               response_agent_id=?, presentation_ids_json='[]',
+                               outcome_json=?, completed_at=?
+                           WHERE command_id=? AND state='started'""",
+                        (
+                            response,
+                            scope[4],
+                            json_dumps(outcome),
+                            now_text,
+                            receipt_id,
+                        ),
+                    ).rowcount
+                    if updated != 1:
+                        raise StoreError(
+                            "system command receipt completion lost its reservation"
+                        )
+                    completed_row = conn.execute(
+                        "SELECT * FROM command_receipts WHERE command_id=?",
+                        (receipt_id,),
+                    ).fetchone()
+                    receipt = self._command_receipt_from_row(completed_row) or {}
+                    return {
+                        **result,
+                        "command_response": response,
+                        "command_receipt": receipt,
+                    }
+
+                if (
+                    receipt_row is not None
+                    and str(receipt_row["state"] or "") == "completed"
+                ):
+                    # The receipt outcome pins the original immutable role.
+                    # Replay must not consult the current selection or infer a
+                    # version from matching role content.
+                    return finish({}, changed=False)
+
+                selection = conn.execute(
+                    """SELECT current_role_version, next_role_version
+                       FROM session_agent_role_selections
+                       WHERE channel=? AND bot_id=? AND external_user_id=?
+                         AND session_id=? AND agent_id=?""",
+                    scope,
+                ).fetchone()
+                current = dict(_IMPLICIT_DEFAULT_ROLE)
+                if selection is not None:
+                    current_row = conn.execute(
+                        """SELECT * FROM session_agent_roles
+                           WHERE channel=? AND bot_id=? AND external_user_id=?
+                             AND session_id=? AND agent_id=?
+                             AND role_version=?""",
+                        (*scope, int(selection["current_role_version"])),
+                    ).fetchone()
+                    if current_row is None:
+                        raise StoreError(
+                            "session role selection references a missing version"
+                        )
+                    current = self._role_snapshot_from_row(current_row)
+                route = conn.execute(
+                    """SELECT active_agent_id FROM routes
+                       WHERE channel=? AND bot_id=? AND external_user_id=?
+                         AND session_id=?""",
+                    scope[:4],
+                ).fetchone()
+                if (
+                    route is not None
+                    and str(route["active_agent_id"] or "") != scope[4]
+                ):
+                    raise StoreError(
+                        "front Agent changed while setting the session role"
+                    )
+                if (
+                    current["kind"] == requested_kind
+                    and current["normalized_content"] == canonical_content
+                    and current["normalization_version"]
+                    == _IMPLICIT_DEFAULT_ROLE["normalization_version"]
+                    and current["persona_composition_version"]
+                    == ROLE_PERSONA_COMPOSITION_VERSION
+                ):
+                    return finish(current, changed=False)
+
+                if route is None:
+                    conn.execute(
+                        """INSERT INTO routes(
+                               channel, bot_id, external_user_id, session_id,
+                               active_agent_id, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        (*scope, now_text),
+                    )
+
+                # A changed selection and every future task can now reference
+                # the exact canonical default predecessor for this scope.
+                self._task_role_snapshot_tx(
+                    conn,
+                    metadata={"session_role": _IMPLICIT_DEFAULT_ROLE},
+                    channel=scope[0],
+                    bot_id=scope[1],
+                    external_user_id=scope[2],
+                    session_id=scope[3],
+                    agent_id=scope[4],
+                )
+                next_version = (
+                    int(selection["next_role_version"])
+                    if selection is not None
+                    else 1
+                )
+                snapshot = build_role_snapshot(
+                    role_version=next_version,
+                    kind=requested_kind,
+                    normalized_content=canonical_content,
+                )
+                conn.execute(
+                    """INSERT INTO session_agent_roles (
+                           channel, bot_id, external_user_id, session_id,
+                           agent_id, role_version, normalization_version,
+                           kind, normalized_content, content_hash,
+                           persona_composition_version, snapshot_hash,
+                           created_by, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        *scope,
+                        snapshot["role_version"],
+                        snapshot["normalization_version"],
+                        snapshot["kind"],
+                        snapshot["normalized_content"],
+                        snapshot["content_hash"],
+                        snapshot["persona_composition_version"],
+                        snapshot["snapshot_hash"],
+                        str(created_by if created_by is not None else actor or "")
+                        or None,
+                        now_text,
+                    ),
+                )
+                if selection is None:
+                    conn.execute(
+                        """INSERT INTO session_agent_role_selections (
+                               channel, bot_id, external_user_id, session_id,
+                               agent_id, current_role_version,
+                               next_role_version, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (*scope, next_version, next_version + 1, now_text),
+                    )
+                else:
+                    changed = conn.execute(
+                        """UPDATE session_agent_role_selections
+                           SET current_role_version=?, next_role_version=?,
+                               updated_at=?
+                           WHERE channel=? AND bot_id=?
+                             AND external_user_id=? AND session_id=?
+                             AND agent_id=? AND current_role_version=?
+                             AND next_role_version=?""",
+                        (
+                            next_version,
+                            next_version + 1,
+                            now_text,
+                            *scope,
+                            int(selection["current_role_version"]),
+                            next_version,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise StoreError("session role selection changed concurrently")
+                return finish(snapshot, changed=True)
+
+        return await self._call(op)
+
+    get_role = get_session_role
+    set_role = set_session_role
+
     async def set_route(
         self,
         *,
@@ -13774,6 +24120,29 @@ class SQLiteStore:
                     "INSERT OR IGNORE INTO deleted_agents(agent_id, deleted_at) VALUES (?, ?)",
                     (agent_id, now_text),
                 )
+                marker = conn.execute(
+                    "SELECT deleted_at FROM deleted_agents WHERE agent_id=?",
+                    (agent_id,),
+                ).fetchone()
+                profile = self._latest_agent_profile_row_tx(conn, agent_id)
+                if marker is None or profile is None:
+                    raise StoreError(
+                        f"cannot retire Agent without a Profile: {agent_id}"
+                    )
+                source_id = compound_id(
+                    "agent-lifecycle-source",
+                    ("retire-agent", agent_id, str(marker["deleted_at"])),
+                )
+                self._tombstone_agent_lifecycle_tx(
+                    conn,
+                    agent_id=agent_id,
+                    now_text=now_text,
+                    event_kind="retired",
+                    source_kind="retire_agent",
+                    source_id=source_id,
+                    provenance={"compatibility_path": "retire_agent"},
+                    profile_version=int(profile["profile_version"]),
+                )
                 conn.execute(
                     "UPDATE routes SET active_agent_id=?, updated_at=? "
                     "WHERE active_agent_id=?",
@@ -13815,7 +24184,7 @@ class SQLiteStore:
         def op(conn: sqlite3.Connection) -> bool:
             with _transaction(conn):
                 tombstone = conn.execute(
-                    "SELECT 1 FROM deleted_agents WHERE agent_id=?",
+                    "SELECT * FROM deleted_agents WHERE agent_id=?",
                     (agent_id,),
                 ).fetchone()
                 if tombstone is None:
@@ -13843,12 +24212,9 @@ class SQLiteStore:
                         if column == "enabled":
                             continue
                         actual = row[column]
-                        if column.endswith("_json"):
-                            if self._json_snapshot(
-                                json_loads(actual, [])
-                            ) != self._json_snapshot(json_loads(expected, [])):
-                                mismatches.append(column)
-                        elif str(actual) != str(expected):
+                        if not self._definition_metadata_equal(
+                            column, actual, expected
+                        ):
                             mismatches.append(column)
                     if mismatches:
                         raise StoreError(
@@ -13862,6 +24228,35 @@ class SQLiteStore:
                 conn.execute(
                     "UPDATE agent_profiles SET enabled=1 WHERE agent_id=?",
                     (agent_id,),
+                )
+                latest = self._latest_agent_lifecycle_row_tx(conn, agent_id)
+                source_id = compound_id(
+                    "agent-lifecycle-source",
+                    (
+                        "profile-prepared",
+                        agent_id,
+                        profile_version,
+                        str(tombstone["deleted_at"]),
+                        (
+                            int(latest["agent_incarnation"])
+                            if latest is not None
+                            else 1
+                        ),
+                    ),
+                )
+                self._project_profile_lifecycle_tx(
+                    conn,
+                    agent_id=agent_id,
+                    profile_version=profile_version,
+                    now_text=now,
+                    source_kind="reactivate_agent_prepare",
+                    source_id=source_id,
+                    event_kind="profile_prepared",
+                    provenance={
+                        "compatibility_path": "reactivate_agent",
+                        "deleted_at": str(tombstone["deleted_at"]),
+                    },
+                    emit_if_unchanged=True,
                 )
                 return True
 
@@ -13928,7 +24323,7 @@ class SQLiteStore:
                     now=now_text,
                 )
                 tombstone = conn.execute(
-                    "SELECT 1 FROM deleted_agents WHERE agent_id=?",
+                    "SELECT * FROM deleted_agents WHERE agent_id=?",
                     (agent_id,),
                 ).fetchone()
                 if tombstone is not None:
@@ -13941,10 +24336,71 @@ class SQLiteStore:
                         raise StoreError(
                             f"Agent reactivation is incomplete: {agent_id}"
                         )
-                conn.execute(
-                    "DELETE FROM deleted_agents WHERE agent_id=?",
-                    (agent_id,),
-                )
+                    latest_profile = self._latest_agent_profile_row_tx(
+                        conn, agent_id
+                    )
+                    if latest_profile is None:
+                        raise StoreError(
+                            f"cannot reactivate missing Agent profile: {agent_id}"
+                        )
+                    deleted = conn.execute(
+                        "DELETE FROM deleted_agents "
+                        "WHERE agent_id=? AND deleted_at=?",
+                        (agent_id, str(tombstone["deleted_at"])),
+                    ).rowcount
+                    if deleted != 1:
+                        raise StoreError(
+                            "Agent deletion marker changed during reactivation"
+                        )
+                    self._create_agent_incarnation_tx(
+                        conn,
+                        agent_id=agent_id,
+                        profile_version=int(latest_profile["profile_version"]),
+                        now_text=now_text,
+                        event_kind="reactivated",
+                        source_kind="commit_agent_reactivation",
+                        source_id=compound_id(
+                            "agent-lifecycle-source",
+                            (
+                                "commit-reactivation",
+                                agent_id,
+                                str(tombstone["deleted_at"]),
+                            ),
+                        ),
+                        require_enabled=True,
+                        provenance={
+                            "compatibility_path": (
+                                "commit_agent_reactivation"
+                            ),
+                            "requested_profile_version": profile_version,
+                        },
+                    )
+                else:
+                    lifecycle = self._project_profile_lifecycle_tx(
+                        conn,
+                        agent_id=agent_id,
+                        profile_version=profile_version,
+                        now_text=now_text,
+                        source_kind="agent_route_commit",
+                        source_id=compound_id(
+                            "agent-lifecycle-source",
+                            ("route-commit", agent_id, profile_version),
+                        ),
+                        provenance={
+                            "compatibility_path": (
+                                "commit_agent_reactivation"
+                            )
+                        },
+                    )
+                    if (
+                        str(lifecycle["lifecycle_state"])
+                        != AgentLifecycleState.ENABLED.value
+                        or str(lifecycle["desired_process_state"])
+                        != AgentDesiredProcessState.RUNNING.value
+                    ):
+                        raise InvalidTransition(
+                            f"cannot route to inactive Agent: {agent_id}"
+                        )
                 conn.execute(
                     """INSERT INTO routes(
                            channel, bot_id, external_user_id, session_id,
@@ -13983,6 +24439,24 @@ class SQLiteStore:
             raise InvalidTransition(
                 f"cannot delete Agent {agent_id}: unfinished tasks remain"
             )
+        unfinished_invocation = conn.execute(
+            "SELECT 1 FROM agent_invocations WHERE agent_id=? "
+            "AND admission_released_at IS NULL LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        if unfinished_invocation is not None:
+            raise InvalidTransition(
+                f"cannot delete Agent {agent_id}: unfinished Agent work remains"
+            )
+        unresolved_mailbox = conn.execute(
+            "SELECT 1 FROM agent_mailbox WHERE destination_agent_id=? "
+            "AND state='orphaned_mailbox' LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        if unresolved_mailbox is not None:
+            raise InvalidTransition(
+                f"cannot delete Agent {agent_id}: unresolved mailbox work remains"
+            )
 
     async def list_agents_routes(self, *, channel: str, bot_id: str, external_user_id: str, session_id: str = "default") -> list[dict[str, Any]]:
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -13994,15 +24468,33 @@ class SQLiteStore:
         data = self._mapping_snapshot(profile)
         if not data:
             raise ValueError("profile must be a mapping or profile value")
+        agent_id = str(data.get("agent_id") or "").strip()
+        if not agent_id:
+            raise ValueError("profile.agent_id is required")
+        profile_version = int(
+            data.get("profile_version", data.get("version", 1))
+        )
         now = self._now()
         def op(conn: sqlite3.Connection) -> bool:
             with _transaction(conn):
                 self._ensure_profile_tx(
                     conn,
-                    agent_id=str(data.get("agent_id") or "").strip(),
-                    profile_version=int(data.get("profile_version", data.get("version", 1))),
+                    agent_id=agent_id,
+                    profile_version=profile_version,
                     snapshot=data,
                     now=now,
+                )
+                self._project_profile_lifecycle_tx(
+                    conn,
+                    agent_id=agent_id,
+                    profile_version=profile_version,
+                    now_text=now,
+                    source_kind="profile_registry_publication",
+                    source_id=compound_id(
+                        "agent-lifecycle-source",
+                        ("profile-publication", agent_id, profile_version),
+                    ),
+                    provenance={"compatibility_path": "put_profile"},
                 )
                 return True
         return await self._call(op)
@@ -14097,6 +24589,34 @@ class SQLiteStore:
                     "INSERT OR IGNORE INTO deleted_agents(agent_id, deleted_at) VALUES (?, ?)",
                     (agent_id, now_text),
                 )
+                marker = conn.execute(
+                    "SELECT deleted_at FROM deleted_agents WHERE agent_id=?",
+                    (agent_id,),
+                ).fetchone()
+                profile = self._latest_agent_profile_row_tx(conn, agent_id)
+                if marker is None or profile is None:
+                    raise StoreError(
+                        f"cannot delete Agent without a Profile: {agent_id}"
+                    )
+                self._tombstone_agent_lifecycle_tx(
+                    conn,
+                    agent_id=agent_id,
+                    now_text=now_text,
+                    event_kind="deleted",
+                    source_kind="mark_agent_deleted",
+                    source_id=compound_id(
+                        "agent-lifecycle-source",
+                        (
+                            "mark-agent-deleted",
+                            agent_id,
+                            str(marker["deleted_at"]),
+                        ),
+                    ),
+                    provenance={
+                        "compatibility_path": "mark_agent_deleted"
+                    },
+                    profile_version=int(profile["profile_version"]),
+                )
                 conn.execute(
                     "UPDATE routes SET active_agent_id=?, updated_at=? WHERE active_agent_id=?",
                     (fallback_agent_id, now_text, agent_id),
@@ -14107,13 +24627,81 @@ class SQLiteStore:
 
     async def clear_agent_deleted(self, agent_id: str) -> bool:
         agent_id = str(agent_id or "").strip()
-        return bool(
-            await self._call(
-                lambda conn: conn.execute(
-                    "DELETE FROM deleted_agents WHERE agent_id=?", (agent_id,)
+        if not agent_id:
+            raise ValueError("agent_id is required")
+        now_text = self._now()
+
+        def op(conn: sqlite3.Connection) -> bool:
+            with _transaction(conn):
+                marker = conn.execute(
+                    "SELECT * FROM deleted_agents WHERE agent_id=?",
+                    (agent_id,),
+                ).fetchone()
+                if marker is None:
+                    return False
+                profile = self._latest_agent_profile_row_tx(conn, agent_id)
+                if profile is None:
+                    raise StoreError(
+                        "cannot clear Agent deletion without a Profile: "
+                        f"{agent_id}"
+                    )
+                latest = self._latest_agent_lifecycle_row_tx(conn, agent_id)
+                if (
+                    latest is None
+                    or str(latest["lifecycle_state"])
+                    != AgentLifecycleState.TOMBSTONED.value
+                ):
+                    self._project_profile_lifecycle_tx(
+                        conn,
+                        agent_id=agent_id,
+                        profile_version=int(profile["profile_version"]),
+                        now_text=now_text,
+                        source_kind="clear_agent_deleted_reconciliation",
+                        source_id=compound_id(
+                            "agent-lifecycle-source",
+                            (
+                                "clear-deletion-reconcile",
+                                agent_id,
+                                str(marker["deleted_at"]),
+                            ),
+                        ),
+                        event_kind="compatibility_reconciled",
+                        provenance={
+                            "compatibility_path": "clear_agent_deleted"
+                        },
+                    )
+                deleted = conn.execute(
+                    "DELETE FROM deleted_agents "
+                    "WHERE agent_id=? AND deleted_at=?",
+                    (agent_id, str(marker["deleted_at"])),
                 ).rowcount
-            )
-        )
+                if deleted != 1:
+                    raise StoreError(
+                        "Agent deletion marker changed while clearing"
+                    )
+                self._create_agent_incarnation_tx(
+                    conn,
+                    agent_id=agent_id,
+                    profile_version=int(profile["profile_version"]),
+                    now_text=now_text,
+                    event_kind="deletion_cleared",
+                    source_kind="clear_agent_deleted",
+                    source_id=compound_id(
+                        "agent-lifecycle-source",
+                        (
+                            "clear-agent-deleted",
+                            agent_id,
+                            str(marker["deleted_at"]),
+                        ),
+                    ),
+                    require_enabled=False,
+                    provenance={
+                        "compatibility_path": "clear_agent_deleted"
+                    },
+                )
+                return True
+
+        return bool(await self._call(op))
 
     async def is_agent_deleted(self, agent_id: str) -> bool:
         agent_id = str(agent_id or "").strip()
@@ -14368,8 +24956,1510 @@ class SQLiteStore:
         return await self._call(op)
 
     # ------------------------------------------------------------------
-    # Recovery and diagnostics
+    # Agent lifecycle and child-process generation foundations
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _process_positive_integer(value: Any, name: str) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a positive integer")
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a positive integer") from exc
+        if normalized <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        if isinstance(value, float) and value != normalized:
+            raise ValueError(f"{name} must be a positive integer")
+        return normalized
+
+    @staticmethod
+    def _process_required_text(
+        value: Any,
+        name: str,
+        *,
+        max_length: int = 1024,
+    ) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError(f"{name} is required")
+        if len(normalized) > max_length:
+            raise ValueError(f"{name} is too long")
+        if any(
+            ord(character) < 0x20 or ord(character) == 0x7F
+            for character in normalized
+        ):
+            raise ValueError(f"{name} contains a control character")
+        return normalized
+
+    @classmethod
+    def _process_sha256_text(cls, value: Any, name: str) -> str:
+        normalized = cls._process_required_text(value, name, max_length=64)
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+        return normalized
+
+    @staticmethod
+    def _process_secret_hash(value: Any, name: str) -> str:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            raw = bytes(value)
+        elif isinstance(value, str):
+            raw = value.encode("utf-8")
+        else:
+            raise ValueError(f"{name} must be text or bytes")
+        if not raw:
+            raise ValueError(f"{name} is required")
+        return hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def _process_timestamp(value: Any, name: str) -> tuple[str, datetime]:
+        parsed = text_to_datetime(value)
+        if parsed is None:
+            raise ValueError(f"{name} must be an ISO-8601 timestamp")
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        normalized = datetime_to_text(parsed)
+        if normalized is None:  # pragma: no cover - parsed is never None here.
+            raise ValueError(f"{name} must be an ISO-8601 timestamp")
+        return normalized, parsed
+
+    def _require_active_supervisor_epoch_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        supervisor_epoch: int,
+        owner_instance_id: str,
+    ) -> sqlite3.Row:
+        if self._active_supervisor_epoch != (
+            supervisor_epoch,
+            owner_instance_id,
+        ):
+            raise StoreError("supervisor epoch is not owned by this store")
+        row = conn.execute(
+            "SELECT * FROM supervisor_epochs WHERE epoch=?",
+            (supervisor_epoch,),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(
+                f"supervisor epoch not found: {supervisor_epoch}"
+            )
+        if str(row["owner_instance_id"]) != owner_instance_id:
+            raise StoreError("supervisor epoch owner identity conflicts")
+        if row["stopped_at"] is not None:
+            raise StoreError("supervisor epoch is already stopped")
+        return row
+
+    @staticmethod
+    def _agent_process_row_tx(
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str,
+        agent_incarnation: int,
+        worker_generation: int,
+    ) -> sqlite3.Row:
+        row = conn.execute(
+            """SELECT * FROM agent_processes
+               WHERE agent_id=? AND agent_incarnation=?
+                 AND worker_generation=?""",
+            (agent_id, agent_incarnation, worker_generation),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(
+                "Agent process generation not found: "
+                f"{agent_id}@{agent_incarnation}/{worker_generation}"
+            )
+        return row
+
+    @classmethod
+    def _validate_agent_process_secret_fences(
+        cls,
+        row: sqlite3.Row,
+        *,
+        expected_supervisor_epoch: int,
+        process_lease_identity: str,
+        process_lease_token: Any,
+        generation_capability: Any,
+    ) -> None:
+        if int(row["supervisor_epoch"]) != expected_supervisor_epoch:
+            raise StoreError("Agent process supervisor epoch conflicts")
+        if str(row["process_lease_identity"]) != process_lease_identity:
+            raise StoreError("Agent process lease identity conflicts")
+        token_hash = cls._process_secret_hash(
+            process_lease_token,
+            "process_lease_token",
+        )
+        if not hmac.compare_digest(
+            str(row["process_lease_token_hash"]),
+            token_hash,
+        ):
+            raise StoreError("Agent process lease token conflicts")
+        capability_hash = cls._process_secret_hash(
+            generation_capability,
+            "generation_capability",
+        )
+        if not hmac.compare_digest(
+            str(row["generation_capability_hash"]),
+            capability_hash,
+        ):
+            raise StoreError("Agent process generation capability conflicts")
+
+    @staticmethod
+    def _require_enabled_agent_lifecycle_tx(
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str,
+        agent_incarnation: int,
+    ) -> sqlite3.Row:
+        row = conn.execute(
+            """SELECT * FROM agent_lifecycle
+               WHERE agent_id=? AND agent_incarnation=?""",
+            (agent_id, agent_incarnation),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(
+                f"Agent lifecycle not found: {agent_id}@{agent_incarnation}"
+            )
+        if (
+            str(row["lifecycle_state"])
+            != AgentLifecycleState.ENABLED.value
+            or str(row["desired_process_state"])
+            != AgentDesiredProcessState.RUNNING.value
+        ):
+            raise InvalidTransition(
+                "Agent incarnation does not desire a running process: "
+                f"{agent_id}@{agent_incarnation}"
+            )
+        return row
+
+    async def get_agent_lifecycle(
+        self,
+        agent_id: str,
+        agent_incarnation: int | None = None,
+    ) -> AgentLifecycleRecord | None:
+        """Read an exact incarnation, or the current/latest retained one."""
+
+        agent_value = self._process_required_text(agent_id, "agent_id")
+        incarnation_value = (
+            self._process_positive_integer(
+                agent_incarnation,
+                "agent_incarnation",
+            )
+            if agent_incarnation is not None
+            else None
+        )
+
+        def op(conn: sqlite3.Connection) -> AgentLifecycleRecord | None:
+            if incarnation_value is not None:
+                row = conn.execute(
+                    """SELECT * FROM agent_lifecycle
+                       WHERE agent_id=? AND agent_incarnation=?""",
+                    (agent_value, incarnation_value),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT * FROM agent_lifecycle WHERE agent_id=?
+                       ORDER BY (lifecycle_state != 'tombstoned') DESC,
+                                agent_incarnation DESC
+                       LIMIT 1""",
+                    (agent_value,),
+                ).fetchone()
+            return self._agent_lifecycle_from_row(row)
+
+        return await self._call(op)
+
+    async def list_agent_lifecycles(
+        self,
+        *,
+        agent_id: str | None = None,
+    ) -> list[AgentLifecycleRecord]:
+        agent_value = (
+            self._process_required_text(agent_id, "agent_id")
+            if agent_id is not None
+            else None
+        )
+
+        def op(conn: sqlite3.Connection) -> list[AgentLifecycleRecord]:
+            rows = conn.execute(
+                "SELECT * FROM agent_lifecycle "
+                + ("WHERE agent_id=? " if agent_value is not None else "")
+                + "ORDER BY agent_id, agent_incarnation",
+                (() if agent_value is None else (agent_value,)),
+            ).fetchall()
+            return [
+                record
+                for row in rows
+                if (record := self._agent_lifecycle_from_row(row)) is not None
+            ]
+
+        return await self._call(op)
+
+    async def get_agent_lifecycle_event(
+        self,
+        lifecycle_event_id: str,
+    ) -> AgentLifecycleEventRecord | None:
+        """Read one append-only lifecycle event by its stable identity."""
+
+        event_id = self._process_required_text(
+            lifecycle_event_id,
+            "lifecycle_event_id",
+        )
+
+        def op(conn: sqlite3.Connection) -> AgentLifecycleEventRecord | None:
+            row = conn.execute(
+                "SELECT * FROM agent_lifecycle_events WHERE lifecycle_event_id=?",
+                (event_id,),
+            ).fetchone()
+            return self._agent_lifecycle_event_from_row(row)
+
+        return await self._call(op)
+
+    async def list_agent_lifecycle_events(
+        self,
+        *,
+        agent_id: str | None = None,
+        agent_incarnation: int | None = None,
+        after_sequence: int | None = None,
+        limit: int = 1000,
+    ) -> list[AgentLifecycleEventRecord]:
+        """List lifecycle events in deterministic projection order."""
+
+        if agent_incarnation is not None and agent_id is None:
+            raise ValueError("agent_id is required with agent_incarnation")
+        if after_sequence is not None and (
+            agent_id is None or agent_incarnation is None
+        ):
+            raise ValueError(
+                "agent_id and agent_incarnation are required with after_sequence"
+            )
+        agent_value = (
+            self._process_required_text(agent_id, "agent_id")
+            if agent_id is not None
+            else None
+        )
+        incarnation_value = (
+            self._process_positive_integer(
+                agent_incarnation,
+                "agent_incarnation",
+            )
+            if agent_incarnation is not None
+            else None
+        )
+        sequence_value: int | None = None
+        if after_sequence is not None:
+            if isinstance(after_sequence, bool):
+                raise ValueError("after_sequence must be a non-negative integer")
+            try:
+                sequence_value = int(after_sequence)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "after_sequence must be a non-negative integer"
+                ) from exc
+            if sequence_value < 0 or (
+                isinstance(after_sequence, float)
+                and after_sequence != sequence_value
+            ):
+                raise ValueError(
+                    "after_sequence must be a non-negative integer"
+                )
+        if isinstance(limit, bool):
+            raise ValueError("limit must be a non-negative integer")
+        try:
+            limit_value = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit must be a non-negative integer") from exc
+        if limit_value < 0 or (isinstance(limit, float) and limit != limit_value):
+            raise ValueError("limit must be a non-negative integer")
+
+        def op(conn: sqlite3.Connection) -> list[AgentLifecycleEventRecord]:
+            predicates: list[str] = []
+            parameters: list[Any] = []
+            if agent_value is not None:
+                predicates.append("agent_id=?")
+                parameters.append(agent_value)
+            if incarnation_value is not None:
+                predicates.append("agent_incarnation=?")
+                parameters.append(incarnation_value)
+            if sequence_value is not None:
+                predicates.append("event_sequence>?")
+                parameters.append(sequence_value)
+            sql = "SELECT * FROM agent_lifecycle_events"
+            if predicates:
+                sql += " WHERE " + " AND ".join(predicates)
+            sql += (
+                " ORDER BY agent_id, agent_incarnation, event_sequence "
+                "LIMIT ?"
+            )
+            parameters.append(limit_value)
+            rows = conn.execute(sql, parameters).fetchall()
+            return [
+                record
+                for row in rows
+                if (record := self._agent_lifecycle_event_from_row(row))
+                is not None
+            ]
+
+        return await self._call(op)
+
+    async def get_agent_process(
+        self,
+        agent_id: str,
+        agent_incarnation: int,
+        worker_generation: int | None = None,
+    ) -> AgentProcessRecord | None:
+        """Read an exact child generation, or the newest retained one."""
+
+        agent_value = self._process_required_text(agent_id, "agent_id")
+        incarnation_value = self._process_positive_integer(
+            agent_incarnation,
+            "agent_incarnation",
+        )
+        generation_value = (
+            self._process_positive_integer(
+                worker_generation,
+                "worker_generation",
+            )
+            if worker_generation is not None
+            else None
+        )
+
+        def op(conn: sqlite3.Connection) -> AgentProcessRecord | None:
+            if generation_value is None:
+                row = conn.execute(
+                    """SELECT * FROM agent_processes
+                       WHERE agent_id=? AND agent_incarnation=?
+                       ORDER BY worker_generation DESC LIMIT 1""",
+                    (agent_value, incarnation_value),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT * FROM agent_processes
+                       WHERE agent_id=? AND agent_incarnation=?
+                         AND worker_generation=?""",
+                    (agent_value, incarnation_value, generation_value),
+                ).fetchone()
+            return self._agent_process_from_row(row)
+
+        return await self._call(op)
+
+    async def list_agent_processes(
+        self,
+        *,
+        agent_id: str | None = None,
+        agent_incarnation: int | None = None,
+        active_only: bool = False,
+    ) -> list[AgentProcessRecord]:
+        if agent_incarnation is not None and agent_id is None:
+            raise ValueError("agent_id is required with agent_incarnation")
+        agent_value = (
+            self._process_required_text(agent_id, "agent_id")
+            if agent_id is not None
+            else None
+        )
+        incarnation_value = (
+            self._process_positive_integer(
+                agent_incarnation,
+                "agent_incarnation",
+            )
+            if agent_incarnation is not None
+            else None
+        )
+
+        def op(conn: sqlite3.Connection) -> list[AgentProcessRecord]:
+            predicates: list[str] = []
+            parameters: list[Any] = []
+            if agent_value is not None:
+                predicates.append("agent_id=?")
+                parameters.append(agent_value)
+            if incarnation_value is not None:
+                predicates.append("agent_incarnation=?")
+                parameters.append(incarnation_value)
+            if active_only:
+                predicates.append("observed_state!='stopped'")
+            sql = "SELECT * FROM agent_processes"
+            if predicates:
+                sql += " WHERE " + " AND ".join(predicates)
+            sql += " ORDER BY agent_id, agent_incarnation, worker_generation"
+            rows = conn.execute(sql, parameters).fetchall()
+            return [
+                record
+                for row in rows
+                if (record := self._agent_process_from_row(row)) is not None
+            ]
+
+        return await self._call(op)
+
+    async def begin_agent_process_generation(
+        self,
+        *,
+        agent_id: str,
+        agent_incarnation: int,
+        supervisor_epoch: int,
+        owner_instance_id: str,
+        generation_capability: str | bytes,
+        lifetime_lock_identity: str,
+        lifetime_lock_acquired_at: datetime | str,
+        process_lease_identity: str,
+        process_lease_token: str | bytes,
+        lease_expires_at: datetime | str,
+        started_at: datetime | str | None = None,
+    ) -> AgentProcessRecord:
+        """Durably allocate one child generation before spawning it.
+
+        ``process_lease_identity`` is the stable start-attempt idempotency key.
+        A retry with the same exact fences returns the existing non-stopped
+        generation; a real restart must use a fresh identity.  The caller must
+        already hold the named OS lifetime lock.  SQLite records that evidence
+        but does not pretend it can acquire or inspect the external lock.
+        """
+
+        agent_value = self._process_required_text(agent_id, "agent_id")
+        incarnation_value = self._process_positive_integer(
+            agent_incarnation,
+            "agent_incarnation",
+        )
+        epoch_value = self._process_positive_integer(
+            supervisor_epoch,
+            "supervisor_epoch",
+        )
+        owner_value = self._process_required_text(
+            owner_instance_id,
+            "owner_instance_id",
+        )
+        capability_hash = self._process_secret_hash(
+            generation_capability,
+            "generation_capability",
+        )
+        lock_value = self._process_required_text(
+            lifetime_lock_identity,
+            "lifetime_lock_identity",
+        )
+        lock_time_text, lock_time = self._process_timestamp(
+            lifetime_lock_acquired_at,
+            "lifetime_lock_acquired_at",
+        )
+        lease_identity_value = self._process_required_text(
+            process_lease_identity,
+            "process_lease_identity",
+        )
+        lease_token_hash = self._process_secret_hash(
+            process_lease_token,
+            "process_lease_token",
+        )
+        lease_text, lease_time = self._process_timestamp(
+            lease_expires_at,
+            "lease_expires_at",
+        )
+        started_was_supplied = started_at is not None
+        started_text, started_time = self._process_timestamp(
+            self.clock() if started_at is None else started_at,
+            "started_at",
+        )
+        if lock_time > started_time:
+            raise ValueError("lifetime lock must be acquired before process begin")
+        if lease_time <= started_time:
+            raise ValueError("process lease must expire after process begin")
+
+        def op(conn: sqlite3.Connection) -> AgentProcessRecord:
+            with _transaction(conn):
+                self._require_active_supervisor_epoch_tx(
+                    conn,
+                    supervisor_epoch=epoch_value,
+                    owner_instance_id=owner_value,
+                )
+                self._require_enabled_agent_lifecycle_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                )
+                existing = conn.execute(
+                    "SELECT * FROM agent_processes "
+                    "WHERE process_lease_identity=?",
+                    (lease_identity_value,),
+                ).fetchone()
+                if existing is not None:
+                    expected = {
+                        "agent_id": agent_value,
+                        "agent_incarnation": incarnation_value,
+                        "supervisor_epoch": epoch_value,
+                        "generation_capability_hash": capability_hash,
+                        "lifetime_lock_identity": lock_value,
+                        "lifetime_lock_acquired_at": lock_time_text,
+                        "process_lease_token_hash": lease_token_hash,
+                        "lease_expires_at": lease_text,
+                    }
+                    if started_was_supplied:
+                        expected["started_at"] = started_text
+                    mismatches = [
+                        column
+                        for column, value in expected.items()
+                        if existing[column] != value
+                    ]
+                    if mismatches:
+                        raise StoreError(
+                            "Agent process begin identity conflicts: "
+                            + ", ".join(mismatches)
+                        )
+                    record = self._agent_process_from_row(existing)
+                    assert record is not None
+                    return record
+
+                active = conn.execute(
+                    """SELECT agent_incarnation, worker_generation
+                       FROM agent_processes
+                       WHERE agent_id=? AND observed_state!='stopped'
+                       LIMIT 1""",
+                    (agent_value,),
+                ).fetchone()
+                if active is not None:
+                    raise InvalidTransition(
+                        "Agent already has a non-stopped process generation: "
+                        f"{agent_value}@{int(active['agent_incarnation'])}/"
+                        f"{int(active['worker_generation'])}"
+                    )
+                generation = int(
+                    conn.execute(
+                        """SELECT COALESCE(MAX(worker_generation), 0) + 1
+                           FROM agent_processes
+                           WHERE agent_id=?""",
+                        (agent_value,),
+                    ).fetchone()[0]
+                )
+                conn.execute(
+                    """INSERT INTO agent_processes(
+                           agent_id, agent_incarnation, worker_generation,
+                           supervisor_epoch, observed_state,
+                           generation_capability_hash,
+                           lifetime_lock_identity, lifetime_lock_acquired_at,
+                           process_lease_identity, process_lease_token_hash,
+                           lease_expires_at, started_at
+                       ) VALUES (?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        agent_value,
+                        incarnation_value,
+                        generation,
+                        epoch_value,
+                        capability_hash,
+                        lock_value,
+                        lock_time_text,
+                        lease_identity_value,
+                        lease_token_hash,
+                        lease_text,
+                        started_text,
+                    ),
+                )
+                row = self._agent_process_row_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                    worker_generation=generation,
+                )
+                record = self._agent_process_from_row(row)
+                assert record is not None
+                return record
+
+        return await self._call(op)
+
+    async def commit_agent_process_handshake(
+        self,
+        *,
+        agent_id: str,
+        agent_incarnation: int,
+        worker_generation: int,
+        supervisor_epoch: int,
+        owner_instance_id: str,
+        generation_capability: str | bytes,
+        process_lease_identity: str,
+        process_lease_token: str | bytes,
+        pid: int,
+        process_group_id: int,
+        kernel_process_birth_id: str,
+        hello_frame_id: str,
+        hello_payload_hash: str,
+        capabilities_frame_id: str,
+        capabilities_payload_hash: str,
+        capability_snapshot_hash: str,
+        committed_at: datetime | str | None = None,
+    ) -> AgentProcessRecord:
+        """Commit exact HELLO/capability evidence without making work ready."""
+
+        agent_value = self._process_required_text(agent_id, "agent_id")
+        incarnation_value = self._process_positive_integer(
+            agent_incarnation,
+            "agent_incarnation",
+        )
+        generation_value = self._process_positive_integer(
+            worker_generation,
+            "worker_generation",
+        )
+        epoch_value = self._process_positive_integer(
+            supervisor_epoch,
+            "supervisor_epoch",
+        )
+        owner_value = self._process_required_text(
+            owner_instance_id,
+            "owner_instance_id",
+        )
+        lease_identity_value = self._process_required_text(
+            process_lease_identity,
+            "process_lease_identity",
+        )
+        pid_value = self._process_positive_integer(pid, "pid")
+        process_group_value = self._process_positive_integer(
+            process_group_id,
+            "process_group_id",
+        )
+        birth_value = self._process_required_text(
+            kernel_process_birth_id,
+            "kernel_process_birth_id",
+        )
+        hello_frame_value = self._process_required_text(
+            hello_frame_id,
+            "hello_frame_id",
+        )
+        hello_hash_value = self._process_sha256_text(
+            hello_payload_hash,
+            "hello_payload_hash",
+        )
+        capabilities_frame_value = self._process_required_text(
+            capabilities_frame_id,
+            "capabilities_frame_id",
+        )
+        capabilities_hash_value = self._process_sha256_text(
+            capabilities_payload_hash,
+            "capabilities_payload_hash",
+        )
+        snapshot_hash_value = self._process_sha256_text(
+            capability_snapshot_hash,
+            "capability_snapshot_hash",
+        )
+        committed_was_supplied = committed_at is not None
+        committed_text, committed_time = self._process_timestamp(
+            self.clock() if committed_at is None else committed_at,
+            "committed_at",
+        )
+
+        def op(conn: sqlite3.Connection) -> AgentProcessRecord:
+            with _transaction(conn):
+                self._require_active_supervisor_epoch_tx(
+                    conn,
+                    supervisor_epoch=epoch_value,
+                    owner_instance_id=owner_value,
+                )
+                row = self._agent_process_row_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                    worker_generation=generation_value,
+                )
+                self._validate_agent_process_secret_fences(
+                    row,
+                    expected_supervisor_epoch=epoch_value,
+                    process_lease_identity=lease_identity_value,
+                    process_lease_token=process_lease_token,
+                    generation_capability=generation_capability,
+                )
+                existing_handshake = row["handshake_committed_at"] is not None
+                if existing_handshake:
+                    expected: dict[str, Any] = {
+                        "pid": pid_value,
+                        "process_group_id": process_group_value,
+                        "kernel_process_birth_id": birth_value,
+                        "hello_frame_id": hello_frame_value,
+                        "hello_payload_hash": hello_hash_value,
+                        "capabilities_frame_id": capabilities_frame_value,
+                        "capabilities_payload_hash": capabilities_hash_value,
+                        "capability_snapshot_hash": snapshot_hash_value,
+                    }
+                    if committed_was_supplied:
+                        expected["handshake_committed_at"] = committed_text
+                    mismatches = [
+                        column
+                        for column, value in expected.items()
+                        if row[column] != value
+                    ]
+                    if mismatches:
+                        raise StoreError(
+                            "Agent process handshake identity conflicts: "
+                            + ", ".join(mismatches)
+                        )
+                    # An exact committed-frame replay remains idempotent after
+                    # later stop evidence. Returning history cannot revive the
+                    # generation; a conflicting payload still fails above.
+                    record = self._agent_process_from_row(row)
+                    assert record is not None
+                    return record
+                if str(row["observed_state"]) != AgentProcessState.STARTING.value:
+                    raise InvalidTransition(
+                        "Agent process handshake requires starting state"
+                    )
+                self._require_enabled_agent_lifecycle_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                )
+                lease_time = text_to_datetime(row["lease_expires_at"])
+                if lease_time is None or lease_time <= committed_time:
+                    raise InvalidTransition(
+                        "Agent process lease expired before handshake commit"
+                    )
+                started_time = text_to_datetime(row["started_at"])
+                if started_time is None or committed_time < started_time:
+                    raise InvalidTransition(
+                        "Agent process handshake predates process begin"
+                    )
+                changed = conn.execute(
+                    """UPDATE agent_processes
+                       SET pid=?, process_group_id=?,
+                           kernel_process_birth_id=?, hello_frame_id=?,
+                           hello_payload_hash=?, capabilities_frame_id=?,
+                           capabilities_payload_hash=?,
+                           capability_snapshot_hash=?,
+                           handshake_committed_at=?, last_heartbeat_at=?
+                       WHERE agent_id=? AND agent_incarnation=?
+                         AND worker_generation=?
+                         AND supervisor_epoch=?
+                         AND observed_state='starting'
+                         AND handshake_committed_at IS NULL""",
+                    (
+                        pid_value,
+                        process_group_value,
+                        birth_value,
+                        hello_frame_value,
+                        hello_hash_value,
+                        capabilities_frame_value,
+                        capabilities_hash_value,
+                        snapshot_hash_value,
+                        committed_text,
+                        committed_text,
+                        agent_value,
+                        incarnation_value,
+                        generation_value,
+                        epoch_value,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise StoreError("Agent process handshake lost its generation fence")
+                row = self._agent_process_row_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                    worker_generation=generation_value,
+                )
+                record = self._agent_process_from_row(row)
+                assert record is not None
+                return record
+
+        return await self._call(op)
+
+    async def commit_agent_process_ready(
+        self,
+        *,
+        agent_id: str,
+        agent_incarnation: int,
+        worker_generation: int,
+        supervisor_epoch: int,
+        owner_instance_id: str,
+        generation_capability: str | bytes,
+        process_lease_identity: str,
+        process_lease_token: str | bytes,
+        ready_frame_id: str,
+        ready_payload_hash: str,
+        ready_at: datetime | str | None = None,
+    ) -> AgentProcessRecord:
+        """Publish schedulable readiness only after the exact handshake."""
+
+        agent_value = self._process_required_text(agent_id, "agent_id")
+        incarnation_value = self._process_positive_integer(
+            agent_incarnation, "agent_incarnation"
+        )
+        generation_value = self._process_positive_integer(
+            worker_generation, "worker_generation"
+        )
+        epoch_value = self._process_positive_integer(
+            supervisor_epoch, "supervisor_epoch"
+        )
+        owner_value = self._process_required_text(
+            owner_instance_id, "owner_instance_id"
+        )
+        lease_identity_value = self._process_required_text(
+            process_lease_identity, "process_lease_identity"
+        )
+        frame_value = self._process_required_text(
+            ready_frame_id, "ready_frame_id"
+        )
+        payload_hash_value = self._process_sha256_text(
+            ready_payload_hash, "ready_payload_hash"
+        )
+        ready_was_supplied = ready_at is not None
+        ready_text, ready_time = self._process_timestamp(
+            self.clock() if ready_at is None else ready_at,
+            "ready_at",
+        )
+
+        def op(conn: sqlite3.Connection) -> AgentProcessRecord:
+            with _transaction(conn):
+                self._require_active_supervisor_epoch_tx(
+                    conn,
+                    supervisor_epoch=epoch_value,
+                    owner_instance_id=owner_value,
+                )
+                row = self._agent_process_row_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                    worker_generation=generation_value,
+                )
+                self._validate_agent_process_secret_fences(
+                    row,
+                    expected_supervisor_epoch=epoch_value,
+                    process_lease_identity=lease_identity_value,
+                    process_lease_token=process_lease_token,
+                    generation_capability=generation_capability,
+                )
+                if row["ready_at"] is not None:
+                    expected: dict[str, Any] = {
+                        "ready_frame_id": frame_value,
+                        "ready_payload_hash": payload_hash_value,
+                    }
+                    if ready_was_supplied:
+                        expected["ready_at"] = ready_text
+                    mismatches = [
+                        column
+                        for column, value in expected.items()
+                        if row[column] != value
+                    ]
+                    if mismatches:
+                        raise StoreError(
+                            "Agent process READY identity conflicts: "
+                            + ", ".join(mismatches)
+                        )
+                    # READY acknowledgement loss can be discovered after the
+                    # generation is already fenced stopped. Exact replay is
+                    # still history, not a state transition back to ready.
+                    record = self._agent_process_from_row(row)
+                    assert record is not None
+                    return record
+                if str(row["observed_state"]) != AgentProcessState.STARTING.value:
+                    raise InvalidTransition(
+                        "Agent process READY requires starting state"
+                    )
+                if row["handshake_committed_at"] is None:
+                    raise InvalidTransition(
+                        "Agent process READY requires a committed handshake"
+                    )
+                self._require_enabled_agent_lifecycle_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                )
+                lease_time = text_to_datetime(row["lease_expires_at"])
+                if lease_time is None or lease_time <= ready_time:
+                    raise InvalidTransition(
+                        "Agent process lease expired before READY commit"
+                    )
+                handshake_time = text_to_datetime(row["handshake_committed_at"])
+                if handshake_time is None or ready_time < handshake_time:
+                    raise InvalidTransition(
+                        "Agent process READY predates its handshake"
+                    )
+                changed = conn.execute(
+                    """UPDATE agent_processes
+                       SET observed_state='ready', ready_frame_id=?,
+                           ready_payload_hash=?, ready_at=?,
+                           last_heartbeat_at=?
+                       WHERE agent_id=? AND agent_incarnation=?
+                         AND worker_generation=? AND supervisor_epoch=?
+                         AND observed_state='starting'
+                         AND handshake_committed_at IS NOT NULL
+                         AND ready_at IS NULL""",
+                    (
+                        frame_value,
+                        payload_hash_value,
+                        ready_text,
+                        ready_text,
+                        agent_value,
+                        incarnation_value,
+                        generation_value,
+                        epoch_value,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise StoreError("Agent process READY lost its generation fence")
+                row = self._agent_process_row_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                    worker_generation=generation_value,
+                )
+                record = self._agent_process_from_row(row)
+                assert record is not None
+                return record
+
+        return await self._call(op)
+
+    async def fence_agent_process_stopped(
+        self,
+        *,
+        agent_id: str,
+        agent_incarnation: int,
+        worker_generation: int,
+        expected_supervisor_epoch: int,
+        fencing_supervisor_epoch: int,
+        owner_instance_id: str,
+        process_lease_identity: str,
+        cleanup_proof: Mapping[str, Any],
+        cleanup_proof_hash: str | None = None,
+        reason: str,
+        stopped_at: datetime | str | None = None,
+        exit_code: int | None = None,
+        last_error: str | None = None,
+    ) -> AgentProcessRecord:
+        """Fence one generation stopped only after complete cleanup evidence.
+
+        The active supervisor supplying the proof may differ from the epoch
+        that started the child.  This is the intentional takeover path: the
+        immutable start epoch remains on the generation while
+        ``stopped_by_supervisor_epoch`` records who proved the old process
+        group/jobs empty and recovered the lifetime lock.
+        """
+
+        agent_value = self._process_required_text(agent_id, "agent_id")
+        incarnation_value = self._process_positive_integer(
+            agent_incarnation, "agent_incarnation"
+        )
+        generation_value = self._process_positive_integer(
+            worker_generation, "worker_generation"
+        )
+        expected_epoch_value = self._process_positive_integer(
+            expected_supervisor_epoch, "expected_supervisor_epoch"
+        )
+        fencing_epoch_value = self._process_positive_integer(
+            fencing_supervisor_epoch, "fencing_supervisor_epoch"
+        )
+        owner_value = self._process_required_text(
+            owner_instance_id, "owner_instance_id"
+        )
+        lease_identity_value = self._process_required_text(
+            process_lease_identity, "process_lease_identity"
+        )
+        reason_value = self._process_required_text(
+            reason, "reason", max_length=512
+        )
+        error_value = None
+        if last_error is not None:
+            error_value = str(last_error).strip()
+            if len(error_value) > 4096:
+                raise ValueError("last_error is too long")
+        if exit_code is not None:
+            if isinstance(exit_code, bool):
+                raise ValueError("exit_code must be an integer")
+            try:
+                exit_code_value: int | None = int(exit_code)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("exit_code must be an integer") from exc
+            if isinstance(exit_code, float) and exit_code != exit_code_value:
+                raise ValueError("exit_code must be an integer")
+        else:
+            exit_code_value = None
+        if not isinstance(cleanup_proof, Mapping):
+            raise ValueError("cleanup_proof must be a mapping")
+        proof = dict(cleanup_proof)
+        proof_kind = self._process_required_text(
+            proof.get("proof_kind"), "cleanup_proof.proof_kind"
+        )
+        if proof_kind not in {"verified_empty_v1", "never_spawned_v1"}:
+            raise ValueError("cleanup_proof.proof_kind is unsupported")
+        proof["proof_kind"] = proof_kind
+        for flag in (
+            "runtime_stopped",
+            "process_group_empty",
+            "invocation_jobs_empty",
+            "lifetime_lock_released",
+        ):
+            if proof.get(flag) is not True:
+                raise ValueError(f"cleanup_proof.{flag} must be true")
+        checked_text, checked_time = self._process_timestamp(
+            proof.get("checked_at"), "cleanup_proof.checked_at"
+        )
+        proof["checked_at"] = checked_text
+        stopped_was_supplied = stopped_at is not None
+        stopped_text, stopped_time = self._process_timestamp(
+            self.clock() if stopped_at is None else stopped_at,
+            "stopped_at",
+        )
+        if checked_time > stopped_time:
+            raise ValueError("cleanup proof must be checked before stop commit")
+        proof_json = json_dumps(proof)
+        if len(proof_json.encode("utf-8")) > 65536:
+            raise ValueError("cleanup_proof is too large")
+        computed_proof_hash = hashlib.sha256(proof_json.encode("utf-8")).hexdigest()
+        if cleanup_proof_hash is not None:
+            supplied_proof_hash = self._process_sha256_text(
+                cleanup_proof_hash, "cleanup_proof_hash"
+            )
+            if not hmac.compare_digest(
+                supplied_proof_hash,
+                computed_proof_hash,
+            ):
+                raise ValueError("cleanup_proof_hash does not match cleanup_proof")
+
+        def op(conn: sqlite3.Connection) -> AgentProcessRecord:
+            with _transaction(conn):
+                fencing_epoch_row = self._require_active_supervisor_epoch_tx(
+                    conn,
+                    supervisor_epoch=fencing_epoch_value,
+                    owner_instance_id=owner_value,
+                )
+                fencing_started_at = text_to_datetime(
+                    fencing_epoch_row["started_at"]
+                )
+                if fencing_started_at is None:
+                    raise StoreError("supervisor epoch start timestamp is invalid")
+                if checked_time < fencing_started_at:
+                    raise StoreError(
+                        "Agent process cleanup proof predates the fencing epoch"
+                    )
+                row = self._agent_process_row_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                    worker_generation=generation_value,
+                )
+                if int(row["supervisor_epoch"]) != expected_epoch_value:
+                    raise StoreError("Agent process start epoch conflicts")
+                if str(row["process_lease_identity"]) != lease_identity_value:
+                    raise StoreError("Agent process lease identity conflicts")
+                required_proof_values = {
+                    "agent_id": agent_value,
+                    "agent_incarnation": incarnation_value,
+                    "worker_generation": generation_value,
+                    "supervisor_epoch": expected_epoch_value,
+                    "fencing_supervisor_epoch": fencing_epoch_value,
+                    "process_lease_identity": lease_identity_value,
+                    "lifetime_lock_identity": str(row["lifetime_lock_identity"]),
+                    "process_group_id": (
+                        int(row["process_group_id"])
+                        if row["process_group_id"] is not None
+                        else None
+                    ),
+                    "kernel_process_birth_id": (
+                        str(row["kernel_process_birth_id"])
+                        if row["kernel_process_birth_id"] is not None
+                        else None
+                    ),
+                }
+                proof_mismatches = [
+                    name
+                    for name, expected in required_proof_values.items()
+                    if proof.get(name) != expected
+                ]
+                if proof_mismatches:
+                    raise StoreError(
+                        "Agent process cleanup proof identity conflicts: "
+                        + ", ".join(proof_mismatches)
+                    )
+                if proof_kind == "never_spawned_v1" and (
+                    proof.get("spawn_attempted") is not False
+                    or row["pid"] is not None
+                    or row["process_group_id"] is not None
+                    or row["kernel_process_birth_id"] is not None
+                ):
+                    raise StoreError(
+                        "never-spawned cleanup proof conflicts with process evidence"
+                    )
+                activity_times = [
+                    timestamp
+                    for column in (
+                        "started_at",
+                        "handshake_committed_at",
+                        "ready_at",
+                        "last_heartbeat_at",
+                    )
+                    if (timestamp := text_to_datetime(row[column])) is not None
+                ]
+                if not activity_times or checked_time < max(activity_times):
+                    raise StoreError(
+                        "Agent process cleanup proof predates retained activity"
+                    )
+                active_slot = conn.execute(
+                    """SELECT slot_id FROM agent_execution_slots
+                         WHERE agent_id=? AND agent_incarnation=?
+                           AND worker_generation=? AND state='active'
+                         LIMIT 1""",
+                    (agent_value, incarnation_value, generation_value),
+                ).fetchone()
+                if active_slot is not None:
+                    raise InvalidTransition(
+                        "cannot stop Agent process with an active execution slot: "
+                        + str(active_slot["slot_id"])
+                    )
+                unresolved_attempt = conn.execute(
+                    """SELECT dispatch_attempt_id
+                         FROM agent_dispatch_attempts
+                        WHERE agent_id=? AND agent_incarnation=?
+                          AND worker_generation=?
+                          AND (
+                              (grant_issued_at IS NULL
+                               AND abort_committed_at IS NULL
+                               AND rejection_committed_at IS NULL)
+                              OR runtime_stopped_at IS NULL
+                              OR invocation_job_empty_at IS NULL
+                              OR cleanup_proof_hash IS NULL
+                          )
+                        LIMIT 1""",
+                    (agent_value, incarnation_value, generation_value),
+                ).fetchone()
+                if unresolved_attempt is not None:
+                    raise InvalidTransition(
+                        "cannot stop Agent process before dispatch cleanup is proven: "
+                        + str(unresolved_attempt["dispatch_attempt_id"])
+                    )
+                # Recompute after all identity fields were validated.  No
+                # caller-supplied hash can bless a proof for another process.
+                if str(row["observed_state"]) == AgentProcessState.STOPPED.value:
+                    expected: dict[str, Any] = {
+                        "stopped_by_supervisor_epoch": fencing_epoch_value,
+                        "cleanup_proof_json": proof_json,
+                        "cleanup_proof_hash": computed_proof_hash,
+                        "stop_reason": reason_value,
+                        "last_exit_code": exit_code_value,
+                        "last_error": error_value,
+                    }
+                    if stopped_was_supplied:
+                        expected["stopped_at"] = stopped_text
+                    mismatches = [
+                        column
+                        for column, value in expected.items()
+                        if row[column] != value
+                    ]
+                    if mismatches:
+                        raise StoreError(
+                            "Agent process stop identity conflicts: "
+                            + ", ".join(mismatches)
+                        )
+                    record = self._agent_process_from_row(row)
+                    assert record is not None
+                    return record
+                if expected_epoch_value != fencing_epoch_value:
+                    start_epoch = conn.execute(
+                        "SELECT stopped_at FROM supervisor_epochs WHERE epoch=?",
+                        (expected_epoch_value,),
+                    ).fetchone()
+                    if start_epoch is None or start_epoch["stopped_at"] is None:
+                        raise InvalidTransition(
+                            "cannot fence a process owned by a live supervisor epoch"
+                        )
+                changed = conn.execute(
+                    """UPDATE agent_processes
+                       SET observed_state='stopped',
+                           stopped_by_supervisor_epoch=?,
+                           cleanup_proof_json=?, cleanup_proof_hash=?,
+                           cleanup_proved_at=?, stopped_at=?, lease_ended_at=?,
+                           stop_reason=?, last_exit_code=?, last_error=?
+                       WHERE agent_id=? AND agent_incarnation=?
+                         AND worker_generation=? AND supervisor_epoch=?
+                         AND process_lease_identity=?
+                         AND observed_state!='stopped'""",
+                    (
+                        fencing_epoch_value,
+                        proof_json,
+                        computed_proof_hash,
+                        checked_text,
+                        stopped_text,
+                        stopped_text,
+                        reason_value,
+                        exit_code_value,
+                        error_value,
+                        agent_value,
+                        incarnation_value,
+                        generation_value,
+                        expected_epoch_value,
+                        lease_identity_value,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise StoreError("Agent process stop lost its generation fence")
+                row = self._agent_process_row_tx(
+                    conn,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                    worker_generation=generation_value,
+                )
+                record = self._agent_process_from_row(row)
+                assert record is not None
+                return record
+
+        return await self._call(op)
+
+    # ------------------------------------------------------------------
+    # Supervisor ownership epochs, recovery, and diagnostics
+    # ------------------------------------------------------------------
+
+    async def activate_supervisor_epoch(
+        self,
+        *,
+        owner_instance_id: str,
+        channel: str,
+        bot_id: str,
+        started_at: datetime | str | None = None,
+    ) -> SupervisorEpochRecord:
+        """Advance the durable owner epoch, then recover the prior process.
+
+        The store must first be initialized with
+        ``recover_startup_state=False`` while the caller holds both external
+        ownership locks.  Epoch insertion and strong recovery share one
+        immediate transaction; abandoned work can therefore never be changed
+        by this path without the replacement epoch becoming durable too.
+        """
+
+        owner_value = str(owner_instance_id or "").strip()
+        channel_value = str(channel or "").strip()
+        bot_value = str(bot_id or "").strip()
+        for value, name in (
+            (owner_value, "owner_instance_id"),
+            (channel_value, "channel"),
+            (bot_value, "bot_id"),
+        ):
+            if not value:
+                raise ValueError(f"{name} is required")
+            if any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in value
+            ):
+                raise ValueError(f"{name} contains a control character")
+        started_text, started_time = self._process_timestamp(
+            self.clock() if started_at is None else started_at,
+            "started_at",
+        )
+
+        def op(conn: sqlite3.Connection) -> SupervisorEpochRecord:
+            database_key = self._live_database_key
+
+            def activate_with_gate() -> SupervisorEpochRecord:
+                if self._supervisor_epoch_finished or (
+                    database_key is not None
+                    and database_key in _FINISHED_DATABASES
+                ):
+                    raise StoreError(
+                        "the finished supervisor epoch owner must close before "
+                        "a replacement epoch can activate"
+                    )
+                existing = conn.execute(
+                    "SELECT * FROM supervisor_epochs WHERE owner_instance_id=?",
+                    (owner_value,),
+                ).fetchone()
+                if existing is not None:
+                    record = self._supervisor_epoch_from_row(existing)
+                    assert record is not None
+                    if record.channel != channel_value or record.bot_id != bot_value:
+                        raise StoreError("supervisor epoch identity conflicts")
+                    if not record.active:
+                        raise StoreError(
+                            "supervisor owner instance was already finished"
+                        )
+                    if self._active_supervisor_epoch != (
+                        record.epoch,
+                        owner_value,
+                    ):
+                        raise StoreError(
+                            "supervisor owner instance is already active elsewhere"
+                        )
+                    return record
+
+                recovery_deferred = (
+                    self._startup_recovery_deferred
+                    if database_key is None
+                    else database_key in _DEFERRED_DATABASES
+                )
+                if not recovery_deferred:
+                    raise StoreError(
+                        "supervisor epoch activation requires deferred startup recovery"
+                    )
+
+                with _transaction(conn):
+                    active_rows = conn.execute(
+                        "SELECT * FROM supervisor_epochs WHERE stopped_at IS NULL"
+                    ).fetchall()
+                    for active_row in active_rows:
+                        active_record = self._supervisor_epoch_from_row(active_row)
+                        assert active_record is not None
+                        if (
+                            active_record.started_at is None
+                            or started_time < active_record.started_at
+                        ):
+                            raise StoreError(
+                                "replacement supervisor epoch predates the active epoch"
+                            )
+                    conn.execute(
+                        "UPDATE supervisor_epochs SET stopped_at=?, "
+                        "stop_reason='superseded' WHERE stopped_at IS NULL",
+                        (started_text,),
+                    )
+                    cursor = conn.execute(
+                        "INSERT INTO supervisor_epochs "
+                        "(owner_instance_id, channel, bot_id, started_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (owner_value, channel_value, bot_value, started_text),
+                    )
+                    epoch = int(cursor.lastrowid)
+                    report = self._strong_startup_recovery_tx(
+                        conn,
+                        now_text=started_text,
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM supervisor_epochs WHERE epoch=?",
+                        (epoch,),
+                    ).fetchone()
+                    record = self._supervisor_epoch_from_row(row)
+                    if record is None:
+                        raise StoreError(
+                            "supervisor epoch activation was not persisted"
+                        )
+
+                # Publish the activation only after its transaction committed.
+                # For a file-backed database this still runs while holding the
+                # process-wide gate lock, so no other adapter can observe an
+                # open gate and race a second activation transaction.
+                self._startup_recovery_report = report
+                self._startup_recovery_deferred = False
+                self._active_supervisor_epoch = (record.epoch, owner_value)
+                self._supervisor_epoch_finished = False
+                if database_key is not None:
+                    _DEFERRED_DATABASES.discard(database_key)
+                return record
+
+            if database_key is None:
+                return activate_with_gate()
+            # Keep the shared gate held through the epoch/recovery commit.  A
+            # concurrent store call either sees the gate before this block or
+            # waits here and proceeds only after the committed removal.
+            with _LIVE_DATABASES_LOCK:
+                return activate_with_gate()
+
+        return await self._call(
+            op,
+            allow_deferred_startup=True,
+            initialize_if_needed=False,
+        )
+
+    async def finish_supervisor_epoch(
+        self,
+        epoch: int,
+        *,
+        owner_instance_id: str,
+        stopped_at: datetime | str | None = None,
+        reason: str = "graceful_shutdown",
+    ) -> bool:
+        """Idempotently mark one exact supervisor epoch as stopped."""
+
+        try:
+            epoch_value = int(epoch)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("epoch must be a positive integer") from exc
+        if epoch_value <= 0:
+            raise ValueError("epoch must be a positive integer")
+        owner_value = str(owner_instance_id or "").strip()
+        if not owner_value:
+            raise ValueError("owner_instance_id is required")
+        reason_value = self._process_required_text(
+            reason,
+            "supervisor stop reason",
+            max_length=512,
+        )
+        stopped_text, stopped_time = self._process_timestamp(
+            self.clock() if stopped_at is None else stopped_at,
+            "stopped_at",
+        )
+
+        def op(conn: sqlite3.Connection) -> bool:
+            database_key = self._live_database_key
+
+            def finish_with_gate() -> bool:
+                # Durable owner text is not sufficient authority: another
+                # adapter in this process can read it.  Only the adapter which
+                # committed activation may finish the epoch.
+                if self._active_supervisor_epoch != (epoch_value, owner_value):
+                    raise StoreError(
+                        "supervisor epoch is not owned by this store"
+                    )
+                if database_key is not None:
+                    live_count = _LIVE_DATABASES.get(database_key, 0)
+                    if live_count != 1:
+                        raise StoreError(
+                            "the supervisor epoch-owning store must finish after "
+                            "all other database adapters"
+                        )
+
+                changed_result = False
+                with _transaction(conn):
+                    row = conn.execute(
+                        "SELECT * "
+                        "FROM supervisor_epochs WHERE epoch=?",
+                        (epoch_value,),
+                    ).fetchone()
+                    if row is None:
+                        raise NotFoundError(
+                            f"supervisor epoch not found: {epoch_value}"
+                        )
+                    if str(row["owner_instance_id"]) != owner_value:
+                        raise StoreError("supervisor epoch owner identity conflicts")
+                    if row["stopped_at"] is not None:
+                        # Validate retained evidence even for an idempotent
+                        # replay; malformed non-NULL text must never look like
+                        # an active epoch to the domain model while SQLite
+                        # treats it stopped.
+                        self._supervisor_epoch_from_row(row)
+                    else:
+                        started_time = text_to_datetime(row["started_at"])
+                        if started_time is None:
+                            raise StoreError(
+                                "supervisor epoch start timestamp is invalid"
+                            )
+                        if stopped_time < started_time:
+                            raise InvalidTransition(
+                                "supervisor epoch stop predates its start"
+                            )
+                        changed = conn.execute(
+                            "UPDATE supervisor_epochs SET stopped_at=?, "
+                            "stop_reason=? WHERE epoch=? AND "
+                            "owner_instance_id=? AND stopped_at IS NULL",
+                            (
+                                stopped_text,
+                                reason_value,
+                                epoch_value,
+                                owner_value,
+                            ),
+                        ).rowcount
+                        if changed != 1:
+                            raise StoreError(
+                                "supervisor epoch finish lost ownership"
+                            )
+                        changed_result = True
+
+                # Keep local ownership until close so a concurrent opener
+                # cannot make the owner's subsequent close bypass its
+                # last-adapter check.  The shared deferred gate makes adapters
+                # opened in this finish/close window unusable.
+                self._supervisor_epoch_finished = True
+                self._startup_recovery_deferred = True
+                if database_key is not None:
+                    _FINISHED_DATABASES.add(database_key)
+                    _DEFERRED_DATABASES.add(database_key)
+                return changed_result
+
+            if database_key is None:
+                return finish_with_gate()
+            # Serialize the stop commit and shutdown-gate publication against
+            # both process-local openers and final adapter closes.
+            with _LIVE_DATABASES_LOCK:
+                return finish_with_gate()
+
+        return await self._call(op, allow_deferred_startup=True)
+
     async def reconcile(
         self,
         *,
@@ -14422,7 +26512,7 @@ class SQLiteStore:
                 )
                 task_sql = (
                     "SELECT task_id FROM tasks "
-                    "WHERE state IN ('claimed','running','cancel_requested')"
+                    "WHERE state IN ('dispatching','running','cancel_requested')"
                 )
                 task_params: tuple[Any, ...] = ()
                 if not startup:
@@ -14455,7 +26545,18 @@ class SQLiteStore:
                             created_at=now_text,
                         )
                     conn.execute("UPDATE tasks SET state='orphaned', claimed_by=NULL, claim_token=NULL, lease_expires_at=NULL, updated_at=?, last_error=COALESCE(last_error,?) WHERE task_id=?", (now_text, recovery_reason, row["task_id"]))
-                    conn.execute("UPDATE task_executions SET state='orphaned', finished_at=?, lease_expires_at=NULL, last_error=COALESCE(last_error,?) WHERE task_id=? AND finished_at IS NULL", (now_text, recovery_reason, row["task_id"]))
+                    conn.execute("UPDATE task_executions SET state='orphaned', finished_at=?, worker_id=NULL, claim_token=NULL, lease_expires_at=NULL, last_error=COALESCE(last_error,?) WHERE task_id=? AND finished_at IS NULL", (now_text, recovery_reason, row["task_id"]))
+                    current_id = conn.execute(
+                        "SELECT current_execution_id FROM tasks WHERE task_id=?",
+                        (row["task_id"],),
+                    ).fetchone()[0]
+                    if not self._release_invocation_tx(
+                        conn, invocation_id=str(current_id), state="orphaned",
+                        now=now_text, last_error=recovery_reason,
+                    ):
+                        raise StoreError(
+                            "recovered task invocation was already released"
+                        )
                 # A legacy/direct sender may have written ``sending`` before
                 # lease support was enabled, leaving a NULL expiry.  Treat
                 # that row as recoverable as well; modern rows always carry a
@@ -14479,7 +26580,7 @@ class SQLiteStore:
                     else: outbox_unknown += 1
                 mailbox_sql = (
                     "SELECT mailbox_id FROM agent_mailbox "
-                    "WHERE state IN ('claimed','processing')"
+                    "WHERE state IN ('dispatching','processing')"
                 )
                 mailbox_params: tuple[Any, ...] = ()
                 if not startup:
@@ -14487,7 +26588,22 @@ class SQLiteStore:
                     mailbox_params = (now_text,)
                 mailbox_rows = conn.execute(mailbox_sql, mailbox_params).fetchall()
                 for row in mailbox_rows:
-                    conn.execute("UPDATE agent_mailbox SET state='pending', claimed_by=NULL, claim_token=NULL, lease_expires_at=NULL, next_attempt_at=?, last_error=COALESCE(last_error,?) WHERE mailbox_id=?", (now_text, recovery_reason, row["mailbox_id"]))
+                    invocation_id = conn.execute(
+                        "SELECT current_invocation_id FROM agent_mailbox WHERE mailbox_id=?",
+                        (row["mailbox_id"],),
+                    ).fetchone()[0]
+                    conn.execute("UPDATE agent_mailbox SET state='orphaned_mailbox', claimed_by=NULL, claim_token=NULL, lease_expires_at=NULL, next_attempt_at=NULL, last_error=COALESCE(last_error,?) WHERE mailbox_id=?", (recovery_reason, row["mailbox_id"]))
+                    if not self._release_invocation_tx(
+                        conn, invocation_id=str(invocation_id), state="orphaned",
+                        now=now_text, last_error=recovery_reason,
+                    ):
+                        raise StoreError(
+                            "recovered mailbox invocation was already released"
+                        )
+                mailbox_expired = self._expire_pending_mailboxes_tx(
+                    conn,
+                    now=now_text,
+                )
                 # Upload/send operations have an independent lease. Uploading
                 # is returned to the upload queue under the row's stable
                 # idempotency key. Uploaded has not crossed the send checkpoint.
@@ -14583,12 +26699,13 @@ class SQLiteStore:
                             (row["attachment_id"],),
                         )
                 return RecoveryReport(
-                    len(task_rows),
-                    outbox_requeued,
-                    outbox_unknown,
-                    len(mailbox_rows),
-                    missing,
-                    media_requeued,
+                    tasks_orphaned=len(task_rows),
+                    outbox_requeued=outbox_requeued,
+                    outbox_unknown=outbox_unknown,
+                    mailbox_requeued=len(mailbox_rows),
+                    missing_attachments=missing,
+                    media_requeued=media_requeued,
+                    mailbox_expired=mailbox_expired,
                 )
         return await self._call(op)
 
@@ -14625,6 +26742,9 @@ class SQLiteStore:
                 report.missing_attachments + live_report.missing_attachments
             ),
             media_requeued=report.media_requeued + live_report.media_requeued,
+            mailbox_expired=(
+                report.mailbox_expired + live_report.mailbox_expired
+            ),
         )
 
     async def recover_expired_leases(self, *, now: datetime | str | None = None) -> RecoveryReport:
@@ -15075,7 +27195,13 @@ class SQLiteStore:
             ) if hasattr(attachment, name)}
         aid = str(data.get("attachment_id") or _uuid())
         kind_value = str(data.get("kind") or kind or "file")
-        now = data.get("created_at") or self._now()
+        raw_created_at = data.get("created_at")
+        # ``StoredAttachment`` uses the empty string as its default omission
+        # sentinel.  Preserve that distinction across retries: an omitted
+        # timestamp adopts the first registration time but does not assert a
+        # fresh timestamp when the same immutable attachment is replayed.
+        created_at_supplied = raw_created_at is not None and raw_created_at != ""
+        now = raw_created_at if created_at_supplied else self._now()
         meta = dict(metadata or {})
         if data.get("filename"):
             meta.setdefault("filename", data["filename"])
@@ -15116,8 +27242,6 @@ class SQLiteStore:
                 if declared_size != actual_size:
                     raise StoreError(f"attachment size mismatch: {aid}")
         metadata_supplied = metadata is not None or bool(data.get("filename"))
-        created_at_supplied = data.get("created_at") is not None
-
         def op(conn: sqlite3.Connection) -> StoredAttachment:
             with _transaction(conn):
                 existing = conn.execute(
@@ -17082,12 +29206,28 @@ class SQLiteStore:
                     session_id=route["session_id"],
                     now=now_text,
                 )
-                thread_id = snapshot.thread_id or self._thread_binding_tx(
+                role_snapshot = self._task_role_snapshot_tx(
                     conn,
+                    metadata=snapshot.metadata,
+                    channel=route["channel"],
+                    bot_id=route["bot_id"],
+                    external_user_id=route["external_user_id"],
+                    session_id=route["session_id"],
+                    agent_id=snapshot.agent_id,
+                )
+                role_version, role_hash, persona_version = role_binding_key(
+                    role_snapshot
+                )
+                thread_id = self._resolve_task_thread_tx(
+                    conn,
+                    supplied_thread_id=snapshot.thread_id,
                     conversation_id=conversation_id,
                     mode_id=snapshot.mode_id,
                     profile_version=snapshot.profile_version,
                     policy_version=snapshot.policy_version,
+                    role_version=role_version,
+                    role_snapshot_hash=role_hash,
+                    persona_composition_version=persona_version,
                 )
                 if existing is None:
                     task_id = snapshot.task_id or _uuid()
@@ -17104,20 +29244,24 @@ class SQLiteStore:
                         snapshot.reply_target,
                         fallback=original_target,
                     )
+                    agent_incarnation = self._current_agent_incarnation_tx(
+                        conn, snapshot.agent_id, int(snapshot.profile_version)
+                    )
                     conn.execute(
                         """INSERT INTO tasks
                            (task_id, dedupe_key, inbound_message_id, channel, bot_id,
-                            external_user_id, session_id, agent_id, conversation_id,
+                            external_user_id, session_id, agent_id, agent_incarnation, conversation_id,
                             thread_id, mode_id, profile_version, policy_version,
                             model, reasoning_effort, reply_target_json, inputs_json,
                             metadata_json, state, attempts, next_attempt_at,
                             parent_task_id, child_depth, request_id, created_at, updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                    'queued', 0, ?, ?, ?, ?, ?, ?)""",
                         (
                             task_id, snapshot.dedupe_key, linked_inbound_id,
                             route["channel"], route["bot_id"],
                             route["external_user_id"], route["session_id"], snapshot.agent_id,
+                            agent_incarnation,
                             conversation_id, thread_id, snapshot.mode_id,
                             int(snapshot.profile_version), int(snapshot.policy_version),
                             snapshot.model, snapshot.reasoning_effort,
@@ -17152,6 +29296,13 @@ class SQLiteStore:
                         task_id=task_id,
                         inputs=snapshot.inputs,
                         created_at=now_text,
+                    )
+                    self._create_queued_task_invocation_tx(
+                        conn,
+                        task_id=task_id,
+                        now=now_text,
+                        max_agent_queue=self.max_agent_queue,
+                        max_global_queue=self.max_global_queue,
                     )
                     existing = self._fetch_task_tx(conn, task_id)
                 if existing is None:
@@ -17189,4 +29340,10 @@ class SQLiteStore:
     interrupt_task = request_cancel
 
 
-__all__ = ["InvalidTransition", "NotFoundError", "SQLiteStore", "StoreError"]
+__all__ = [
+    "InvalidTransition",
+    "NotFoundError",
+    "QueueFullError",
+    "SQLiteStore",
+    "StoreError",
+]

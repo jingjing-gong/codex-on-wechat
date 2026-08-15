@@ -1,15 +1,12 @@
-"""Bridge: real WeChat account <-> Codex SDK agent.
+"""Durable bridge between one real WeChat account and process-isolated Agents.
 
-Routes incoming WeChat text messages to persistent Codex SDK threads and sends the reply back to
-the WeChat user. Each WeChat user gets their own codex thread
-(conversation_id = from_user_id), so conversational context is preserved
-across messages from the same person.
-
-wechat_ilink's Monitor dispatches messages from worker threads (sync code),
-while the Codex SDK is async. To bridge the two,
-a single background thread runs a persistent asyncio event loop hosting the
-codex agent; message handlers submit coroutines to it via
-`asyncio.run_coroutine_threadsafe` and block for the result.
+The supervisor owns WeChat, SQLite, routing, and delivery. Its background
+asyncio loop hosts only orchestration and one ``ProcessAgentRuntime`` proxy per
+enabled Agent; every proxy starts a persistent child process containing that
+Agent's private ``CodexRuntime``, SDK client, event loop, and thread state.
+Monitor worker threads submit channel work to the supervisor loop with
+``asyncio.run_coroutine_threadsafe``. Agent turns then cross the private IPC
+boundary and never execute in the supervisor process.
 
 Usage:
     python src/codex_wechat_bot.py
@@ -24,6 +21,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 import difflib
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -40,18 +38,30 @@ import qrcode
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import CodexAgent  # noqa: E402
-from src.agents.codex_runtime import CodexRuntime, default_workspace  # noqa: E402
+from src.agents.codex_runtime import default_workspace  # noqa: E402
 from src.runtime.agent_bridge import (  # noqa: E402
     AgentBridgeCapabilityAuthority,
     AgentBridgeServer,
 )
 from src.runtime.manager import TaskManager  # noqa: E402
+from src.runtime.process_agent import ProcessAgentRuntime  # noqa: E402
 from src.runtime.media import (  # noqa: E402
     AttachmentStore,
     ManagedImageOutputPublisher,
 )
 from src.runtime.registry import AgentRegistry, codex_profile  # noqa: E402
-from src.runtime.sqlite_store import SQLiteStore  # noqa: E402
+from src.runtime.sqlite_store import (  # noqa: E402
+    DEFAULT_MAILBOX_TTL_SECONDS,
+    DEFAULT_MAX_AGENT_QUEUE,
+    DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+    SQLiteStore,
+)
+from src.runtime.supervisor import (  # noqa: E402
+    ChannelAccountOwnership,
+    CredentialMutationOwnership,
+    SupervisorOwnership,
+    SupervisorResourcesStillLive,
+)
 from src.runtime.shell import run_bounded_shell_process  # noqa: E402
 from src.runtime.worker import AgentMailboxSupervisor, _mailbox_result_content  # noqa: E402
 from src.channels.wechat import (  # noqa: E402
@@ -71,6 +81,7 @@ from src.runtime.skills import (  # noqa: E402
 from wechat_ilink import (  # noqa: E402
     Client,
     Monitor,
+    accounts_dir,
     delete_all_credentials,
     fetch_qrcode,
     format_message_summary,
@@ -144,6 +155,7 @@ HELP_TEXT = """## Commands
 _MAX_SHELL_OUTPUT = 6000
 _SHELL_TIMEOUT = 30
 _CODEX_TASK_TIMEOUT = None
+_DEFAULT_MAX_AGENT_PROCESSES = 16
 # The durable bot's operating mode is administrator-selected at startup.  A
 # new immutable profile version avoids conflicting with databases seeded by
 # earlier releases whose Codex profile defaulted to read-only ``chat``.
@@ -488,6 +500,68 @@ def logout() -> None:
     )
 
 
+def _load_or_authenticate_credentials() -> tuple[Any, bool]:
+    """Return exact credentials without constructing a channel client."""
+
+    existing = load_all_credentials()
+    if existing:
+        logger.info("using saved credentials for %s", existing[0].ilink_user_id)
+        return existing[0], False
+
+    qr = fetch_qrcode()
+    print("scan this QR code with WeChat to log in:")
+    _render_qrcode(qr.qrcode_img_content)
+    credentials = poll_qr_status(
+        qr.qrcode,
+        on_status=lambda status: print(f"status: {status}"),
+    )
+    return credentials, True
+
+
+def _login_with_ownership() -> None:
+    """Authenticate and publish credentials under mutation/account locks."""
+
+    with CredentialMutationOwnership(accounts_dir()):
+        credentials, should_save = _load_or_authenticate_credentials()
+        with ChannelAccountOwnership(
+            channel="wechat",
+            bot_id=credentials.ilink_bot_id,
+        ):
+            if should_save:
+                save_credentials(credentials)
+                logger.info("login successful, credentials saved")
+
+
+def _logout_with_ownership() -> None:
+    """Delete credentials only while every discovered account is quiescent."""
+
+    with CredentialMutationOwnership(accounts_dir()):
+        account_locks: list[ChannelAccountOwnership] = []
+        try:
+            for bot_id in sorted(
+                {
+                    str(credentials.ilink_bot_id or "").strip()
+                    for credentials in load_all_credentials()
+                    if str(credentials.ilink_bot_id or "").strip()
+                }
+            ):
+                lock = ChannelAccountOwnership(channel="wechat", bot_id=bot_id)
+                lock.acquire()
+                account_locks.append(lock)
+            count = delete_all_credentials()
+        finally:
+            for lock in reversed(account_locks):
+                lock.close()
+    print(
+        f"deleted {count} saved credential file(s); "
+        "next run will require a fresh QR-code login"
+    )
+
+
+class AsyncLoopShutdownError(SupervisorResourcesStillLive):
+    """The loop thread is still live, so supervisor locks must be retained."""
+
+
 class AsyncLoopThread:
     """Runs a persistent asyncio event loop on a background thread.
 
@@ -628,7 +702,19 @@ class AsyncLoopThread:
 
         self.run_coro(consume())
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float | None = 5.0) -> None:
+        """Stop and definitively join the loop thread or fail closed.
+
+        Python cannot safely kill an arbitrary in-process thread.  If loop
+        cleanup ignores cancellation past the bounded join, raise the fatal
+        ownership-retention marker instead of returning while runtime code is
+        still able to touch SQLite or channel resources.
+        """
+
+        if timeout is not None:
+            timeout = float(timeout)
+            if timeout < 0:
+                raise ValueError("loop shutdown timeout cannot be negative")
         with self._state_lock:
             if not self._started:
                 if not self._closed and not self.loop.is_closed():
@@ -636,15 +722,25 @@ class AsyncLoopThread:
                     self._stop_requested = True
                     self.loop.close()
                 return
+            request_stop = not self._stop_requested
             self._stop_requested = True
             thread = self._thread
-            if not self.loop.is_closed():
+            if request_stop and not self.loop.is_closed():
                 self.loop.call_soon_threadsafe(self.loop.stop)
         if threading.current_thread() is thread:
-            return
-        thread.join(timeout=5)
+            raise AsyncLoopShutdownError(
+                "loop thread cannot definitively join itself during shutdown"
+            )
+        thread.join(timeout=timeout)
         if thread.is_alive():
-            logger.warning("asyncio loop thread did not stop within timeout")
+            raise AsyncLoopShutdownError(
+                "asyncio loop thread did not stop; supervisor ownership retained"
+            )
+        with self._state_lock:
+            if not self._closed or not self.loop.is_closed():
+                raise AsyncLoopShutdownError(
+                    "asyncio loop shutdown finished without a closed-loop fence"
+                )
 
 
 def _legacy_main() -> None:
@@ -1204,23 +1300,123 @@ def _durable_main() -> None:
     """
     args = set(sys.argv[1:])
     if "--logout" in args:
-        logout()
+        _logout_with_ownership()
         return
     if "--login" in args:
-        wechat_client = login()
-        try:
-            print("login complete")
-        finally:
-            wechat_client.close()
+        _login_with_ownership()
+        print("login complete")
         return
 
-    wechat_client = login()
+    database = _durable_database()
+    ownership: SupervisorOwnership | None = None
     try:
-        _run_durable(wechat_client)
-    finally:
-        # Startup rollback and ordinary shutdown both drain channel workers in
-        # the runner before this shared HTTP transport is released.
+        # This is the one global lock order: credential mutation, then the
+        # database/account pair.  Credential discovery and QR authentication
+        # happen before Client construction; new credentials are not published
+        # until their exact account and runtime database are both exclusively
+        # owned.
+        with CredentialMutationOwnership(accounts_dir()):
+            credentials, should_save = _load_or_authenticate_credentials()
+            ownership = SupervisorOwnership(
+                database,
+                channel="wechat",
+                bot_id=credentials.ilink_bot_id,
+            ).acquire()
+            if should_save:
+                save_credentials(credentials)
+                logger.info("login successful, credentials saved")
+    except BaseException:
+        if ownership is not None:
+            ownership.close()
+        raise
+
+    assert ownership is not None
+    with ownership:
+        wechat_client = Client(credentials)
+        try:
+            _run_owned_durable(
+                wechat_client,
+                database=database,
+                ownership=ownership,
+            )
+        except SupervisorResourcesStillLive:
+            # The live loop may still be using both SQLite and the HTTP client.
+            # Let SupervisorOwnership retain both locks until process exit.
+            raise
+        except BaseException:
+            _close_owned_client(wechat_client)
+            raise
+        else:
+            _close_owned_client(wechat_client)
+
+
+def _durable_database() -> Path:
+    """Resolve the canonical runtime database without opening SQLite."""
+
+    return Path(
+        os.environ.get(
+            "CODEX_WECHAT_DB",
+            str(Path.home() / ".codex-wechat-bot" / "runtime.sqlite3"),
+        )
+    ).expanduser().resolve()
+
+
+def _positive_environment_integer(name: str, default: int) -> int:
+    """Read one security/capacity bound and reject unsafe configuration."""
+
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive integer")
+    return value
+
+
+def _agent_supervisor_worker_count() -> int:
+    """Return enough dispatch coroutines for independently hosted Agents.
+
+    ``CODEX_WECHAT_WORKERS`` described the removed shared-runtime topology.
+    Honouring a stale value of ``1`` would accidentally serialize otherwise
+    independent Agent processes, so it is now ignored with a migration hint.
+    The durable per-Agent admission slot remains the authority that prevents
+    two invocations from running concurrently inside one Agent process.
+    """
+
+    if "CODEX_WECHAT_WORKERS" in os.environ:
+        logger.warning(
+            "CODEX_WECHAT_WORKERS is deprecated and ignored; use "
+            "CODEX_WECHAT_MAX_AGENT_PROCESSES"
+        )
+    return _positive_environment_integer(
+        "CODEX_WECHAT_MAX_AGENT_PROCESSES",
+        _DEFAULT_MAX_AGENT_PROCESSES,
+    )
+
+
+def _nonnegative_environment_number(name: str, default: float) -> float:
+    """Read one finite duration while preserving an explicit zero value."""
+
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a non-negative finite number") from exc
+    if not math.isfinite(value) or value < 0:
+        raise RuntimeError(f"{name} must be a non-negative finite number")
+    return value
+
+
+def _close_owned_client(wechat_client: Client | Any) -> None:
+    """Close the HTTP boundary or retain ownership when it cannot be fenced."""
+
+    try:
         wechat_client.close()
+    except BaseException as exc:
+        raise SupervisorResourcesStillLive(
+            "WeChat client shutdown failed; supervisor ownership retained"
+        ) from exc
 
 
 def _durable_workspace() -> Path:
@@ -1236,15 +1432,118 @@ def _durable_workspace() -> Path:
     return workspace
 
 
-def _run_durable(wechat_client: Client) -> None:
-    """Run the durable bridge using an already authenticated client."""
+def _build_process_agent_runtime(
+    *,
+    workspace_path: Path,
+    turn_timeout: float | None,
+    managed_root: Path,
+    skill_roots: tuple[Path, ...],
+    image_output_publisher: Any,
+    agent_socket: Path,
+    agent_bridge_capability_issuer: Any,
+    max_processes: int,
+) -> ProcessAgentRuntime:
+    """Build the supervisor proxy without constructing an SDK runtime here."""
 
-    database = Path(
-        os.environ.get(
-            "CODEX_WECHAT_DB",
-            str(Path.home() / ".codex-wechat-bot" / "runtime.sqlite3"),
-        )
-    ).expanduser().resolve()
+    return ProcessAgentRuntime(
+        agent_id="codex",
+        max_processes=max_processes,
+        cwd=str(workspace_path),
+        turn_timeout=turn_timeout,
+        managed_root=managed_root,
+        trusted_skill_roots=skill_roots,
+        image_output_publisher=image_output_publisher,
+        agent_bridge_command=(
+            sys.executable,
+            "-m",
+            "src.agent_cli",
+            "--socket",
+            str(agent_socket),
+        ),
+        agent_bridge_capability_issuer=agent_bridge_capability_issuer,
+    )
+
+
+async def _stop_runtime_boundaries(
+    *,
+    agent_bridge: AgentBridgeServer | Any | None,
+    manager: TaskManager | Any | None,
+    store: SQLiteStore | Any | None,
+) -> None:
+    """Attempt every runtime shutdown boundary before reporting one error."""
+
+    errors: list[BaseException] = []
+    # Stop task/mailbox workers and their Agent children while the bridge is
+    # still accepting turn-scoped collaboration calls.  Only after every
+    # child is drained/reaped may the supervisor close that Unix-socket
+    # boundary.  SQLite is last and both manager/store close are idempotent.
+    for label, resource in (
+        ("task manager", manager),
+        ("Agent bridge", agent_bridge),
+        ("SQLite store", store),
+    ):
+        if resource is None:
+            continue
+        try:
+            if label == "SQLite store":
+                await resource.close()
+            else:
+                await resource.stop()
+        except BaseException as exc:
+            errors.append(exc)
+            logger.debug("failed to stop %s", label, exc_info=True)
+    if errors:
+        raise errors[0]
+
+
+def _raise_unproven_runtime_shutdown(
+    context: str,
+    errors: list[BaseException],
+) -> None:
+    """Fail closed after best-effort cleanup if any boundary remains unknown."""
+
+    if not errors:
+        return
+    raise SupervisorResourcesStillLive(
+        f"{context}; supervisor ownership retained"
+    ) from errors[0]
+
+
+def _run_durable(wechat_client: Client) -> None:
+    """Acquire exclusive database/account ownership and run the bridge."""
+
+    database = _durable_database()
+    ownership = SupervisorOwnership(
+        database,
+        channel="wechat",
+        bot_id=wechat_client.bot_id,
+    )
+    with ownership:
+        try:
+            _run_owned_durable(
+                wechat_client,
+                database=database,
+                ownership=ownership,
+            )
+        except SupervisorResourcesStillLive:
+            raise
+        except BaseException:
+            _close_owned_client(wechat_client)
+            raise
+        else:
+            _close_owned_client(wechat_client)
+
+
+def _run_owned_durable(
+    wechat_client: Client,
+    *,
+    database: Path,
+    ownership: SupervisorOwnership,
+) -> None:
+    """Run only after both supervisor ownership locks are held."""
+
+    if not ownership.held:
+        raise RuntimeError("durable runtime requires supervisor ownership")
     agent_socket = Path(
         os.environ.get(
             "CODEX_WECHAT_AGENT_SOCKET",
@@ -1268,10 +1567,21 @@ def _run_durable(wechat_client: Client) -> None:
         turn_timeout = float(turn_timeout_text) if turn_timeout_text else None
     except ValueError:
         turn_timeout = None
-    try:
-        worker_count = max(1, int(os.environ.get("CODEX_WECHAT_WORKERS", "1")))
-    except ValueError:
-        worker_count = 1
+    worker_count = _agent_supervisor_worker_count()
+    max_agent_queue = _positive_environment_integer(
+        "CODEX_WECHAT_MAX_AGENT_QUEUE", DEFAULT_MAX_AGENT_QUEUE
+    )
+    max_global_queue = _positive_environment_integer(
+        "CODEX_WECHAT_MAX_GLOBAL_QUEUE", DEFAULT_MAX_GLOBAL_AGENT_QUEUE
+    )
+    mailbox_ttl_seconds = _nonnegative_environment_number(
+        "CODEX_WECHAT_MAILBOX_TTL", DEFAULT_MAILBOX_TTL_SECONDS
+    )
+    if max_agent_queue > max_global_queue:
+        raise RuntimeError(
+            "CODEX_WECHAT_MAX_AGENT_QUEUE cannot exceed "
+            "CODEX_WECHAT_MAX_GLOBAL_QUEUE"
+        )
 
     # Validate/create local configuration before starting the loop.  If this
     # fails (for example, an unwritable attachment directory), there is no
@@ -1280,23 +1590,46 @@ def _run_durable(wechat_client: Client) -> None:
 
     agent_loop = AsyncLoopThread()
     loop_started = False
+    store: SQLiteStore | None = None
+    manager: TaskManager | None = None
+    delivery_worker: WeChatDeliveryWorker | None = None
+    media_worker: WeChatMediaDeliveryWorker | None = None
+    mailbox_supervisor: AgentMailboxSupervisor | None = None
+    agent_bridge: AgentBridgeServer | None = None
+    delivery_future: Any | None = None
+    media_future: Any | None = None
+    mailbox_future: Any | None = None
+    monitor: Monitor | None = None
 
-    async def setup() -> tuple[
-        SQLiteStore,
-        TaskManager,
-        WeChatDeliveryWorker,
-        WeChatMediaDeliveryWorker,
-        AgentMailboxSupervisor,
-        AgentBridgeServer,
-    ]:
+    async def setup() -> None:
+        nonlocal store, manager, delivery_worker, media_worker
+        nonlocal mailbox_supervisor, agent_bridge
         # Keep SQLite attachment metadata and the managed filesystem under
         # the same canonical root.  Without this, ``register_attachment``
         # cannot enforce the configured path boundary after a restart.
-        store = SQLiteStore(database, attachment_root=managed_root)
-        manager: TaskManager | None = None
-        agent_bridge: AgentBridgeServer | None = None
+        store = SQLiteStore(
+            database,
+            attachment_root=managed_root,
+            max_agent_queue=max_agent_queue,
+            max_global_queue=max_global_queue,
+            mailbox_ttl_seconds=mailbox_ttl_seconds,
+        )
         try:
-            await store.initialize()
+            # Migrate without touching abandoned work.  The next transaction
+            # advances the durable ownership epoch first and only then performs
+            # the one strong process-boundary recovery.
+            await store.initialize(recover_startup_state=False)
+            epoch = await store.activate_supervisor_epoch(
+                owner_instance_id=ownership.owner_instance_id,
+                channel=ownership.channel,
+                bot_id=ownership.bot_id,
+            )
+            logger.info(
+                "activated supervisor epoch %s for %s/%s",
+                epoch.epoch,
+                ownership.channel,
+                ownership.bot_id,
+            )
             # SQLite owns attachment references across process restarts.  The
             # async cleanup boundary must consult that durable source before
             # removing a file; a process-local AttachmentStore ref map is only
@@ -1318,24 +1651,23 @@ def _run_durable(wechat_client: Client) -> None:
                         exc_info=True,
                     )
             bridge_capabilities = AgentBridgeCapabilityAuthority()
-            runtime = CodexRuntime(
-                cwd=str(workspace_path),
+            # The supervisor owns routing, SQLite, delivery, and process
+            # lifecycle only.  The proxy starts a fresh child interpreter and
+            # constructs the private CodexRuntime there; ``for_agent`` gives
+            # every dynamically created Agent its own persistent process.
+            runtime = _build_process_agent_runtime(
+                workspace_path=workspace_path,
                 turn_timeout=turn_timeout,
                 managed_root=managed_root,
-                trusted_skill_roots=skill_roots,
                 image_output_publisher=ManagedImageOutputPublisher(
                     attachment_store,
                     store,
                     workspace_root=workspace_path,
                 ),
-                agent_bridge_command=(
-                    sys.executable,
-                    "-m",
-                    "src.agent_cli",
-                    "--socket",
-                    str(agent_socket),
-                ),
+                skill_roots=skill_roots,
+                agent_socket=agent_socket,
                 agent_bridge_capability_issuer=bridge_capabilities.issue,
+                max_processes=worker_count,
             )
             registry = AgentRegistry()
             # Keep the immutable v1 chat profile available for queued tasks
@@ -1369,6 +1701,7 @@ def _run_durable(wechat_client: Client) -> None:
                 # the manager persists/restores its immutable profile while
                 # the static `codex` runtime remains the transport template.
                 allow_dynamic_agents=True,
+                require_process_isolation=True,
             )
             agent_bridge = AgentBridgeServer(
                 manager,
@@ -1421,40 +1754,23 @@ def _run_durable(wechat_client: Client) -> None:
                 manager.registry,
                 reply_handler=reply_mailbox,
             )
-            return (
-                store,
-                manager,
-                delivery_worker,
-                media_worker,
-                mailbox_supervisor,
-                agent_bridge,
-            )
         except BaseException:
             # ``TaskManager.start`` rolls back workers, but a failure during
             # store initialization or registry startup can happen before its
             # normal started flag is set.  Close both lifecycle boundaries
             # here; their stop/close methods are idempotent.
             try:
-                if agent_bridge is not None:
-                    await agent_bridge.stop()
-                if manager is not None:
-                    await manager.stop()
-                else:
-                    await store.close()
+                await _stop_runtime_boundaries(
+                    agent_bridge=agent_bridge,
+                    manager=manager,
+                    store=store,
+                )
             except BaseException:
-                logger.debug("failed to clean up runtime after startup error", exc_info=True)
+                logger.debug(
+                    "failed to clean up runtime after startup error",
+                    exc_info=True,
+                )
             raise
-
-    store: SQLiteStore | None = None
-    manager: TaskManager | None = None
-    delivery_worker: WeChatDeliveryWorker | None = None
-    media_worker: WeChatMediaDeliveryWorker | None = None
-    mailbox_supervisor: AgentMailboxSupervisor | None = None
-    agent_bridge: AgentBridgeServer | None = None
-    delivery_future: Any | None = None
-    media_future: Any | None = None
-    mailbox_future: Any | None = None
-    monitor: Monitor | None = None
 
     try:
         agent_loop.start()
@@ -1463,14 +1779,10 @@ def _run_durable(wechat_client: Client) -> None:
         # Keep construction separate from Monitor.run: an exception in a
         # gateway/worker constructor needs runtime cleanup, while an ordinary
         # monitor exception should still take the normal drain path below.
-        (
-            store,
-            manager,
-            delivery_worker,
-            media_worker,
-            mailbox_supervisor,
-            agent_bridge,
-        ) = agent_loop.run_coro(setup(), timeout=60)
+        agent_loop.run_coro(setup(), timeout=60)
+        assert store is not None
+        assert manager is not None
+        assert media_worker is not None
         gateway = WeChatGateway(
             manager,
             bot_id=wechat_client.bot_id,
@@ -1521,25 +1833,49 @@ def _run_durable(wechat_client: Client) -> None:
     except BaseException:
         # ``setup`` handles failures inside manager.start.  This path covers
         # loop, gateway, monitor, and delivery-task startup.
+        cleanup_errors: list[BaseException] = []
         for worker in (delivery_worker, media_worker):
             if worker is not None:
-                worker.stop()
+                try:
+                    worker.stop()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+                    logger.debug(
+                        "failed to stop delivery worker during startup rollback",
+                        exc_info=True,
+                    )
         if mailbox_supervisor is not None:
-            mailbox_supervisor.stop()
-        if agent_bridge is not None and loop_started:
             try:
-                agent_loop.run_coro(agent_bridge.stop(), timeout=10)
-            except BaseException:
-                logger.debug("failed to stop Agent bridge during startup rollback", exc_info=True)
+                mailbox_supervisor.stop()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                logger.debug(
+                    "failed to stop mailbox worker during startup rollback",
+                    exc_info=True,
+                )
         if monitor is not None:
-            monitor.close()
+            try:
+                monitor.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                logger.debug(
+                    "failed to close monitor during startup rollback",
+                    exc_info=True,
+                )
         auxiliary_futures = [
             future
             for future in (delivery_future, media_future, mailbox_future)
             if future is not None
         ]
         for future in auxiliary_futures:
-            future.cancel()
+            try:
+                future.cancel()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                logger.debug(
+                    "failed to cancel auxiliary worker during startup rollback",
+                    exc_info=True,
+                )
         if auxiliary_futures and loop_started:
             async def drain_auxiliary() -> None:
                 for future in auxiliary_futures:
@@ -1552,21 +1888,35 @@ def _run_durable(wechat_client: Client) -> None:
                         logger.debug("auxiliary worker exited during startup rollback", exc_info=True)
             try:
                 agent_loop.run_coro(drain_auxiliary(), timeout=15)
-            except BaseException:
+            except BaseException as exc:
+                cleanup_errors.append(exc)
                 logger.debug("failed to drain auxiliary workers during startup rollback", exc_info=True)
-        if manager is not None and loop_started:
-            try:
-                agent_loop.run_coro(manager.stop(), timeout=20)
-            except BaseException:
-                logger.debug("failed to stop runtime after startup error", exc_info=True)
-        elif store is not None and loop_started:
-            try:
-                agent_loop.run_coro(store.close(), timeout=20)
-            except BaseException:
-                logger.debug("failed to close store after startup error", exc_info=True)
         if loop_started:
-            agent_loop.stop()
-            loop_started = False
+            try:
+                agent_loop.run_coro(
+                    _stop_runtime_boundaries(
+                        agent_bridge=agent_bridge,
+                        manager=manager,
+                        store=store,
+                    ),
+                    timeout=20,
+                )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                logger.debug(
+                    "failed to stop runtime boundaries after startup error",
+                    exc_info=True,
+                )
+        if loop_started:
+            try:
+                agent_loop.stop()
+                loop_started = False
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        _raise_unproven_runtime_shutdown(
+            "runtime startup rollback could not prove cleanup",
+            cleanup_errors,
+        )
         raise
 
     stop_event = threading.Event()
@@ -1576,19 +1926,36 @@ def _run_durable(wechat_client: Client) -> None:
         except KeyboardInterrupt:
             pass
     finally:
+        shutdown_errors: list[BaseException] = []
         stop_event.set()
         assert monitor is not None
-        monitor.close()
+        try:
+            monitor.close()
+        except BaseException as exc:
+            shutdown_errors.append(exc)
+            logger.exception("durable monitor shutdown failed")
 
         async def shutdown() -> None:
             assert manager is not None
             assert delivery_worker is not None
             assert media_worker is not None
             assert delivery_future is not None
-            delivery_worker.stop()
-            media_worker.stop()
+            errors: list[BaseException] = []
+            for label, worker in (
+                ("delivery worker", delivery_worker),
+                ("media worker", media_worker),
+            ):
+                try:
+                    worker.stop()
+                except BaseException as exc:
+                    errors.append(exc)
+                    logger.debug("failed to stop %s", label, exc_info=True)
             assert mailbox_supervisor is not None
-            mailbox_supervisor.stop()
+            try:
+                mailbox_supervisor.stop()
+            except BaseException as exc:
+                errors.append(exc)
+                logger.debug("failed to stop mailbox worker", exc_info=True)
             # Drain every channel/Agent worker before TaskManager closes
             # SQLite.  A worker may already have claimed a row; closing the
             # store first would strand its lease transition and lose the
@@ -1605,18 +1972,42 @@ def _run_durable(wechat_client: Client) -> None:
                     future.cancel()
                 except asyncio.CancelledError:
                     pass
-                except Exception:
+                except BaseException:
                     logger.debug("auxiliary worker exited with an error", exc_info=True)
-            assert agent_bridge is not None
-            await agent_bridge.stop()
-            await manager.stop()
+            try:
+                await _stop_runtime_boundaries(
+                    agent_bridge=agent_bridge,
+                    manager=manager,
+                    store=store,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            if errors:
+                raise errors[0]
 
         try:
             agent_loop.run_coro(shutdown(), timeout=20)
-        except BaseException:
+        except BaseException as exc:
+            shutdown_errors.append(exc)
             logger.exception("durable runtime shutdown failed")
+        # ``shutdown`` normally closes through TaskManager.  A timeout or
+        # partial worker failure must still drain SQLite before the enclosing
+        # SupervisorOwnership context releases either kernel lock.
+        if store is not None and loop_started:
+            try:
+                agent_loop.run_coro(store.close(), timeout=20)
+            except BaseException as exc:
+                shutdown_errors.append(exc)
+                logger.exception("durable store shutdown fence failed")
         if loop_started:
-            agent_loop.stop()
+            try:
+                agent_loop.stop()
+            except BaseException as exc:
+                shutdown_errors.append(exc)
+        _raise_unproven_runtime_shutdown(
+            "runtime shutdown could not prove cleanup",
+            shutdown_errors,
+        )
 
 
 def main() -> None:

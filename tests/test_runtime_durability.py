@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from src.agents.base import AgentEvent, AgentResult
+from src.agents.base import AgentEvent, AgentResult, AgentTask
 from src.runtime.media import AttachmentStore
 from src.runtime.sqlite_store import SQLiteStore
 from src.runtime.sqlite_store import StoreError
@@ -28,6 +28,40 @@ def _task() -> dict[str, object]:
         },
         "inputs": {"text": "hello"},
     }
+
+
+def test_worker_does_not_terminalize_after_thread_binding_persistence_error():
+    class Store:
+        def __init__(self) -> None:
+            self.completed = False
+
+        async def set_task_thread(self, *_args, **_kwargs):
+            raise StoreError("thread binding persistence failed")
+
+        async def complete_task(self, *_args, **_kwargs):
+            self.completed = True
+
+    async def scenario() -> None:
+        store = Store()
+        worker = TaskWorker(
+            store,
+            runtime=type("Runtime", (), {"agent_id": "codex"})(),
+            worker_id="binding-failure-worker",
+        )
+        task = AgentTask(
+            task_id="binding-failure-task",
+            conversation_id="binding-failure-conversation",
+        )
+        result = AgentResult(
+            task_id=task.task_id,
+            status="completed",
+            thread_id="provider-thread",
+        )
+        with pytest.raises(StoreError, match="thread binding persistence failed"):
+            await worker._finish(task, result, "claim-token")
+        assert store.completed is False
+
+    asyncio.run(scenario())
 
 
 def test_worker_projects_completed_items_before_terminal_without_duplication(tmp_path):

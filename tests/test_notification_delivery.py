@@ -392,7 +392,29 @@ def test_foreground_migration_recovers_after_partial_schema_application(tmp_path
                         "SELECT version FROM schema_migrations WHERE version >= 12"
                     )
                 }
-                assert versions == {12, 13, 14, 15, 16, 17, 18, 19}
+                assert versions == {
+                    12,
+                    13,
+                    14,
+                    15,
+                    16,
+                    17,
+                    18,
+                    19,
+                    20,
+                    21,
+                    22,
+                    23,
+                    24,
+                    25,
+                    26,
+                    27,
+                    28,
+                    29,
+                    30,
+                    31,
+                    32,
+                }
         finally:
             await recovered.close()
 

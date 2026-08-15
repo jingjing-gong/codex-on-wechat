@@ -306,14 +306,29 @@ def test_task_manager_periodically_recovers_expired_leases_without_restart(
                 now=current_time[0],
             )
 
-            mailbox = await store.create_agent_message(
+            blocked_mailbox = await store.create_agent_message(
                 source_agent_id="planner",
                 destination_agent_id="codex",
+                content="wait behind the task",
+                request_id="live-blocked-mailbox",
+            )
+            assert await store.claim_mailbox(
+                "codex",
+                "mailbox-worker",
+                lease_seconds=1,
+                now=current_time[0],
+            ) == []
+
+            # A different Agent owns an independent active-invocation fence,
+            # so task and mailbox recovery can still be exercised together.
+            mailbox = await store.create_agent_message(
+                source_agent_id="codex",
+                destination_agent_id="planner",
                 content="recover me",
                 request_id="live-expired-mailbox",
             )
             mailbox_claims = await store.claim_mailbox(
-                "codex",
+                "planner",
                 "mailbox-worker",
                 lease_seconds=1,
                 now=current_time[0],
@@ -370,7 +385,7 @@ def test_task_manager_periodically_recovers_expired_leases_without_restart(
                     current_task is not None
                     and current_task.state.value == "orphaned"
                     and current_mailbox is not None
-                    and current_mailbox.state.value == "pending"
+                    and current_mailbox.state.value == "orphaned_mailbox"
                     and current_claimed is not None
                     and current_claimed.state.value == "pending"
                     and current_sending is not None
@@ -387,6 +402,11 @@ def test_task_manager_periodically_recovers_expired_leases_without_restart(
             execution = await store.get_execution(task_claim.execution_id)
             assert execution is not None
             assert execution.state.value == "orphaned"
+            still_blocked = await store.get_mailbox_item(
+                blocked_mailbox.mailbox_id
+            )
+            assert still_blocked is not None
+            assert still_blocked.state.value == "pending"
             assert manager._reconcile_task is not None
             assert not manager._reconcile_task.done()
         finally:
@@ -503,26 +523,70 @@ def test_startup_reconcile_reclaims_future_leases_conservatively(tmp_path):
                 now=base,
             )
 
-            mailbox_claimed = await first.create_agent_message(
+            blocked_mailbox = await first.create_agent_message(
                 source_agent_id="codex",
                 destination_agent_id="codex",
+                content="blocked by running task",
+                request_id="restart-mailbox-blocked",
+                now=base,
+            )
+            assert await first.claim_mailbox(
+                "codex",
+                "old-mailbox-worker",
+                limit=2,
+                lease_seconds=3600,
+                now=base,
+            ) == []
+
+            mailbox_claimed = await first.create_agent_message(
+                source_agent_id="codex",
+                destination_agent_id="planner",
                 content="claimed mailbox",
                 request_id="restart-mailbox-claimed",
+                now=base,
+            )
+            mailbox_waiting = await first.create_agent_message(
+                source_agent_id="codex",
+                destination_agent_id="planner",
+                content="second planner mailbox",
+                request_id="restart-mailbox-waiting",
+                now=base,
             )
             mailbox_processing = await first.create_agent_message(
                 source_agent_id="codex",
-                destination_agent_id="codex",
+                destination_agent_id="reviewer",
                 content="processing mailbox",
                 request_id="restart-mailbox-processing",
+                now=base,
             )
-            mailbox_claims = await first.claim_mailbox(
-                "codex", "old-mailbox-worker", limit=2, lease_seconds=3600, now=base
+            planner_claims = await first.claim_mailbox(
+                "planner",
+                "old-mailbox-worker",
+                limit=2,
+                lease_seconds=3600,
+                now=base,
             )
-            assert len(mailbox_claims) == 2
-            mailbox_by_id = {item.mailbox_id: item for item in mailbox_claims}
+            # limit is an API compatibility ceiling; an Agent receives at
+            # most one active invocation, leaving its second row queued.
+            assert [item.mailbox_id for item in planner_claims] == [
+                mailbox_claimed.mailbox_id
+            ]
+            assert (
+                await first.get_mailbox_item(mailbox_waiting.mailbox_id)
+            ).state.value == "pending"
+            reviewer_claims = await first.claim_mailbox(
+                "reviewer",
+                "old-mailbox-worker",
+                limit=2,
+                lease_seconds=3600,
+                now=base,
+            )
+            assert [item.mailbox_id for item in reviewer_claims] == [
+                mailbox_processing.mailbox_id
+            ]
             assert await first.mark_mailbox_processing(
                 mailbox_processing.mailbox_id,
-                mailbox_by_id[mailbox_processing.mailbox_id].claim_token,
+                reviewer_claims[0].claim_token,
             )
 
             attachment_store = AttachmentStore(tmp_path / "attachments")
@@ -602,12 +666,34 @@ def test_startup_reconcile_reclaims_future_leases_conservatively(tmp_path):
             assert all(item.claim_token is None for item in recovered_outbox.values())
 
             recovered_mailbox = {
-                item.mailbox_id: item
-                for item in await restarted.list_mailbox("codex", limit=10)
+                mailbox_id: await restarted.get_mailbox_item(mailbox_id)
+                for mailbox_id in (
+                    blocked_mailbox.mailbox_id,
+                    mailbox_claimed.mailbox_id,
+                    mailbox_waiting.mailbox_id,
+                    mailbox_processing.mailbox_id,
+                )
             }
-            assert recovered_mailbox[mailbox_claimed.mailbox_id].state.value == "pending"
-            assert recovered_mailbox[mailbox_processing.mailbox_id].state.value == "pending"
-            assert all(item.claim_token is None for item in recovered_mailbox.values())
+            assert (
+                recovered_mailbox[mailbox_claimed.mailbox_id].state.value
+                == "orphaned_mailbox"
+            )
+            assert (
+                recovered_mailbox[mailbox_processing.mailbox_id].state.value
+                == "orphaned_mailbox"
+            )
+            assert (
+                recovered_mailbox[blocked_mailbox.mailbox_id].state.value
+                == "pending"
+            )
+            assert (
+                recovered_mailbox[mailbox_waiting.mailbox_id].state.value
+                == "pending"
+            )
+            assert all(
+                item is not None and item.claim_token is None
+                for item in recovered_mailbox.values()
+            )
 
             recovered_media = {
                 item.media_id: item
@@ -679,15 +765,30 @@ def test_second_live_store_startup_reconcile_does_not_steal_healthy_leases(tmp_p
                 outbox.outbox_id, outbox_claim.claim_token, now=base
             )
 
-            mailbox = await first.create_agent_message(
+            blocked_mailbox = await first.create_agent_message(
                 source_agent_id="codex",
                 destination_agent_id="codex",
+                content="blocked live mailbox",
+                request_id="live-mailbox-blocked",
+                now=base,
+            )
+            assert await first.claim_mailbox(
+                "codex",
+                "live-mailbox-worker",
+                lease_seconds=3600,
+                now=base,
+            ) == []
+
+            mailbox = await first.create_agent_message(
+                source_agent_id="codex",
+                destination_agent_id="planner",
                 content="live mailbox",
                 request_id="live-mailbox",
+                now=base,
             )
             mailbox_claim = (
                 await first.claim_mailbox(
-                    "codex",
+                    "planner",
                     "live-mailbox-worker",
                     lease_seconds=3600,
                     now=base,
@@ -729,6 +830,9 @@ def test_second_live_store_startup_reconcile_does_not_steal_healthy_leases(tmp_p
             assert (await first.get_task(task.task_id)).state.value == "running"
             assert (await first.get_outbox_item(outbox.outbox_id)).state.value == "sending"
             assert (await first.get_mailbox_item(mailbox.mailbox_id)).state.value == "processing"
+            assert (
+                await first.get_mailbox_item(blocked_mailbox.mailbox_id)
+            ).state.value == "pending"
             assert (await first.get_outgoing_media(media.media_id)).state.value == "uploading"
 
             # The first owner has already consumed its empty open-time report.
@@ -746,6 +850,9 @@ def test_second_live_store_startup_reconcile_does_not_steal_healthy_leases(tmp_p
                 assert (await first.get_task(task.task_id)).state.value == "running"
                 assert (await first.get_outbox_item(outbox.outbox_id)).state.value == "sending"
                 assert (await first.get_mailbox_item(mailbox.mailbox_id)).state.value == "processing"
+                assert (
+                    await first.get_mailbox_item(blocked_mailbox.mailbox_id)
+                ).state.value == "pending"
                 assert (await first.get_outgoing_media(media.media_id)).state.value == "uploading"
             finally:
                 await manager.stop()

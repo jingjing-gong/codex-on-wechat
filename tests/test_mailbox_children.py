@@ -228,6 +228,11 @@ def test_mailbox_worker_replies_through_task_manager(tmp_path):
             assert [(item.content, item.reply_to_id) for item in responses] == [
                 ("answer", request.message_id)
             ]
+            # The queued source task is codex's older unfinished invocation,
+            # so its correlated mailbox response cannot start concurrently.
+            assert await manager.process_mailbox_once("codex") == 0
+            assert codex.calls == 0
+            assert await store.cancel_task("source-task", actor="test")
             assert await manager.process_mailbox_once("codex") == 1
             assert codex.calls == 1
             assert (await store.list_mailbox("planner")) == [original]
@@ -290,11 +295,14 @@ def test_mailbox_recovery_does_not_repeat_agent_after_response_commit(tmp_path):
             registry.register("planner", runtime)
             manager = TaskManager(store, registry)
 
-            assert await manager.process_mailbox_once("planner") == 1
+            # A response committed before ownership loss is retained, but the
+            # uncertain request invocation is never automatically executed a
+            # second time.
+            assert await manager.process_mailbox_once("planner") == 0
             assert runtime.calls == 0
             recovered = await store.get_mailbox_item(request.mailbox_id)
             assert recovered is not None
-            assert recovered.state.value == "processed"
+            assert recovered.state.value == "orphaned_mailbox"
             assert await store.get_correlated_mailbox_response(
                 request.mailbox_id
             ) == response

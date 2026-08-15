@@ -151,13 +151,13 @@ def test_unscoped_event_persists_sender_and_initialize_repairs_v19_row(
         finally:
             await store.close()
 
-        # Model an already-marked v19 database produced before the idempotent
+        # Model an already-marked latest database produced before the idempotent
         # sender repair existed.  Initialization must repair it without relying
         # on the migration body running again.
         with sqlite3.connect(path) as connection:
             assert connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone() == (19,)
+            ).fetchone() == (32,)
             connection.execute(
                 "UPDATE user_outbox SET from_user_id='' WHERE outbox_id=?",
                 (outbox_id,),

@@ -22,11 +22,7 @@ from src.agents.base import (
 )
 
 from .dispatcher import SQLiteDispatcher, _call_compatible
-from .identity import (
-    conversation_id as canonical_conversation_id,
-    conversation_id_matches,
-    mailbox_conversation_id,
-)
+from .identity import mailbox_conversation_id
 
 logger = logging.getLogger(__name__)
 
@@ -362,10 +358,19 @@ class TaskWorker:
                         raise
                     except Exception as exc:
                         logger.exception("Agent task %s failed", task_id)
+                        # Losing a child process after an assignment crossed
+                        # the runtime boundary is not an ordinary model
+                        # failure. The external turn may already have caused
+                        # effects or emitted an unacknowledged result, so the
+                        # durable attempt must require explicit review/retry
+                        # instead of being presented as a safely failed turn.
+                        uncertain = bool(
+                            getattr(exc, "execution_uncertain", False)
+                        )
                         result = AgentResult(
                             task_id=task_id,
                             execution_id=execution_id,
-                            status="failed",
+                            status="orphaned" if uncertain else "failed",
                             error=str(exc) or exc.__class__.__name__,
                             events=tuple(events),
                         )
@@ -664,15 +669,12 @@ class TaskWorker:
         if result.thread_id:
             setter = getattr(self.store, "set_task_thread", None) or getattr(self.store, "set_thread_binding", None)
             if setter is not None:
-                try:
-                    await _call_compatible(
-                        setter,
-                        task.task_id,
-                        thread_id=result.thread_id,
-                        claim_token=claim_token,
-                    )
-                except Exception:
-                    logger.debug("could not persist Codex thread binding", exc_info=True)
+                await _call_compatible(
+                    setter,
+                    task.task_id,
+                    thread_id=result.thread_id,
+                    claim_token=claim_token,
+                )
         method = getattr(self.store, "finish_task", None) or getattr(self.store, "complete_task", None)
         if method is not None:
             return await _call_compatible(
@@ -1618,56 +1620,17 @@ class AgentMailboxWorker:
             or _field(item, "message_id", "")
             or uuid.uuid4().hex
         )
-        has_route = bool(target.channel and target.bot_id and target.external_user_id)
-        canonical_conversation = (
-            canonical_conversation_id(
-                target.channel,
-                target.bot_id,
-                target.external_user_id,
-                target.session_id,
-                destination,
-            )
-            if has_route
-            else ""
-        )
         conversation_id = str(snapshot.get("conversation_id", "") or "")
-        if canonical_conversation:
-            if conversation_id and not conversation_id_matches(
-                conversation_id,
-                target.channel,
-                target.bot_id,
-                target.external_user_id,
-                target.session_id,
-                destination,
-            ):
-                raise PermissionError(
-                    "mailbox conversation identity conflicts with reply target"
-                )
-            resolver = getattr(self.store, "resolve_scoped_conversation", None)
-            if resolver is not None:
-                try:
-                    conversation_id = await _call_compatible(
-                        resolver,
-                        conversation_id,
-                        channel=target.channel,
-                        bot_id=target.bot_id,
-                        external_user_id=target.external_user_id,
-                        session_id=target.session_id,
-                        agent_id=destination,
-                    )
-                except Exception as exc:
-                    raise PermissionError(
-                        "mailbox conversation identity could not be validated"
-                    ) from exc
-            else:
-                # A compatibility store cannot prove ownership of an ambiguous
-                # legacy ID. Canonicalize it before entering the Agent runtime.
-                conversation_id = canonical_conversation
-        elif not conversation_id:
-            # Pre-snapshot rows cannot safely share a long-lived Agent thread.
-            # Keep each logical request isolated while retaining its stable ID
-            # across a processing retry.
-            conversation_id = mailbox_conversation_id(destination, request_id)
+        expected_conversation_id = mailbox_conversation_id(destination, request_id)
+        if conversation_id and conversation_id != expected_conversation_id:
+            raise PermissionError(
+                "mailbox conversation identity conflicts with its request"
+            )
+        # Mailbox turns are request/destination scoped even when their reply
+        # target contains a complete user route.  The route controls where a
+        # later foreground response may be presented; it is never a provider
+        # thread identity for internal Agent work.
+        conversation_id = expected_conversation_id
 
         snapshot_agent = str(snapshot.get("agent_id", destination) or destination)
         if snapshot_agent != destination:
@@ -1718,6 +1681,7 @@ class AgentMailboxWorker:
 
         metadata = snapshot.get("metadata")
         metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+        metadata.pop("session_role", None)
         if profile is not None and "profile" not in metadata:
             converter = getattr(profile, "as_dict", None) or getattr(
                 profile, "to_dict", None

@@ -14,6 +14,7 @@ import pytest
 
 from src.agents.base import AgentResult, ReplyTarget
 from src.runtime.agent_bridge import AgentBridgeServer
+from src.runtime.identity import mailbox_conversation_id
 from src.runtime.manager import TaskManager
 from src.runtime.modes import AgentMode
 from src.runtime.policy import AgentProfile, PolicyEngine
@@ -160,9 +161,42 @@ def test_two_dynamic_aliases_use_manager_mailbox_without_user_outbox(tmp_path):
             )
             assert message.source_agent_id == "planner"
             assert message.destination_agent_id == "reviewer"
+            assert message.execution_snapshot["conversation_id"] == (
+                mailbox_conversation_id("reviewer", "dynamic-agent-request")
+            )
+            assert message.execution_snapshot["conversation_id"] != (
+                task.conversation_id
+            )
+
+            response = await manager.reply_agent_message(
+                message.mailbox_id,
+                "The proposed change is sound.",
+                source_agent_id="reviewer",
+            )
+            assert response.request_id == message.request_id
+            assert response.reply_to_id == message.message_id
+            assert response.causation_id == message.message_id
+            assert response.execution_snapshot["conversation_id"] == (
+                mailbox_conversation_id("planner", "dynamic-agent-request")
+            )
+            assert response.execution_snapshot["conversation_id"] != (
+                message.execution_snapshot["conversation_id"]
+            )
+
+            generated = await manager.send_agent_message(
+                "reviewer",
+                "Use one generated logical request identity.",
+                task_id=task.task_id,
+                require_active_task=True,
+            )
+            assert generated.request_id
+            assert generated.execution_snapshot["conversation_id"] == (
+                mailbox_conversation_id("reviewer", generated.request_id)
+            )
             mailbox = await manager.store.list_mailbox("reviewer")
             assert [item.request_id for item in mailbox] == [
-                "dynamic-agent-request"
+                "dynamic-agent-request",
+                generated.request_id,
             ]
             assert await manager.store.list_outbox() == []
 

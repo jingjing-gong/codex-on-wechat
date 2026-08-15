@@ -22,7 +22,7 @@ _SKILL_NAME_RE = re.compile(
     # The public syntax in plan.md is ``[A-Za-z][A-Za-z0-9_-]*``; accepting
     # punctuation here would make malformed selectors look like distinct
     # registry IDs and would complicate deterministic error handling.
-    r"^\$([A-Za-z][A-Za-z0-9_-]*)(?:[ \t]+([\s\S]*))?$"
+    r"^\$([A-Za-z][A-Za-z0-9_-]*)(?:\s+([\s\S]*))?$"
 )
 _MAX_SKILLS_HELP = 6000
 _PATH_FRAGMENT_RE = re.compile(r"(?<![A-Za-z0-9_])/(?:[^\s`]+)")

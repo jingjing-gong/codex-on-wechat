@@ -145,12 +145,20 @@ class CodexAgent(CodexRuntime):
         thread = await result if inspect.isawaitable(result) else result
         self._threads[str(conversation_id)] = thread
         from .agents.codex_runtime import ThreadBinding
+        from .runtime.roles import implicit_default_role
+
+        default_role = implicit_default_role()
 
         binding = ThreadBinding(
             conversation_id=str(conversation_id),
             mode_id="chat",
             profile_version=1,
             policy_version=1,
+            role_version=int(default_role["role_version"]),
+            role_snapshot_hash=str(default_role["snapshot_hash"]),
+            persona_composition_version=str(
+                default_role["persona_composition_version"]
+            ),
             thread_id=str(getattr(thread, "id", thread_id)),
             thread=thread,
         )

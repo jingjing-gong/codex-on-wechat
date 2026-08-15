@@ -282,9 +282,9 @@ def test_mailbox_worker_does_not_publish_reply_after_lease_loss(tmp_path):
             await asyncio.wait_for(cancelled.wait(), timeout=1)
             assert await asyncio.wait_for(running, timeout=1) == 0
             assert replies == []
-            pending = await store.get_mailbox_item(request.mailbox_id)
-            assert pending is not None
-            assert pending.state.value == "pending"
+            orphaned = await store.get_mailbox_item(request.mailbox_id)
+            assert orphaned is not None
+            assert orphaned.state.value == "orphaned_mailbox"
             assert worker._lost_mailbox_claims == set()
             assert worker._mailbox_claim_loss_events == {}
         finally:

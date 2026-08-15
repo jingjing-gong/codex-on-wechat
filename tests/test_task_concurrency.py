@@ -104,6 +104,73 @@ def test_minimal_custom_codex_mode_version_cannot_be_rewritten(tmp_path):
     asyncio.run(scenario())
 
 
+def test_set_valued_profile_and_mode_metadata_ignore_legacy_json_order(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        await store.initialize()
+        try:
+            profile = AgentProfile(
+                agent_id="writer",
+                display_name="writer",
+                capabilities=frozenset({"read", "write", "execute"}),
+                allowed_peers=frozenset({"codex", "reviewer"}),
+                denied_peers=frozenset({"blocked", "retired"}),
+                allowed_request_types=frozenset({"ask", "review"}),
+                denied_request_types=frozenset({"delete", "publish"}),
+                profile_version=2,
+            )
+            mode = AgentMode(
+                mode_id="custom",
+                allowed_tools=frozenset({"read", "search", "write"}),
+                denied_tools=frozenset({"delete", "network"}),
+                policy_version=2,
+            )
+            await store.put_profile(profile)
+            await store.put_mode(mode, agent_id="writer")
+
+            await store._call(
+                lambda conn: conn.execute(
+                    """UPDATE agent_profiles
+                       SET capabilities_json='["write","read","execute"]',
+                           allowed_peers_json='["reviewer","codex"]',
+                           denied_peers_json='["retired","blocked"]',
+                           allowed_request_types_json='["review","ask"]',
+                           denied_request_types_json='["publish","delete"]'
+                       WHERE agent_id='writer' AND profile_version=2"""
+                ).rowcount
+            )
+            await store._call(
+                lambda conn: conn.execute(
+                    """UPDATE agent_modes
+                       SET allowed_tools_json='["write","search","read"]',
+                           denied_tools_json='["network","delete"]'
+                       WHERE agent_id='writer' AND mode_id='custom'
+                         AND policy_version=2"""
+                ).rowcount
+            )
+
+            assert await store.put_profile(profile)
+            assert await store.put_mode(mode, agent_id="writer")
+            assert await store.get_profile("writer", 2) == profile
+            assert await store.get_mode("writer", "custom", 2) == mode
+
+            # Lifecycle/scalar drift is not a representation difference.
+            assert await store._call(
+                lambda conn: conn.execute(
+                    """UPDATE agent_profiles SET enabled=0
+                       WHERE agent_id='writer' AND profile_version=2"""
+                ).rowcount
+            ) == 1
+            with pytest.raises(
+                StoreError, match="profile version metadata conflicts: writer@2"
+            ):
+                await store.put_profile(profile)
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
 def test_minimal_codex_profile_version_cannot_be_rewritten_publicly(tmp_path):
     async def scenario() -> None:
         store = SQLiteStore(tmp_path / "runtime.sqlite")
@@ -861,14 +928,22 @@ def test_transition_task_rejects_a_missing_active_execution(tmp_path):
                 execution_id=claim.execution_id,
             )
 
-            # Simulate a corrupt/partially migrated database where the task
-            # still advertises active ownership but its execution disappeared.
-            await store._call(
-                lambda conn: conn.execute(
-                    "DELETE FROM task_executions WHERE execution_id=?",
-                    (claim.execution_id,),
-                ).rowcount
-            )
+            # Simulate an externally imported/corrupt database.  Schema v26
+            # normally prevents this deletion through the deferred execution
+            # and invocation foreign keys, so the test must explicitly bypass
+            # FK enforcement to retain coverage of the store's fail-closed
+            # validation at the API boundary.
+            def remove_execution(conn):
+                conn.execute("PRAGMA foreign_keys=OFF")
+                try:
+                    return conn.execute(
+                        "DELETE FROM task_executions WHERE execution_id=?",
+                        (claim.execution_id,),
+                    ).rowcount
+                finally:
+                    conn.execute("PRAGMA foreign_keys=ON")
+
+            assert await store._call(remove_execution) == 1
 
             with pytest.raises(StoreError, match="execution"):
                 await store.transition_task(
@@ -911,23 +986,34 @@ def test_complete_task_fails_closed_when_unfinished_executions_are_ambiguous(tmp
 
             # Simulate a crash/repair that left a second unfinished attempt
             # behind while the task projection still points at the first one.
-            await store._call(
-                lambda conn: conn.execute(
-                    """INSERT INTO task_executions
-                       (execution_id, task_id, attempt, state, worker_id,
-                        claim_token, lease_expires_at, created_at)
-                       VALUES (?, ?, ?, 'running', ?, ?, ?, ?)""",
-                    (
-                        "ambiguous-execution",
-                        task.task_id,
-                        99,
-                        "worker-b",
-                        "ambiguous-token",
-                        "2099-01-01T00:00:00+00:00",
-                        "2026-01-01T00:00:00+00:00",
-                    ),
-                ).rowcount
-            )
+            def insert_ambiguous_execution(conn):
+                conn.execute("PRAGMA foreign_keys=OFF")
+                try:
+                    return conn.execute(
+                        """INSERT INTO task_executions
+                           (execution_id, task_id, attempt, agent_id,
+                            agent_incarnation, state, dispatch_backend,
+                            worker_id, claim_token, lease_expires_at,
+                            started_at, created_at)
+                           VALUES (?, ?, ?, ?, ?, 'running', 'compatibility',
+                                   ?, ?, ?, ?, ?)""",
+                        (
+                            "ambiguous-execution",
+                            task.task_id,
+                            99,
+                            task.agent_id,
+                            task.agent_incarnation,
+                            "worker-b",
+                            "ambiguous-token",
+                            "2099-01-01T00:00:00+00:00",
+                            "2026-01-01T00:00:00+00:00",
+                            "2026-01-01T00:00:00+00:00",
+                        ),
+                    ).rowcount
+                finally:
+                    conn.execute("PRAGMA foreign_keys=ON")
+
+            assert await store._call(insert_ambiguous_execution) == 1
 
             with pytest.raises(StoreError, match="ambiguous active execution"):
                 await store.complete_task(

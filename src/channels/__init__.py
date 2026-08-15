@@ -14,6 +14,9 @@ from .models import (
 from .wechat import (
     Acceptance,
     COMMAND_HELP,
+    COMMAND_REGISTRY,
+    CommandRegistryEntry,
+    CommandRegistryGroup,
     MVPCommandRouter,
     MVP_COMMAND_NAMES,
     WeChatAdapter,
@@ -48,8 +51,11 @@ from .wechat import (
 __all__ = [
     "Acceptance",
     "COMMAND_HELP",
+    "COMMAND_REGISTRY",
     "ChannelCommand",
     "ChannelMessage",
+    "CommandRegistryEntry",
+    "CommandRegistryGroup",
     "DeliveryReceipt",
     "InboundEnvelope",
     "InboundMessage",

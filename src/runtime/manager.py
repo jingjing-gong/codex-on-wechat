@@ -8,6 +8,7 @@ from dataclasses import replace
 import inspect
 import logging
 import math
+import os
 import re
 import uuid
 from collections.abc import Mapping
@@ -23,12 +24,21 @@ from .worker import TaskWorker
 from .modes import ModeRegistry
 from .media import canonical_media_inputs
 from .policy import AgentProfile, EffectivePolicy, PolicyEngine
+from .roles import (
+    RoleValidationError,
+    build_role_snapshot,
+    implicit_default_role,
+    is_default_role_token,
+    normalize_role_text,
+    validate_role_snapshot,
+)
 from .skills import (
     find_skill,
     iter_skill_descriptors,
     normalize_skill,
     normalize_skills,
 )
+from .store import QueueFullError
 
 logger = logging.getLogger(__name__)
 
@@ -42,26 +52,45 @@ _DYNAMIC_AGENT_SUMMARY = DYNAMIC_AGENT_SUMMARY
 
 
 class _NamedAgentRuntime:
-    """Logical Agent view over a shared, already configured runtime.
+    """Logical Agent view with an independently owned runtime when supported.
 
-    A named Agent owns its profile and conversation identity, while the
-    Codex transport can safely be shared with the static runtime.  Lifecycle
-    ownership remains with the original registry entry; this wrapper avoids
-    starting/stopping the same transport once per alias.
+    A process-backed template exposes ``for_agent(agent_id)``.  In that case
+    the named Agent owns the returned delegate and therefore starts/stops a
+    distinct child process.  The compatibility fallback remains intentionally
+    narrow for embedders whose in-memory test/runtime objects do not provide a
+    factory: those aliases retain the historical shared-delegate behavior.
     """
 
     def __init__(self, agent_id: str, delegate: Any) -> None:
         self.agent_id = str(agent_id)
-        self._delegate = delegate
+        factory = getattr(delegate, "for_agent", None)
+        if callable(factory):
+            owned_delegate = factory(self.agent_id)
+            if inspect.isawaitable(owned_delegate):
+                raise TypeError("Agent runtime for_agent() must be synchronous")
+            if owned_delegate is delegate:
+                raise ValueError(
+                    "Agent runtime for_agent() must return an independent runtime"
+                )
+            self._delegate = owned_delegate
+            self._owns_delegate = True
+        else:
+            self._delegate = delegate
+            self._owns_delegate = False
+
+    @property
+    def owns_delegate(self) -> bool:
+        """Whether this named Agent owns an independent lifecycle boundary."""
+
+        return self._owns_delegate
 
     async def start(self) -> None:
-        # The template runtime is registered before this alias and therefore
-        # starts first.  A no-op also makes adding an alias after startup safe.
-        return None
+        if self._owns_delegate:
+            await self._delegate.start()
 
     async def stop(self) -> None:
-        # The template registry entry owns transport shutdown.
-        return None
+        if self._owns_delegate:
+            await self._delegate.stop()
 
     async def run(self, task: AgentTask, emit: Any) -> Any:
         return await self._delegate.run(task, emit)
@@ -70,7 +99,7 @@ class _NamedAgentRuntime:
         return bool(await self._delegate.interrupt(task_id))
 
     def __getattr__(self, name: str) -> Any:
-        # Preserve optional CodexRuntime helpers such as ``list_skills`` and
+        # Preserve optional runtime helpers such as ``list_skills`` and
         # ``reset_session`` for command/runtime compatibility.
         return getattr(self._delegate, name)
 
@@ -260,6 +289,7 @@ class TaskManager:
         trusted_default_execute: bool = False,
         allow_dynamic_agents: bool = False,
         dynamic_agent_template_id: str | None = None,
+        require_process_isolation: bool = False,
         reconcile_interval: float | None = 15.0,
     ) -> None:
         if worker_count < 0:
@@ -346,6 +376,10 @@ class TaskManager:
         # durable WeChat startup enables it; generic embedders remain
         # fail-closed unless they opt in.
         self.allow_dynamic_agents = bool(allow_dynamic_agents)
+        # Generic embedders may still use in-memory runtimes.  The production
+        # launcher opts into this fail-closed topology gate so it can never
+        # silently fall back to shared/coroutine Agent execution.
+        self.require_process_isolation = bool(require_process_isolation)
         self.dynamic_agent_template_id = str(
             dynamic_agent_template_id or self.default_agent_id
         ).strip() or self.default_agent_id
@@ -360,6 +394,117 @@ class TaskManager:
     @property
     def workers(self) -> tuple[TaskWorker, ...]:
         return tuple(self._workers)
+
+    def _validate_process_isolation(
+        self,
+        *,
+        require_live: bool,
+        selected_agent_id: str | None = None,
+    ) -> None:
+        """Prove process topology globally or liveness for one selected Agent.
+
+        Startup passes no selection and therefore requires every enabled Agent
+        to be ready.  Dynamic routing passes the selected ID: unrelated lost
+        peers are ignored, while the selected process still has to be ready
+        and its PID must differ from every other currently live Agent proxy.
+        """
+
+        if not self.require_process_isolation:
+            return
+        template = self.registry.registration(self.dynamic_agent_template_id)
+        if self.allow_dynamic_agents and (
+            template is None
+            or not callable(getattr(template.runtime, "for_agent", None))
+        ):
+            raise RuntimeError(
+                "production dynamic Agent template lacks for_agent() isolation"
+            )
+
+        selected = (
+            str(selected_agent_id or "").strip()
+            if selected_agent_id is not None
+            else None
+        )
+        selected_seen = False
+        selected_pid: int | None = None
+        live_pids: dict[int, str] = {}
+        for descriptor in self.registry.list():
+            agent_id = str(_get(descriptor, "agent_id", "") or "").strip()
+            registration = self.registry.registration(agent_id)
+            runtime = registration.runtime if registration is not None else None
+            process_isolated = bool(
+                runtime is not None
+                and getattr(runtime, "process_isolated", False)
+            )
+            validates_this_agent = selected is None or agent_id == selected
+            if not process_isolated and validates_this_agent:
+                raise RuntimeError(
+                    f"Agent {agent_id or '?'} is not process-isolated"
+                )
+            if runtime is None or not process_isolated:
+                continue
+            pid = getattr(runtime, "pid", None)
+            generation = getattr(runtime, "generation", None)
+            health = getattr(runtime, "health", "unknown")
+            health = str(getattr(health, "value", health) or "").lower()
+            live = not (
+                type(pid) is not int
+                or pid <= 0
+                or pid == os.getpid()
+                or type(generation) is not int
+                or generation <= 0
+                or health not in {"ready", "busy"}
+            )
+            if require_live and validates_this_agent and not live:
+                raise RuntimeError(
+                    f"Agent {agent_id} process did not become ready"
+                )
+            if agent_id == selected:
+                selected_seen = True
+                selected_pid = pid if live else None
+            if not live:
+                continue
+            assert type(pid) is int
+            previous = live_pids.get(pid)
+            # A selected-Agent proof should not couple B to an unrelated
+            # duplicate between A and C. It must still reject B sharing either
+            # PID. Startup (no selection) rejects every duplicate globally.
+            duplicate_in_scope = selected is None or agent_id == selected or (
+                previous == selected
+            )
+            if previous is not None and duplicate_in_scope:
+                raise RuntimeError(
+                    "Agent process identity is shared: "
+                    f"{previous} and {agent_id} use PID {pid}"
+                )
+            live_pids.setdefault(pid, agent_id)
+        if selected is not None and not selected_seen:
+            raise RuntimeError(f"Agent {selected} process is unavailable")
+        if selected_pid is not None:
+            owner = live_pids.get(selected_pid)
+            if owner not in {None, selected}:
+                raise RuntimeError(
+                    "Agent process identity is shared: "
+                    f"{owner} and {selected} use PID {selected_pid}"
+                )
+
+    async def _ensure_selected_process_ready(self, agent_id: str) -> None:
+        """Start/restart and prove only the Agent about to be routed."""
+
+        if not self.require_process_isolation or not self._started:
+            return
+        registration = self.registry.registration(agent_id)
+        if registration is None:
+            raise RuntimeError(f"Agent {agent_id} process is unavailable")
+        runtime = registration.runtime
+        health = getattr(runtime, "health", "unknown")
+        health = str(getattr(health, "value", health) or "").lower()
+        if health not in {"ready", "busy"}:
+            await runtime.start()
+        self._validate_process_isolation(
+            require_live=True,
+            selected_agent_id=agent_id,
+        )
 
     def _assert_loop(self) -> None:
         try:
@@ -476,7 +621,9 @@ class TaskManager:
             value = int(self.profile_version)
         return value
 
-    async def _persist_registry_definitions(self) -> None:
+    async def _persist_registry_definitions(
+        self, *, only_agent_ids: Iterable[str] | None = None
+    ) -> None:
         """Publish registered Profile/Mode snapshots before workers start.
 
         SQLite seeds the built-in Codex definitions, but custom registrations
@@ -485,7 +632,27 @@ class TaskManager:
         persistence hooks, so absence of a hook remains a supported
         compatibility mode; errors from an implemented hook are propagated so
         an immutable-version conflict cannot be hidden by startup.
+
+        Dynamic Agent creation scopes publication to the alias being created.
+        This matters after ``/delagent``: the process-local registry retains
+        immutable historical Profiles, while SQLite deliberately changes
+        their lifecycle-only ``enabled`` bit to false.  Republishing an
+        unrelated retired alias would otherwise turn that expected lifecycle
+        difference into a same-version metadata conflict.  A global startup
+        pass similarly skips tombstoned Profile history that no longer has a
+        runtime registration; an explicitly registered Agent remains subject
+        to the Store's strict conflict validation.
         """
+
+        selected_agent_ids = (
+            None
+            if only_agent_ids is None
+            else frozenset(
+                str(agent_id).strip()
+                for agent_id in only_agent_ids
+                if str(agent_id).strip()
+            )
+        )
 
         profile_writer = getattr(self.store, "put_profile", None) or getattr(
             self.store, "register_profile", None
@@ -508,13 +675,19 @@ class TaskManager:
                 agent_id = _get(profile, "agent_id", None)
                 if agent_id is None:
                     continue
+                agent_id = str(agent_id)
+                if (
+                    selected_agent_ids is not None
+                    and agent_id not in selected_agent_ids
+                ):
+                    continue
                 try:
                     version = int(
                         _get(profile, "profile_version", _get(profile, "version", 1))
                     )
                 except (TypeError, ValueError):
                     version = 1
-                profiles_by_key[(str(agent_id), version)] = profile
+                profiles_by_key[(agent_id, version)] = profile
 
         # Lightweight registry implementations commonly expose descriptors
         # and only a one-version ``profile(id)`` lookup.  Include that current
@@ -536,6 +709,11 @@ class TaskManager:
             if agent_id is None:
                 continue
             agent_id = str(agent_id)
+            if (
+                selected_agent_ids is not None
+                and agent_id not in selected_agent_ids
+            ):
+                continue
             agent_ids.add(agent_id)
             if profile_list is None:
                 profile_getter = getattr(self.registry, "profile", None) or getattr(
@@ -556,6 +734,25 @@ class TaskManager:
                     profile = await profile
                 if profile is not None:
                     profiles_by_key[(agent_id, version)] = profile
+
+        if selected_agent_ids is None and profiles_by_key:
+            deleted_reader = getattr(self.store, "list_deleted_agents", None)
+            if deleted_reader is not None:
+                deleted_values = await _call_compatible(deleted_reader)
+                deleted_agent_ids = {
+                    str(agent_id).strip()
+                    for agent_id in deleted_values or ()
+                    if str(agent_id).strip()
+                }
+                registered_agent_ids = set(agent_ids)
+                profiles_by_key = {
+                    key: profile
+                    for key, profile in profiles_by_key.items()
+                    if not (
+                        key[0] in deleted_agent_ids
+                        and key[0] not in registered_agent_ids
+                    )
+                }
 
         # Profiles may be registered before a runtime/descriptor is attached;
         # include those Agent IDs when assigning mode snapshots below.
@@ -650,6 +847,7 @@ class TaskManager:
             # workers so queued tasks can resolve their original owner after
             # a restart.
             await self._restore_dynamic_agents()
+            self._validate_process_isolation(require_live=False)
             await self._persist_registry_definitions()
             await self._upgrade_collaboration_mode_preferences()
             # ``AgentRegistry.start`` rolls back runtimes it started itself,
@@ -658,6 +856,7 @@ class TaskManager:
             # every boundary consistently.
             registry_start_attempted = True
             await self.registry.start()
+            self._validate_process_isolation(require_live=True)
             for worker in self._workers:
                 # Record the attempt before awaiting: a worker can allocate a
                 # dispatcher task and then raise, so it still needs rollback.
@@ -826,13 +1025,30 @@ class TaskManager:
     async def stop(self) -> None:
         self._assert_loop()
         if not self._started:
-            await self._stop_reconcile_loop()
+            errors: list[BaseException] = []
+            try:
+                await self._stop_reconcile_loop()
+            except BaseException as exc:
+                errors.append(exc)
+            # Startup rollback can leave an uncertain process registration
+            # deliberately marked started.  Retry that cleanup even though
+            # the manager never reached its ordinary started state.
+            if self.registry.started:
+                try:
+                    await self.registry.stop()
+                except BaseException as exc:
+                    errors.append(exc)
             # Closing an explicitly opened store is still useful in tests.
             close = getattr(self.store, "close", None)
             if close is not None:
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                except BaseException as exc:
+                    errors.append(exc)
+            if errors:
+                raise errors[0]
             return
         errors: list[BaseException] = []
         try:
@@ -883,6 +1099,7 @@ class TaskManager:
         skill_snapshot: Mapping[str, Any] | None = None,
         actor: str = "",
         explicit: bool = False,
+        _synthetic_command_name: str | None = None,
     ) -> Any:
         """Persist an inbound envelope and optionally enqueue one task.
 
@@ -981,6 +1198,10 @@ class TaskManager:
                 )
             ),
         )
+        session_role = await self._session_role_for_target(
+            target_for_route, resolved_agent
+        )
+        metadata = {**metadata, "session_role": session_role}
         if agent_id is None:
             # This inbound was routed through the user's front Agent rather
             # than an explicit task-level override. Persist that fact for a
@@ -1076,6 +1297,7 @@ class TaskManager:
                 inbound_message_id=_get(persisted, "message_id", _get(inbound, "message_id")),
                 dedupe_key=dedupe_key,
                 metadata=metadata,
+                _role_snapshot_override=session_role,
                 skill_snapshot=skill_snapshot,
                 actor=actor,
                 explicit=explicit,
@@ -1094,6 +1316,11 @@ class TaskManager:
                     "policy_version": resolved_policy_version,
                     "model": resolved_model,
                     "reasoning_effort": resolved_reasoning_effort,
+                    **(
+                        {"synthetic_command_name": _synthetic_command_name}
+                        if _synthetic_command_name
+                        else {}
+                    ),
                 }
                 if not create_task
                 else None
@@ -1129,6 +1356,7 @@ class TaskManager:
         skill_snapshot: Mapping[str, Any] | None = None,
         actor: str = "",
         explicit: bool = False,
+        _synthetic_command_name: str | None = None,
     ) -> Any:
         """Serialize ingress against route/mode mutations for one session."""
         self._assert_loop()
@@ -1146,6 +1374,8 @@ class TaskManager:
             raise PermissionError(
                 "inbound mode and policy are manager-controlled"
             )
+        if _synthetic_command_name not in {None, "__queue_full__"}:
+            raise PermissionError("unsupported synthetic command marker")
         target = self._reply_target(inbound)
         key = (
             target.channel,
@@ -1155,26 +1385,46 @@ class TaskManager:
         )
         lock = self._control_locks.setdefault(key, asyncio.Lock())
         async with lock:
-            return await self._accept_inbound_impl(
-                inbound,
-                create_task=create_task,
-                agent_id=agent_id,
-                mode_id=mode_id,
-                profile_version=profile_version,
-                policy_version=policy_version,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                dedupe_key=dedupe_key,
-                transcription_candidates=transcription_candidates,
-                audio_candidates=audio_candidates,
-                cursor=cursor,
-                channel_cursor=channel_cursor,
-                _trusted_media_wire_fingerprints=_trusted_media_wire_fingerprints,
-                inputs=inputs,
-                skill_snapshot=skill_snapshot,
-                actor=actor,
-                explicit=explicit,
-            )
+            kwargs = {
+                "agent_id": agent_id,
+                "mode_id": mode_id,
+                "profile_version": profile_version,
+                "policy_version": policy_version,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "dedupe_key": dedupe_key,
+                "transcription_candidates": transcription_candidates,
+                "audio_candidates": audio_candidates,
+                "cursor": cursor,
+                "channel_cursor": channel_cursor,
+                "_trusted_media_wire_fingerprints": (
+                    _trusted_media_wire_fingerprints
+                ),
+                "inputs": inputs,
+                "skill_snapshot": skill_snapshot,
+                "actor": actor,
+                "explicit": explicit,
+            }
+            try:
+                return await self._accept_inbound_impl(
+                    inbound,
+                    create_task=create_task,
+                    _synthetic_command_name=_synthetic_command_name,
+                    **kwargs,
+                )
+            except QueueFullError:
+                if not create_task:
+                    raise
+                # Preserve the exact route/mode acceptance order while
+                # converting capacity exhaustion into a durable control-plane
+                # receipt.  The failed task transaction consumed no task,
+                # admission debit, or ready sequence.
+                return await self._accept_inbound_impl(
+                    inbound,
+                    create_task=False,
+                    _synthetic_command_name="__queue_full__",
+                    **kwargs,
+                )
 
     ingest_inbound = accept_inbound
     accept_message = accept_inbound
@@ -1201,6 +1451,7 @@ class TaskManager:
         actor: str = "",
         explicit: bool = False,
         _policy_snapshot_override: Mapping[str, Any] | None = None,
+        _role_snapshot_override: Mapping[str, Any] | None = None,
         skill_snapshot: Mapping[str, Any] | None = None,
         initial_reply: Any = None,
         delivery_reply_scope_id: str | None = None,
@@ -1279,6 +1530,15 @@ class TaskManager:
             # when the mode/profile registry has since advanced or the front
             # Agent has switched.  Do not resolve the current policy here.
             policy_metadata = dict(_policy_snapshot_override)
+        if _role_snapshot_override is None:
+            session_role = await self._session_role_for_target(
+                target, resolved_agent
+            )
+        else:
+            try:
+                session_role = validate_role_snapshot(_role_snapshot_override)
+            except RoleValidationError as exc:
+                raise RuntimeError("trusted session role snapshot is invalid") from exc
         merged_metadata = dict(policy_metadata)
         if metadata:
             # Caller-supplied task metadata cannot replace the authoritative
@@ -1295,9 +1555,11 @@ class TaskManager:
                         "mode",
                         "agent_mode",
                         "mode_authorization",
+                        "session_role",
                     }
                 }
             )
+        merged_metadata["session_role"] = session_role
         if skill_snapshot is not None:
             skill = await self._resolve_trusted_skill_snapshot(
                 skill_snapshot,
@@ -1925,6 +2187,7 @@ class TaskManager:
             raise KeyError(f"Agent was deleted: {selected}")
         if registration is not None and not (was_deleted and allow_deleted):
             self.registry.require(selected)
+            await self._ensure_selected_process_ready(selected)
             return False
         if registration is None:
             try:
@@ -1968,7 +2231,10 @@ class TaskManager:
                                 f"Agent recreation lacks a Profile: {selected}"
                             )
                         await _call_compatible(reactivator, profile)
-                        await self._persist_registry_definitions()
+                        await self._persist_registry_definitions(
+                            only_agent_ids=(selected,)
+                        )
+                await self._ensure_selected_process_ready(selected)
                 return False
             runtime, template = self._dynamic_template()
             profile = self._named_profile(selected, template)
@@ -1989,17 +2255,34 @@ class TaskManager:
                 # ``ensure_agent`` before ``TaskManager.start``.  SQLite's
                 # store lazily initializes, and startup repeats this operation
                 # idempotently for compatibility stores.
-                await self._persist_registry_definitions()
+                await self._persist_registry_definitions(
+                    only_agent_ids=(selected,)
+                )
                 if self._started:
-                    # ``registry.start`` then marks the no-op alias started.
+                    # Process-backed aliases start a distinct child here;
+                    # production then proves its PID is live and unique before
+                    # the Agent becomes usable for routing.
                     await self.registry.start()
-            except BaseException:
-                # The alias has no lifecycle resources of its own, so it is
-                # safe to remove on a failed dynamic registration.  Any
-                # durable profile row is immutable and can be reused by a
-                # later retry with the same generated snapshot.
+                    await self._ensure_selected_process_ready(selected)
+            except BaseException as startup_error:
+                # Registry startup performs its own rollback, but an
+                # interrupted/failed process cleanup must never be followed by
+                # unregistering the only proxy that can retry reaping that
+                # child.  Make one explicit idempotent stop attempt here and
+                # preserve the registration whenever shutdown remains
+                # uncertain.  Immutable durable profile rows can be reused by
+                # a later retry after cleanup is proven.
+                current = self.registry.registration(selected)
+                if current is not None:
+                    try:
+                        await current.runtime.stop()
+                    except BaseException as cleanup_error:
+                        raise cleanup_error from startup_error
                 try:
-                    self.registry.unregister(selected)
+                    # The explicit successful stop above is the proof needed
+                    # to clear a conservative `_started` marker retained by
+                    # AgentRegistry after an earlier failed cleanup attempt.
+                    self.registry.unregister(selected, allow_started=True)
                 except Exception:
                     logger.debug("could not roll back named Agent registration", exc_info=True)
                 raise
@@ -2046,6 +2329,11 @@ class TaskManager:
                 raise AttributeError(
                     "store does not support durable Agent deletion"
                 )
+            # A process-backed named Agent owns its child lifecycle.  Stop it
+            # while the registration is still reachable so a failed shutdown
+            # cannot silently discard the only handle capable of reaping the
+            # process.  Shared compatibility aliases have a no-op ``stop``.
+            await current.runtime.stop()
             self.registry.unregister(selected, allow_started=True)
             self._active_agent = {key: value for key, value in self._active_agent.items() if value != selected}
             if channel or bot_id or external_user_id:
@@ -2305,6 +2593,242 @@ class TaskManager:
             await self.ensure_agent(resolved)
         return resolved
 
+    async def _session_role_for_target(
+        self, target: ReplyTarget, agent_id: str
+    ) -> dict[str, Any]:
+        """Resolve one canonical future-task role without materializing it."""
+
+        target = self._coerce_target(target)
+        getter = getattr(self.store, "get_session_role", None) or getattr(
+            self.store, "get_role", None
+        )
+        if getter is None or not target.external_user_id:
+            return implicit_default_role()
+        value = await _call_compatible(
+            getter,
+            channel=target.channel,
+            bot_id=target.bot_id,
+            external_user_id=target.external_user_id,
+            session_id=target.session_id or "default",
+            agent_id=agent_id,
+        )
+        try:
+            return validate_role_snapshot(value)
+        except RoleValidationError as exc:
+            raise RuntimeError("stored session role is invalid") from exc
+
+    async def _get_system_role_unlocked(
+        self,
+        *,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        session_id: str = "default",
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        target = ReplyTarget(
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+            session_id=session_id or "default",
+        )
+        active = agent_id or await self.get_active_agent(
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+            session_id=session_id or "default",
+        )
+        if self.allow_dynamic_agents:
+            active = self._canonical_route_agent(active)
+            await self.ensure_agent(active)
+        active = str(active or "").strip()
+        self.registry.require(active)
+        return await self._session_role_for_target(target, active)
+
+    async def get_system_role(
+        self,
+        *,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        user_id: str = "",
+        session_id: str = "default",
+        agent_id: str | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        """Return the front Agent's role ordered with control mutations."""
+
+        self._assert_loop()
+        external_user_id = external_user_id or user_id
+        session_id = session_id or "default"
+        async with self._scope_lock(
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+            session_id=session_id,
+        ):
+            return await self._get_system_role_unlocked(
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_id,
+                agent_id=agent_id,
+            )
+
+    async def set_system_role(
+        self,
+        role_text: Any,
+        *,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        user_id: str = "",
+        session_id: str = "default",
+        agent_id: str | None = None,
+        kind: str | None = None,
+        actor: str = "",
+        command_id: str | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        """Persist a role selection without invoking or waiting for an Agent.
+
+        A command-owned mutation asks the SQLite boundary to finalize the
+        durable ``/system`` receipt in the same transaction.  Direct callers
+        that omit ``command_id`` retain the compatibility return shape.
+        """
+
+        self._assert_loop()
+        external_user_id = external_user_id or user_id
+        session_id = session_id or "default"
+        receipt_id = str(command_id or "").strip()
+        canonical_content = normalize_role_text(role_text)
+        requested_kind = str(kind or "").strip().lower()
+        if not requested_kind:
+            if is_default_role_token(canonical_content):
+                requested_kind = "default"
+                canonical_content = ""
+            else:
+                requested_kind = "custom" if canonical_content else "default"
+        elif requested_kind == "default" and is_default_role_token(
+            canonical_content
+        ):
+            canonical_content = ""
+        # Reuse the snapshot validator for empty/custom/reserved constraints.
+        # The store assigns the durable positive version.
+        build_role_snapshot(
+            role_version=0,
+            kind=requested_kind,
+            normalized_content=canonical_content,
+        )
+        async with self._scope_lock(
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+            session_id=session_id,
+        ):
+            active = agent_id or await self.get_active_agent(
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_id,
+            )
+            if self.allow_dynamic_agents:
+                active = self._canonical_route_agent(active)
+                await self.ensure_agent(active)
+            active = str(active or "").strip()
+            self.registry.require(active)
+            setter = getattr(self.store, "set_session_role", None) or getattr(
+                self.store, "set_role", None
+            )
+            if setter is None:
+                raise AttributeError("store does not support session roles")
+            if receipt_id:
+                try:
+                    setter_parameters = inspect.signature(setter).parameters
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "store atomic system-role support cannot be verified"
+                    ) from exc
+                if "command_id" not in setter_parameters and not any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in setter_parameters.values()
+                ):
+                    # `_call_compatible` intentionally drops unsupported
+                    # keywords for direct legacy calls.  Doing that here could
+                    # commit a role without its receipt, so reject before the
+                    # legacy setter has any opportunity to mutate state.
+                    raise RuntimeError(
+                        "store does not support atomic system-role receipts"
+                    )
+            value = await _call_compatible(
+                setter,
+                canonical_content,
+                kind=requested_kind,
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_id,
+                agent_id=active,
+                actor=actor or external_user_id,
+                created_by=actor or external_user_id,
+                command_id=receipt_id or None,
+            )
+            if not isinstance(value, Mapping):
+                raise RuntimeError("store returned an invalid session role")
+            try:
+                snapshot = validate_role_snapshot(value)
+            except RoleValidationError as exc:
+                raise RuntimeError("store returned an invalid session role") from exc
+            changed = bool(value.get("changed", True))
+            result = {**snapshot, "changed": changed}
+            if not receipt_id:
+                return result
+
+            command_response = str(value.get("command_response", "") or "")
+            command_receipt = value.get("command_receipt")
+            expected_response = (
+                "system role: unchanged"
+                if not changed
+                else "system role: default"
+                if snapshot["kind"] == "default"
+                else "system role: updated"
+            )
+            if (
+                command_response != expected_response
+                or not isinstance(command_receipt, Mapping)
+                or str(command_receipt.get("command_id", "") or "")
+                != receipt_id
+                or str(command_receipt.get("state", "") or "")
+                != "completed"
+                or str(command_receipt.get("response_text", "") or "")
+                != command_response
+                or str(command_receipt.get("response_agent_id", "") or "")
+                != active
+                or tuple(command_receipt.get("presentation_ids", ()) or ())
+                or tuple(command_receipt.get("response_fragments", ()) or ())
+                or str(command_receipt.get("channel", "") or "") != channel
+                or str(command_receipt.get("bot_id", "") or "") != bot_id
+                or str(command_receipt.get("external_user_id", "") or "")
+                != external_user_id
+                or str(command_receipt.get("session_id", "") or "")
+                != session_id
+                or str(command_receipt.get("command_name", "") or "")
+                .strip()
+                .lower()
+                != "system"
+            ):
+                raise RuntimeError(
+                    "store returned an invalid atomic system-role receipt"
+                )
+            return {
+                **result,
+                "command_response": command_response,
+                "command_receipt": dict(command_receipt),
+            }
+
+    get_role = get_system_role
+    set_role = set_system_role
+
     async def list_agents(self, *, include_disabled: bool = False, **_: Any) -> list[Any]:
         self._assert_loop()
         values = list(self.registry.list(include_disabled=include_disabled))
@@ -2312,22 +2836,77 @@ class TaskManager:
         # registration behind when publication or route commit fails.  The
         # durable tombstone remains authoritative, so do not expose that
         # staged alias through `/agents` while it is unusable for task ingress.
-        if not self.allow_dynamic_agents:
-            return values
-        deleted_reader = getattr(self.store, "list_deleted_agents", None)
-        if deleted_reader is None:
-            return values
-        deleted = {
-            str(value).strip().lower()
-            for value in await _call_compatible(deleted_reader)
-            if str(value).strip()
-        }
-        return [
-            value
-            for value in values
-            if str(_get(value, "agent_id", "") or "").strip().lower()
-            not in deleted
-        ]
+        if self.allow_dynamic_agents:
+            deleted_reader = getattr(self.store, "list_deleted_agents", None)
+            if deleted_reader is not None:
+                deleted = {
+                    str(value).strip().lower()
+                    for value in await _call_compatible(deleted_reader)
+                    if str(value).strip()
+                }
+                values = [
+                    value
+                    for value in values
+                    if str(_get(value, "agent_id", "") or "").strip().lower()
+                    not in deleted
+                ]
+
+        # Process status is intentionally attached only to process-backed
+        # runtimes.  Ordinary descriptors retain their historical return type
+        # and shape, which keeps lightweight embedders and command tests
+        # compatible while making the production isolation boundary visible.
+        enriched: list[Any] = []
+        for descriptor in values:
+            agent_id = str(_get(descriptor, "agent_id", "") or "").strip()
+            registration = self.registry.registration(agent_id)
+            runtime = registration.runtime if registration is not None else None
+            is_process_runtime = bool(
+                runtime is not None
+                and (
+                    getattr(runtime, "process_isolated", False)
+                    or runtime.__class__.__name__ == "ProcessAgentRuntime"
+                    or (
+                        isinstance(runtime, _NamedAgentRuntime)
+                        and runtime.owns_delegate
+                    )
+                )
+            )
+            if not is_process_runtime:
+                enriched.append(descriptor)
+                continue
+            serializer = getattr(descriptor, "as_dict", None)
+            if serializer is not None:
+                public = dict(serializer())
+            elif isinstance(descriptor, Mapping):
+                public = dict(descriptor)
+            else:
+                public = {
+                    name: getattr(descriptor, name)
+                    for name in (
+                        "agent_id",
+                        "display_name",
+                        "summary",
+                        "enabled",
+                        "default_mode_id",
+                        "profile_version",
+                    )
+                    if hasattr(descriptor, name)
+                }
+            health = getattr(runtime, "health", "unknown")
+            if callable(health):
+                health = health()
+            if inspect.isawaitable(health):
+                health = await health
+            public.update(
+                {
+                    "pid": getattr(runtime, "pid", None),
+                    "generation": getattr(runtime, "generation", None),
+                    "health": getattr(health, "value", health),
+                    "process_isolated": True,
+                }
+            )
+            enriched.append(public)
+        return enriched
 
     agents = list_agents
 
@@ -3252,6 +3831,7 @@ class TaskManager:
         agent_id: str | None = None,
         limit: int = 100,
         present: bool = True,
+        switch_only: bool = False,
         **_: Any,
     ) -> list[Any]:
         self._assert_loop()
@@ -3261,31 +3841,90 @@ class TaskManager:
             external_user_id=external_user_id,
             session_id=session_id,
         )
-        if present:
-            method = getattr(self.store, "present_unseen", None)
-            if method is not None:
-                return list(await _call_compatible(
-                    method,
+        # Item candidates, rather than transport outboxes, own replies that
+        # were retained because their Agent was in the background.  A
+        # switch-back reads only that class; generic `/inbox` additionally
+        # retains the legacy/outbox presentation surface below.
+        candidate_method = getattr(
+            self.store, "present_inbox_candidates", None
+        )
+        candidates: list[Any] = []
+        if candidate_method is not None:
+            candidates = list(
+                await _call_compatible(
+                    candidate_method,
                     channel=channel,
                     bot_id=bot_id,
                     external_user_id=external_user_id,
                     session_id=session_id,
                     agent_id=active,
                     limit=limit,
-                ))
+                    present=present,
+                    switch_only=switch_only,
+                )
+                or ()
+            )
+        if switch_only:
+            return candidates
+        remaining = max(0, int(limit) - len(candidates))
+        if remaining <= 0:
+            return candidates
+        if present:
+            method = getattr(self.store, "present_unseen", None)
+            if method is not None:
+                return candidates + list(
+                    await _call_compatible(
+                        method,
+                        channel=channel,
+                        bot_id=bot_id,
+                        external_user_id=external_user_id,
+                        session_id=session_id,
+                        agent_id=active,
+                        limit=remaining,
+                    )
+                    or ()
+                )
         method = getattr(self.store, "list_outbox", None)
         if method is None:
-            return []
-        return list(await _call_compatible(
-            method,
+            return candidates
+        return candidates + list(
+            await _call_compatible(
+                method,
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_id,
+                agent_id=active,
+                unseen=True,
+                limit=remaining,
+            )
+            or ()
+        )
+
+    async def switch_back_inbox(
+        self,
+        *,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        session_id: str = "default",
+        agent_id: str,
+        limit: int = 100,
+        present: bool = False,
+        **_: Any,
+    ) -> list[Any]:
+        """Return only unread items completed while ``agent_id`` was away."""
+
+        return await self.inbox(
             channel=channel,
             bot_id=bot_id,
             external_user_id=external_user_id,
             session_id=session_id,
-            agent_id=active,
-            unseen=True,
+            agent_id=agent_id,
             limit=limit,
-        ))
+            present=present,
+            switch_only=True,
+        )
 
     # ------------------------------------------------------------------ Agent collaboration
     async def _collaboration_policy(
@@ -3582,7 +4221,9 @@ class TaskManager:
         """Freeze the destination Agent task context before mailbox enqueue.
 
         A mailbox request is executed outside the source task worker, so it
-        cannot inherit the source task's mode or thread implicitly. Resolve
+        cannot inherit the source task's user conversation or thread.  Every
+        direction in one request chain receives a deterministic mailbox-only
+        conversation keyed by its destination and logical request ID. Resolve
         the destination's own route/mode/profile and persist the resulting
         policy metadata with the mailbox projection.
         """
@@ -3590,6 +4231,10 @@ class TaskManager:
         destination = str(destination_agent_id or "").strip()
         if not destination:
             raise ValueError("destination Agent is required")
+        logical_request_id = str(request_id or "").strip()
+        if not logical_request_id:
+            raise ValueError("mailbox request ID is required")
+        conversation = mailbox_conversation_id(destination, logical_request_id)
         source_task = await self.get_task(str(task_id)) if task_id else None
         if source_task is not None:
             target = self._coerce_target(_get(source_task, "reply_target", None))
@@ -3602,12 +4247,11 @@ class TaskManager:
             # than resolving the Agent's now-current session mode.
             if str(_get(source_task, "agent_id", "") or "") == destination:
                 metadata = _get(source_task, "metadata", {}) or {}
+                metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+                metadata.pop("session_role", None)
                 return {
                     "agent_id": destination,
-                    "conversation_id": str(
-                        _get(source_task, "conversation_id", "")
-                        or self._conversation_id(target, destination)
-                    ),
+                    "conversation_id": conversation,
                     "reply_target": target.to_dict(),
                     "mode_id": str(_get(source_task, "mode_id", "chat") or "chat"),
                     "profile_version": int(
@@ -3618,7 +4262,7 @@ class TaskManager:
                     ),
                     "model": model,
                     "reasoning_effort": reasoning_effort,
-                    "metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
+                    "metadata": metadata,
                 }
         else:
             target = ReplyTarget(
@@ -3654,16 +4298,10 @@ class TaskManager:
                 or self._execute_authorized(target, destination, policy_version)
             ),
         )
-        conversation_id = (
-            self._conversation_id(target, destination)
-            if has_route
-            else mailbox_conversation_id(
-                destination, task_id or request_id or uuid.uuid4().hex
-            )
-        )
+        metadata.pop("session_role", None)
         return {
             "agent_id": destination,
-            "conversation_id": conversation_id,
+            "conversation_id": conversation,
             "reply_target": target.to_dict(),
             "mode_id": mode_id,
             "profile_version": int(profile_version),
@@ -3720,6 +4358,11 @@ class TaskManager:
             )
         source = str(source).strip()
         request_kind = str(request_type or "ask").strip()
+        # Allocate the logical request identity once, before deriving the
+        # mailbox-only conversation or asking the store to persist the row.
+        # A store-generated fallback would make the runtime snapshot and the
+        # durable correlation use different request IDs.
+        request_id = str(request_id or "").strip() or uuid.uuid4().hex
         envelope_payload = dict(payload or {})
         reason = ""
         try:
@@ -4179,11 +4822,26 @@ class TaskManager:
         def field(name: str, default: Any = "") -> Any:
             return candidate.get(name, default) if isinstance(candidate, Mapping) else getattr(candidate, name, default)
         agent = str(field("agent_id", self.default_agent_id) or self.default_agent_id)
+        candidate_inbound_id = field("inbound_message_id", None)
+        original_inbound = None
+        inbound_getter = (
+            getattr(self.store, "get_inbound", None)
+            or getattr(self.store, "get_inbound_message", None)
+        )
+        if candidate_inbound_id and inbound_getter is not None:
+            original_inbound = await _call_compatible(
+                inbound_getter, str(candidate_inbound_id)
+            )
         target = ReplyTarget(
             channel=str(field("channel", channel)),
             bot_id=str(field("bot_id", bot_id)),
             external_user_id=str(field("external_user_id", external_user_id)),
             session_id=str(field("session_id", session_id) or "default"),
+            source_message_id=str(
+                _get(original_inbound, "external_message_id", "") or ""
+            ),
+            source_sequence=_get(original_inbound, "source_sequence", None),
+            context_token=_get(original_inbound, "context_token", None),
         )
         default_mode, default_version = self._default_mode_selection(agent)
         mode_id = str(field("mode_id", default_mode) or default_mode)
@@ -4261,19 +4919,16 @@ class TaskManager:
             "attachment_id": field("attachment_id", None),
             "source": field("source", ""),
         }
-        inbound_id = field("inbound_message_id", None)
-        inbound_getter = (
-            getattr(self.store, "get_inbound", None)
-            or getattr(self.store, "get_inbound_message", None)
-        )
+        inbound_id = candidate_inbound_id
         if inbound_id:
             if inbound_getter is None:
                 raise AttributeError(
                     "store cannot restore confirmed transcription input"
                 )
-            original_inbound = await _call_compatible(
-                inbound_getter, str(inbound_id)
-            )
+            if original_inbound is None:
+                original_inbound = await _call_compatible(
+                    inbound_getter, str(inbound_id)
+                )
             if original_inbound is None:
                 raise ValueError(
                     "confirmed transcription inbound message is unavailable"
@@ -4292,7 +4947,15 @@ class TaskManager:
         # the persisted continuation snapshot only through the private submit
         # path while holding the same scope lock as ordinary task creation.
         # The public ``submit()`` API must never accept a caller-provided policy
-        # snapshot because that would bypass execute-mode authorization.
+        # snapshot because that would bypass execute-mode authorization.  A
+        # legacy candidate with no role field predates session roles and is
+        # therefore pinned to the canonical implicit default; absence here
+        # must not mean "resolve the user's current role".
+        continuation_role = (
+            metadata["session_role"]
+            if isinstance(metadata, Mapping) and "session_role" in metadata
+            else implicit_default_role()
+        )
         async with self._scope_lock(
             channel=target.channel,
             bot_id=target.bot_id,
@@ -4310,6 +4973,7 @@ class TaskManager:
                 _policy_snapshot_override=(
                     metadata if isinstance(metadata, Mapping) else None
                 ),
+                _role_snapshot_override=continuation_role,
                 inbound_message_id=(str(inbound_id) if inbound_id else None),
                 dedupe_key=f"confirmation:{confirmation_id}",
             )

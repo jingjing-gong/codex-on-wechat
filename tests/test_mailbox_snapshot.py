@@ -10,7 +10,7 @@ import pytest
 
 from src.agents.base import AgentResult
 from src.runtime.models import ReplyTarget
-from src.runtime.identity import conversation_id
+from src.runtime.identity import mailbox_conversation_id
 from src.runtime.modes import AgentMode
 from src.runtime.policy import AgentProfile
 from src.runtime.registry import AgentRegistry
@@ -70,7 +70,7 @@ async def _store(path) -> SQLiteStore:
     return store
 
 
-def test_mailbox_fallback_is_per_user_and_uses_destination_snapshot(tmp_path):
+def test_mailbox_fallback_is_per_request_and_uses_destination_snapshot(tmp_path):
     async def scenario() -> None:
         store = await _store(tmp_path / "runtime.sqlite")
         runtime = _Runtime()
@@ -96,18 +96,23 @@ def test_mailbox_fallback_is_per_user_and_uses_destination_snapshot(tmp_path):
             assert await worker.run_once() == 1
             assert await worker.run_once() == 1
             assert [task.conversation_id for task in runtime.tasks] == [
-                "wechat:bot:user-a:default:planner",
-                "wechat:bot:user-b:default:planner",
+                mailbox_conversation_id("planner", "request-a"),
+                mailbox_conversation_id("planner", "request-b"),
             ]
             assert [(task.mode_id, task.profile_version, task.policy_version) for task in runtime.tasks] == [
                 ("review", 3, 7),
                 ("review", 3, 7),
             ]
-            for mailbox_id in (first_message.mailbox_id, second_message.mailbox_id):
+            for mailbox_id, request_id in (
+                (first_message.mailbox_id, "request-a"),
+                (second_message.mailbox_id, "request-b"),
+            ):
                 item = await store.get_mailbox_item(mailbox_id)
                 assert item is not None
                 assert item.execution_snapshot["agent_id"] == "planner"
-                assert item.execution_snapshot["conversation_id"].endswith(":planner")
+                assert item.execution_snapshot["conversation_id"] == (
+                    mailbox_conversation_id("planner", request_id)
+                )
         finally:
             await store.close()
 
@@ -246,7 +251,7 @@ def test_event_projected_mailbox_gets_destination_route_snapshot(tmp_path):
             rows = await store.list_mailbox("planner")
             assert len(rows) == 1
             assert rows[0].execution_snapshot["conversation_id"] == (
-                "wechat:bot:user-a:default:planner"
+                mailbox_conversation_id("planner", "event-request")
             )
             assert rows[0].execution_snapshot["mode_id"] == "review"
             assert rows[0].execution_snapshot["profile_version"] == 3
@@ -257,7 +262,7 @@ def test_event_projected_mailbox_gets_destination_route_snapshot(tmp_path):
     asyncio.run(scenario())
 
 
-def test_mailbox_legacy_conversation_requires_matching_persisted_scope(tmp_path):
+def test_mailbox_snapshot_rejects_even_owned_foreground_conversation(tmp_path):
     async def scenario() -> None:
         store = await _store(tmp_path / "runtime.sqlite")
         legacy_id = "wechat:bot:a:user:default:planner"
@@ -267,15 +272,9 @@ def test_mailbox_legacy_conversation_requires_matching_persisted_scope(tmp_path)
             "external_user_id": "user",
             "session_id": "default",
         }
-        second_target = {
-            "channel": "wechat",
-            "bot_id": "bot",
-            "external_user_id": "a:user",
-            "session_id": "default",
-        }
         try:
-            # Establish exact durable ownership of the legacy ID for only the
-            # first of two scopes whose old delimiter-joined IDs collide.
+            # Durable ownership makes this a valid foreground conversation,
+            # but it must still never become an internal mailbox thread.
             await store.create_task(
                 {
                     "task_id": "legacy-owner",
@@ -288,51 +287,66 @@ def test_mailbox_legacy_conversation_requires_matching_persisted_scope(tmp_path)
                     "inputs": {"text": "owner"},
                 }
             )
-            first = await store.create_agent_message(
-                source_agent_id="codex",
-                destination_agent_id="planner",
-                content="first",
-                request_id="legacy-request-a",
-                reply_target=first_target,
-                execution_snapshot={
-                    "agent_id": "planner",
-                    "conversation_id": legacy_id,
-                    "reply_target": first_target,
-                    "mode_id": "review",
-                    "profile_version": 3,
-                    "policy_version": 7,
-                },
-            )
-            second = await store.create_agent_message(
-                source_agent_id="codex",
-                destination_agent_id="planner",
-                content="second",
-                request_id="legacy-request-b",
-                reply_target=second_target,
-                execution_snapshot={
-                    "agent_id": "planner",
-                    "conversation_id": legacy_id,
-                    "reply_target": second_target,
-                    "mode_id": "review",
-                    "profile_version": 3,
-                    "policy_version": 7,
-                },
-            )
-
-            assert first.execution_snapshot["conversation_id"] == legacy_id
-            assert second.execution_snapshot["conversation_id"] == conversation_id(
-                "wechat", "bot", "a:user", "default", "planner"
-            )
-            assert first.execution_snapshot["conversation_id"] != second.execution_snapshot[
-                "conversation_id"
-            ]
+            with pytest.raises(StoreError, match="mailbox conversation identity"):
+                await store.create_agent_message(
+                    source_agent_id="codex",
+                    destination_agent_id="planner",
+                    content="foreground identity",
+                    request_id="legacy-request-a",
+                    reply_target=first_target,
+                    execution_snapshot={
+                        "agent_id": "planner",
+                        "conversation_id": legacy_id,
+                        "reply_target": first_target,
+                        "mode_id": "review",
+                        "profile_version": 3,
+                        "policy_version": 7,
+                    },
+                )
         finally:
             await store.close()
 
     asyncio.run(scenario())
 
 
-def test_worker_canonicalizes_unproven_legacy_mailbox_snapshots(tmp_path):
+def test_low_level_correlated_response_without_snapshot_is_request_scoped(tmp_path):
+    async def scenario() -> None:
+        store = await _store(tmp_path / "runtime.sqlite")
+        try:
+            source = await store.create_task(_task("source", "user"))
+            request = await store.create_agent_message(
+                source_agent_id="codex",
+                destination_agent_id="planner",
+                content="request",
+                request_id="round-trip",
+                task_id=source.task_id,
+            )
+            response = await store.create_agent_message(
+                source_agent_id="planner",
+                destination_agent_id="codex",
+                content="response",
+                request_id="round-trip",
+                reply_to_id=request.message_id,
+                causation_id=request.message_id,
+                task_id=source.task_id,
+            )
+
+            assert request.execution_snapshot["conversation_id"] == (
+                mailbox_conversation_id("planner", "round-trip")
+            )
+            assert response.execution_snapshot["conversation_id"] == (
+                mailbox_conversation_id("codex", "round-trip")
+            )
+            assert response.execution_snapshot["conversation_id"] != (
+                source.conversation_id
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_worker_rejects_unproven_legacy_mailbox_snapshots(tmp_path):
     async def scenario() -> None:
         path = tmp_path / "runtime.sqlite"
         store = await _store(path)
@@ -389,13 +403,16 @@ def test_worker_canonicalizes_unproven_legacy_mailbox_snapshots(tmp_path):
             store = SQLiteStore(path)
             await store.initialize()
             worker = AgentMailboxWorker(store, {"planner": runtime}, "planner")
-            assert await worker.run_once() == 1
-            assert await worker.run_once() == 1
-            assert [task.conversation_id for task in runtime.tasks] == [
-                conversation_id("wechat", "bot:a", "user", "default", "planner"),
-                conversation_id("wechat", "bot", "a:user", "default", "planner"),
-            ]
-            assert runtime.tasks[0].conversation_id != runtime.tasks[1].conversation_id
+            assert await worker.run_once() == 0
+            assert await worker.run_once() == 0
+            assert runtime.tasks == []
+            rejected = await store.list_mailbox("planner")
+            assert len(rejected) == 2
+            assert {item.state.value for item in rejected} == {"rejected"}
+            assert all(
+                "mailbox conversation identity conflicts" in item.last_error
+                for item in rejected
+            )
         finally:
             await store.close()
 

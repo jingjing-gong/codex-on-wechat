@@ -17,6 +17,7 @@ from src.channels.models import DeliveryReceipt, ReplyTarget, UserDelivery
 from src.channels.wechat import (
     COMMAND_INTERRUPTED_RESPONSE,
     CommandResponse,
+    MVPCommandRouter,
     WeChatDeliveryWorker,
     WeChatGateway,
     command_client_id,
@@ -25,6 +26,7 @@ from src.channels.wechat import (
     stable_contextless_client_id,
 )
 from src.runtime.models import InboundMessage
+from src.runtime.roles import build_role_snapshot
 from src.runtime.sqlite_store import SQLiteStore, StoreError
 from wechat_ilink.types import (
     ITEM_TYPE_TEXT,
@@ -1143,6 +1145,104 @@ def test_duplicate_long_command_reuses_fragments_and_full_receipt(
             assert [item.outbox_id for item in after] == [
                 item.outbox_id for item in before
             ]
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_system_role_uses_complete_fence_safe_fragments_and_replays(
+    tmp_path, monkeypatch
+):
+    role_text = "`" * 4_000
+
+    class Manager:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        async def get_active_agent(self, **_kwargs: Any) -> str:
+            return "codex"
+
+        async def get_system_role(self, **_kwargs: Any) -> dict[str, Any]:
+            self.reads += 1
+            return build_role_snapshot(
+                role_version=1,
+                kind="custom",
+                normalized_content=role_text,
+            )
+
+    sent: list[UserDelivery] = []
+
+    async def fake_send(
+        _client: Any, delivery: UserDelivery
+    ) -> DeliveryReceipt:
+        sent.append(delivery)
+        return DeliveryReceipt(
+            delivery_id=delivery.delivery_id,
+            client_id=delivery.client_id,
+            sent=True,
+        )
+
+    monkeypatch.setattr("src.channels.wechat.send_user_delivery_async", fake_send)
+
+    def unwrap_fragment(content: str, *, first: bool) -> str:
+        if first:
+            assert content.startswith("system role:\n")
+            content = content[len("system role:\n") :]
+        opening, separator, remainder = content.partition("\n")
+        assert separator
+        assert opening.endswith("text")
+        fence = opening[: -len("text")]
+        assert len(fence) >= 3 and set(fence) == {"`"}
+        assert remainder.endswith("\n" + fence)
+        return remainder[: -len("\n" + fence)]
+
+    async def scenario() -> None:
+        path = tmp_path / "system-role-fragments.sqlite"
+        store = SQLiteStore(path)
+        manager = Manager()
+        gateway = WeChatGateway(
+            store,
+            bot_id="bot",
+            command_router=MVPCommandRouter(manager),
+        )
+        message = _command_message(text="/system", message_id=411)
+        try:
+            first = await gateway.handle_message(
+                SimpleNamespace(bot_id="bot"), message
+            )
+            assert first is not None
+            assert "... (content truncated)" not in first.command_response
+            assert manager.reads == 1
+            assert len(sent) == 1
+
+            with sqlite3.connect(path) as connection:
+                fragments = connection.execute(
+                    "SELECT fragment_ordinal, content FROM reply_fragments "
+                    "ORDER BY fragment_ordinal"
+                ).fetchall()
+            assert 1 < len(fragments) <= 10
+            assert all(len(content) <= 3_000 for _ordinal, content in fragments)
+            reconstructed = "".join(
+                unwrap_fragment(content, first=ordinal == 1)
+                for ordinal, content in fragments
+            )
+            assert reconstructed == role_text
+            assert sent[0].content == fragments[0][1]
+
+            before_ids = [
+                item.outbox_id for item in await store.list_outbox(limit=100)
+            ]
+            replay = await gateway.handle_message(
+                SimpleNamespace(bot_id="bot"), message
+            )
+            assert replay is not None and replay.duplicate
+            assert replay.command_response == first.command_response
+            assert manager.reads == 1
+            assert len(sent) == 1
+            assert [
+                item.outbox_id for item in await store.list_outbox(limit=100)
+            ] == before_ids
         finally:
             await store.close()
 

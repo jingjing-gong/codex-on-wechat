@@ -19,13 +19,74 @@ from __future__ import annotations
 from typing import Any, Protocol, runtime_checkable
 
 
+class StoreError(RuntimeError):
+    """Base exception exposed by every durable-store backend."""
+
+
+class NotFoundError(StoreError):
+    """A required durable object does not exist."""
+
+
+class InvalidTransition(StoreError):
+    """A requested durable state transition is not currently valid."""
+
+
+class QueueFullError(StoreError):
+    """The durable Agent invocation admission limit was reached."""
+
+    def __init__(self, scope: str, limit: int) -> None:
+        normalized = str(scope or "global").strip().lower()
+        if normalized not in {"agent", "global"}:
+            normalized = "global"
+        self.scope = normalized
+        self.limit = int(limit)
+        super().__init__(f"queue_full: {normalized} limit {self.limit}")
+
+
 @runtime_checkable
 class DurableStore(Protocol):
     """Asynchronous persistence boundary used by the task manager/worker."""
 
-    async def initialize(self) -> None: ...
+    async def initialize(
+        self, *, recover_startup_state: bool | None = None
+    ) -> None: ...
 
     async def close(self) -> None: ...
+
+    async def activate_supervisor_epoch(self, **kwargs: Any) -> Any: ...
+
+    async def finish_supervisor_epoch(
+        self, epoch: int, **kwargs: Any
+    ) -> bool: ...
+
+    async def get_agent_lifecycle(
+        self, agent_id: str, agent_incarnation: int | None = None
+    ) -> Any | None: ...
+
+    async def list_agent_lifecycles(self, **kwargs: Any) -> list[Any]: ...
+
+    async def get_agent_lifecycle_event(
+        self, lifecycle_event_id: str
+    ) -> Any | None: ...
+
+    async def list_agent_lifecycle_events(self, **kwargs: Any) -> list[Any]: ...
+
+    async def get_agent_process(
+        self,
+        agent_id: str,
+        agent_incarnation: int,
+        worker_generation: int | None = None,
+    ) -> Any | None: ...
+
+    async def list_agent_processes(self, **kwargs: Any) -> list[Any]: ...
+
+    async def begin_agent_process_generation(self, **kwargs: Any) -> Any: ...
+
+    async def commit_agent_process_handshake(self, **kwargs: Any) -> Any: ...
+
+    async def commit_agent_process_ready(self, **kwargs: Any) -> Any: ...
+
+    async def fence_agent_process_stopped(self, **kwargs: Any) -> Any: ...
 
     async def accept_inbound(
         self, inbound: Any, *, task: Any | None = None, create_task: bool = True, **kwargs: Any
@@ -36,6 +97,40 @@ class DurableStore(Protocol):
     async def get_task(self, task_id: str) -> Any | None: ...
 
     async def get_execution(self, execution_id: str) -> Any | None: ...
+
+    async def get_agent_invocation(self, invocation_id: str) -> Any | None: ...
+
+    async def list_agent_invocations(self, **kwargs: Any) -> list[Any]: ...
+
+    async def get_agent_admission_counter(
+        self, agent_id: str, agent_incarnation: int
+    ) -> Any | None: ...
+
+    async def list_agent_admission_counters(self, **kwargs: Any) -> list[Any]: ...
+
+    async def get_global_agent_admission_counter(self) -> Any | None: ...
+
+    async def get_agent_execution_slot(self, slot_id: str) -> Any | None: ...
+
+    async def get_active_agent_execution_slot(
+        self, agent_id: str, agent_incarnation: int
+    ) -> Any | None: ...
+
+    async def list_agent_execution_slots(self, **kwargs: Any) -> list[Any]: ...
+
+    async def get_agent_dispatch_attempt(
+        self, dispatch_attempt_id: str
+    ) -> Any | None: ...
+
+    async def list_agent_dispatch_attempts(self, **kwargs: Any) -> list[Any]: ...
+
+    async def reserve_next_agent_invocation(self, **kwargs: Any) -> Any | None: ...
+
+    async def commit_agent_dispatch_abort(self, **kwargs: Any) -> Any: ...
+
+    async def commit_agent_dispatch_rejection(self, **kwargs: Any) -> Any: ...
+
+    async def record_agent_dispatch_cleanup(self, **kwargs: Any) -> Any: ...
 
     async def list_task_executions(
         self, task_id: str, *, limit: int = 100, newest_first: bool = False
@@ -113,6 +208,8 @@ class DurableStore(Protocol):
 
     async def present_unseen(self, **kwargs: Any) -> list[Any]: ...
 
+    async def present_inbox_candidates(self, **kwargs: Any) -> list[Any]: ...
+
     async def claim_mailbox(self, destination_agent_id: str, worker_id: str, **kwargs: Any) -> list[Any]: ...
 
     async def renew_mailbox_lease(
@@ -121,9 +218,32 @@ class DurableStore(Protocol):
 
     async def create_agent_message(self, **kwargs: Any) -> Any: ...
 
+    async def review_mailbox_orphan(
+        self,
+        mailbox_message_id: str,
+        expected_current_invocation_id: str,
+        mailbox_maintenance_id: str,
+        action: Any,
+        **kwargs: Any,
+    ) -> Any: ...
+
+    async def get_mailbox_orphan_review(
+        self, mailbox_maintenance_id: str
+    ) -> Any | None: ...
+
+    async def list_mailbox_orphan_reviews(self, **kwargs: Any) -> list[Any]: ...
+
+    async def list_agent_invocation_events(
+        self, invocation_id: str, **kwargs: Any
+    ) -> list[Any]: ...
+
     async def get_route(self, **kwargs: Any) -> str: ...
 
     async def set_route(self, **kwargs: Any) -> bool: ...
+
+    async def get_session_role(self, **kwargs: Any) -> Any: ...
+
+    async def set_session_role(self, role_text: str, **kwargs: Any) -> Any: ...
 
     async def mark_agent_deleted(self, agent_id: str, **kwargs: Any) -> bool: ...
 
@@ -169,4 +289,13 @@ StoreProtocol = DurableStore
 RuntimeStore = DurableStore
 
 
-__all__ = ["DurableStore", "RuntimeStore", "Store", "StoreProtocol"]
+__all__ = [
+    "DurableStore",
+    "InvalidTransition",
+    "NotFoundError",
+    "QueueFullError",
+    "RuntimeStore",
+    "Store",
+    "StoreError",
+    "StoreProtocol",
+]

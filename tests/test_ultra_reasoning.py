@@ -139,7 +139,7 @@ def test_help_keeps_effort_choices_model_scoped() -> None:
             rendered = await _route(MVPCommandRouter(manager), "/help")
             assert (
                 rendered.count(
-                    "`/model [<model_id> <effort|default>|effort <effort|default>]`"
+                    "`/model [<model-id> <effort|default>|effort <effort|default>]`"
                 )
                 == 1
             )

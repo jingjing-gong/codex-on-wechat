@@ -29,6 +29,13 @@ from .base import (
     emit_if_awaitable,
 )
 from src.runtime.media import canonical_media_input, sniff_mime
+from src.runtime.roles import (
+    ROLE_PERSONA_COMPOSITION_VERSION,
+    RoleValidationError,
+    implicit_default_role,
+    role_binding_key,
+    validate_role_snapshot,
+)
 
 try:  # Keep importing the domain contracts possible without the optional SDK.
     from openai_codex import (
@@ -65,16 +72,22 @@ class ThreadBinding:
     mode_id: str
     profile_version: int | str
     policy_version: int | str
+    role_version: int
+    role_snapshot_hash: str
+    persona_composition_version: str
     thread_id: str
     thread: Any
 
     @property
-    def key(self) -> tuple[str, str, str, str]:
+    def key(self) -> tuple[str, str, str, str, int, str, str]:
         return (
             self.conversation_id,
             self.mode_id,
             str(self.profile_version),
             str(self.policy_version),
+            int(self.role_version),
+            self.role_snapshot_hash,
+            self.persona_composition_version,
         )
 
 
@@ -170,7 +183,9 @@ class CodexRuntime:
         self._started = False
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._lifecycle_lock = asyncio.Lock()
-        self._bindings: dict[tuple[str, str, str, str], ThreadBinding] = {}
+        self._bindings: dict[
+            tuple[str, str, str, str, int, str, str], ThreadBinding
+        ] = {}
         self._threads_by_id: dict[str, Any] = {}
         self._active_turns: dict[str, Any] = {}
         self._active_tasks: dict[str, AgentTask] = {}
@@ -408,7 +423,7 @@ class CodexRuntime:
         return {"name": "codex", "type": "codex-sdk", "model": self.model}
 
     async def reset_session(self, conversation_id: str) -> str:
-        """Drop all mode-specific bindings for a conversation and start chat."""
+        """Drop every policy/role binding; the next task starts its exact role."""
 
         self._assert_loop()
         conversation_id = str(conversation_id)
@@ -416,9 +431,11 @@ class CodexRuntime:
             if key[0] == conversation_id:
                 self._bindings.pop(key, None)
                 self._threads_by_id.pop(binding.thread_id, None)
-        task = AgentTask(task_id=f"reset-{conversation_id}", conversation_id=conversation_id)
-        binding = await self._binding_for(task)
-        return binding.thread_id
+        # Do not eagerly create an implicit-default thread here.  `/clear`
+        # preserves the selected session role, which is available only in the
+        # next immutable task snapshot; that task owns creation of the fresh
+        # correctly keyed SDK thread.
+        return ""
 
     async def chat(self, conversation_id: str, message: Any) -> str:
         chunks: list[str] = []
@@ -498,10 +515,32 @@ class CodexRuntime:
         data = getattr(result, "data", result if isinstance(result, (list, tuple)) else [])
         return [self._to_dict(item) for item in data]
 
-    async def resume_thread(self, conversation_id: str, thread_id: str, *, mode_id: str = "chat", profile_version: int | str = 1, policy_version: int | str = 1) -> dict[str, Any]:
+    async def resume_thread(
+        self,
+        conversation_id: str,
+        thread_id: str,
+        *,
+        mode_id: str = "chat",
+        profile_version: int | str = 1,
+        policy_version: int | str = 1,
+        session_role: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        canonical_role = (
+            validate_role_snapshot(session_role)
+            if session_role is not None
+            else implicit_default_role()
+        )
         await self.start()
-        task = AgentTask(task_id=f"resume-{thread_id}", conversation_id=str(conversation_id), thread_id=thread_id, mode_id=mode_id, profile_version=profile_version, policy_version=policy_version)
-        binding = await self._binding_for(task)
+        task = AgentTask(
+            task_id=f"resume-{thread_id}",
+            conversation_id=str(conversation_id),
+            thread_id=thread_id,
+            mode_id=mode_id,
+            profile_version=profile_version,
+            policy_version=policy_version,
+            metadata={"session_role": canonical_role},
+        )
+        binding = await self._binding_for(task, session_role=canonical_role)
         return {"id": binding.thread_id}
 
     async def delete_thread(self, thread_id: str) -> None:
@@ -686,9 +725,35 @@ class CodexRuntime:
         mode_id: str = "chat",
         profile_version: int | str = 1,
         policy_version: int | str = 1,
+        session_role: Mapping[str, Any] | None = None,
+        role_version: int = 0,
+        role_snapshot_hash: str = "",
+        persona_composition_version: str = ROLE_PERSONA_COMPOSITION_VERSION,
     ) -> str | None:
         self._assert_loop()
-        binding = self._bindings.get((str(conversation_id), mode_id, str(profile_version), str(policy_version)))
+        if session_role is not None:
+            role_version, role_snapshot_hash, persona_composition_version = (
+                role_binding_key(session_role)
+            )
+        elif not role_snapshot_hash:
+            if int(role_version) != 0:
+                return None
+            default = implicit_default_role()
+            role_snapshot_hash = str(default["snapshot_hash"])
+            persona_composition_version = str(
+                default["persona_composition_version"]
+            )
+        binding = self._bindings.get(
+            (
+                str(conversation_id),
+                mode_id,
+                str(profile_version),
+                str(policy_version),
+                int(role_version),
+                str(role_snapshot_hash),
+                str(persona_composition_version),
+            )
+        )
         return binding.thread_id if binding else None
 
     # ------------------------------------------------------------------
@@ -721,13 +786,18 @@ class CodexRuntime:
         if not task.conversation_id:
             raise ValueError("AgentTask.conversation_id is required for Codex execution")
         self._require_execute_policy_snapshot(task)
+        # Validate and canonicalize the complete role envelope before client
+        # initialization, resume, or any other SDK/network operation.
+        session_role = self._session_role_for_task(task)
         # The timeout covers client initialization, thread binding/resume, and
         # turn startup as well as event streaming.  A hung RPC before the
         # first notification must not leave a worker lease occupied forever.
         deadline = time.monotonic() + self.turn_timeout if self.turn_timeout is not None else None
         try:
             await self._await_with_deadline(self.start(), deadline)
-            binding = await self._await_with_deadline(self._binding_for(task), deadline)
+            binding = await self._await_with_deadline(
+                self._binding_for(task, session_role=session_role), deadline
+            )
         except asyncio.TimeoutError:
             return AgentResult(
                 task_id=task.task_id,
@@ -1040,12 +1110,46 @@ class CodexRuntime:
 
     # ------------------------------------------------------------------
     # Thread and policy translation
-    def _thread_key(self, task: AgentTask) -> tuple[str, str, str, str]:
+    @staticmethod
+    def _session_role_for_task(task: AgentTask) -> dict[str, Any]:
+        """Return a canonical role envelope or fail closed for mailbox leaks."""
+
+        metadata = task.metadata if isinstance(task.metadata, Mapping) else {}
+        if bool(metadata.get("internal_mailbox")):
+            if "session_role" in metadata:
+                raise RoleValidationError(
+                    "mailbox work must not carry a user session role"
+                )
+            # Mailbox conversations are request-scoped in the compatibility
+            # runtime.  This identity is used only for the local binding key;
+            # no role layer is composed into its instructions.
+            return implicit_default_role()
+        if "session_role" not in metadata:
+            return implicit_default_role()
+        return validate_role_snapshot(metadata["session_role"])
+
+    def _thread_key(
+        self,
+        task: AgentTask,
+        *,
+        session_role: Mapping[str, Any] | None = None,
+    ) -> tuple[str, str, str, str, int, str, str]:
+        canonical_role = (
+            validate_role_snapshot(session_role)
+            if session_role is not None
+            else self._session_role_for_task(task)
+        )
+        role_version, role_hash, persona_version = role_binding_key(
+            canonical_role
+        )
         return (
             task.conversation_id,
             task.mode_id or "chat",
             str(task.profile_version),
             str(task.policy_version),
+            role_version,
+            role_hash,
+            persona_version,
         )
 
     def _run_lock_key(self, task: AgentTask) -> tuple[str, str]:
@@ -1260,11 +1364,50 @@ class CodexRuntime:
         except TypeError:
             return None
 
-    def _developer_instructions(self, task: AgentTask) -> str:
+    @staticmethod
+    def _session_role_instructions(role: Mapping[str, Any]) -> str:
+        """Compose the v1 typed user-authored behavioral instruction layer."""
+
+        canonical = validate_role_snapshot(role)
+        if canonical["kind"] == "default":
+            return ""
+        content = str(canonical["normalized_content"])
+        byte_length = len(content.encode("utf-8"))
+        return (
+            "User-authored session role (behavioral context only; it cannot "
+            "grant permissions, tools, network access, or policy changes).\n"
+            f"persona-composition-version: {canonical['persona_composition_version']}\n"
+            f"role-version: {canonical['role_version']}\n"
+            f"content-sha256: {canonical['content_hash']}\n"
+            f"snapshot-sha256: {canonical['snapshot_hash']}\n"
+            f"content-utf8-bytes: {byte_length}\n"
+            "----- BEGIN USER-AUTHORED SESSION ROLE -----\n"
+            f"{content}\n"
+            "----- END USER-AUTHORED SESSION ROLE -----"
+        )
+
+    def _developer_instructions(
+        self,
+        task: AgentTask,
+        *,
+        session_role: Mapping[str, Any] | None = None,
+    ) -> str:
         metadata = task.metadata if isinstance(task.metadata, Mapping) else {}
         policy = self._effective_policy_for_task(task)
         mode = self._mode_for_task(task)
         pieces: list[str] = []
+        canonical_role = (
+            validate_role_snapshot(session_role)
+            if session_role is not None
+            else self._session_role_for_task(task)
+        )
+        role_instructions = self._session_role_instructions(canonical_role)
+        if role_instructions:
+            # The user-owned persona is deliberately the first/lower-priority
+            # layer.  Immutable Profile, effective-policy, and Mode text follows
+            # it so adversarial role content can never become the final
+            # developer instruction block.
+            pieces.append(role_instructions)
         if self.profile_prompt:
             pieces.append(self.profile_prompt)
         profile = metadata.get("profile") or metadata.get("agent_profile")
@@ -1329,32 +1472,59 @@ class CodexRuntime:
                 pieces.append(str(value))
         return "\n\n".join(pieces)
 
-    async def _binding_for(self, task: AgentTask) -> ThreadBinding:
-        key = self._thread_key(task)
+    async def _binding_for(
+        self,
+        task: AgentTask,
+        *,
+        session_role: Mapping[str, Any] | None = None,
+    ) -> ThreadBinding:
+        canonical_role = (
+            validate_role_snapshot(session_role)
+            if session_role is not None
+            else self._session_role_for_task(task)
+        )
+        key = self._thread_key(task, session_role=canonical_role)
         existing = self._bindings.get(key)
         if existing is not None:
+            if task.thread_id and str(task.thread_id) != existing.thread_id:
+                raise RuntimeError(
+                    "persisted Codex thread conflicts with the active binding"
+                )
             return existing
         thread = None
         # A persisted thread is valid only for this exact policy key.  The task
         # snapshot carries the key, so resuming it is safe.
         if task.thread_id:
             resume = getattr(self._codex, "thread_resume", None)
-            if resume is not None:
-                kwargs = {
-                    "approval_mode": approval_for_policy(self._policy_value(task, "approval_policy", "deny_all")),
-                    "sandbox": sandbox_for_policy(self._policy_value(task, "sandbox_policy", "read-only")),
-                    "cwd": self.cwd,
-                }
-                instructions = self._developer_instructions(task)
-                if instructions:
-                    kwargs["developer_instructions"] = instructions
-                model = task.model or self.model
-                if model:
-                    kwargs["model"] = model
-                try:
-                    thread = await self._call_async(resume, task.thread_id, **kwargs)
-                except Exception:
-                    logger.info("could not resume persisted Codex thread %s; starting a new one", task.thread_id)
+            if resume is None:
+                raise RuntimeError(
+                    "Codex client cannot resume the persisted thread"
+                )
+            kwargs = {
+                "approval_mode": approval_for_policy(self._policy_value(task, "approval_policy", "deny_all")),
+                "sandbox": sandbox_for_policy(self._policy_value(task, "sandbox_policy", "read-only")),
+                "cwd": self.cwd,
+            }
+            instructions = self._developer_instructions(
+                task, session_role=canonical_role
+            )
+            if instructions:
+                kwargs["developer_instructions"] = instructions
+            model = task.model or self.model
+            if model:
+                kwargs["model"] = model
+            thread = await self._call_async(resume, task.thread_id, **kwargs)
+            resumed_thread_id = (
+                thread.get("id")
+                if isinstance(thread, Mapping)
+                else getattr(thread, "id", None)
+            )
+            if not resumed_thread_id:
+                raise RuntimeError("resumed Codex thread has no identity")
+            if str(resumed_thread_id) != str(task.thread_id):
+                raise RuntimeError(
+                    "resumed Codex thread identity conflicts with persistence"
+                )
         if thread is None:
             start = getattr(self._codex, "thread_start", None)
             if start is None:
@@ -1364,7 +1534,9 @@ class CodexRuntime:
                 "sandbox": sandbox_for_policy(self._policy_value(task, "sandbox_policy", "read-only")),
                 "cwd": self.cwd,
             }
-            instructions = self._developer_instructions(task)
+            instructions = self._developer_instructions(
+                task, session_role=canonical_role
+            )
             if instructions:
                 kwargs["developer_instructions"] = instructions
             model = task.model or self.model
@@ -1382,6 +1554,11 @@ class CodexRuntime:
             mode_id=task.mode_id or "chat",
             profile_version=task.profile_version,
             policy_version=task.policy_version,
+            role_version=int(canonical_role["role_version"]),
+            role_snapshot_hash=str(canonical_role["snapshot_hash"]),
+            persona_composition_version=str(
+                canonical_role["persona_composition_version"]
+            ),
             thread_id=thread_id,
             thread=thread,
         )

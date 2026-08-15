@@ -94,7 +94,7 @@ def test_v19_reply_scope_is_created_replayed_and_backfilled(tmp_path):
         with sqlite3.connect(path) as connection:
             assert connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone() == (19,)
+            ).fetchone() == (32,)
             # Model interruption after the v19 DDL landed but before its
             # scope backfill and migration marker committed.  Initialization
             # must be idempotent and recreate the missing legacy scope.
@@ -102,7 +102,7 @@ def test_v19_reply_scope_is_created_replayed_and_backfilled(tmp_path):
                 "DELETE FROM reply_scopes WHERE inbound_message_id=?",
                 (accepted.inbound.message_id,),
             )
-            connection.execute("DELETE FROM schema_migrations WHERE version=19")
+            connection.execute("DELETE FROM schema_migrations WHERE version>=19")
             connection.commit()
 
         recovered = SQLiteStore(path)

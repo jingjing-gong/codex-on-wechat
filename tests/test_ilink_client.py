@@ -462,7 +462,7 @@ def test_client_rejects_nonpositive_timeout():
 
 @pytest.mark.parametrize(
     ("entrypoint", "runner_name"),
-    [("_legacy_main", "_run_legacy"), ("_durable_main", "_run_durable")],
+    [("_legacy_main", "_run_legacy")],
 )
 @pytest.mark.parametrize("runner_fails", [False, True])
 def test_bot_runner_closes_client_after_runtime_shutdown(
@@ -496,7 +496,7 @@ def test_bot_runner_closes_client_after_runtime_shutdown(
     assert events == ["runner", "close"]
 
 
-@pytest.mark.parametrize("entrypoint", ["_legacy_main", "_durable_main"])
+@pytest.mark.parametrize("entrypoint", ["_legacy_main"])
 def test_login_only_closes_authenticated_client(monkeypatch, entrypoint):
     from src import codex_wechat_bot as bot
 
@@ -513,6 +513,232 @@ def test_login_only_closes_authenticated_client(monkeypatch, entrypoint):
     getattr(bot, entrypoint)()
 
     assert closed == 1
+
+
+@pytest.mark.parametrize("runner_fails", [False, True])
+def test_durable_main_locks_credentials_and_identity_before_client(
+    monkeypatch, tmp_path, runner_fails
+):
+    from src import codex_wechat_bot as bot
+
+    events: list[str] = []
+    state = {"credentials": False, "supervisor": False}
+    credentials = SimpleNamespace(
+        ilink_bot_id="bot",
+        ilink_user_id="user",
+    )
+
+    class CredentialOwnership:
+        def __init__(self, root):
+            assert root == tmp_path / "accounts"
+
+        def __enter__(self):
+            state["credentials"] = True
+            events.append("credentials-acquired")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("credentials-released")
+            state["credentials"] = False
+
+    class Ownership:
+        def __init__(self, database, *, channel, bot_id):
+            assert database == (tmp_path / "runtime.sqlite").resolve()
+            assert channel == "wechat"
+            assert bot_id == "bot"
+            self.channel = channel
+            self.bot_id = bot_id
+            self.owner_instance_id = "owner"
+            self.held = False
+
+        def acquire(self):
+            assert state["credentials"]
+            self.held = True
+            state["supervisor"] = True
+            events.append("supervisor-acquired")
+            return self
+
+        def close(self):
+            if self.held:
+                events.append("supervisor-released")
+            self.held = False
+            state["supervisor"] = False
+
+        def __enter__(self):
+            assert self.held
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    class FakeClient:
+        def __init__(self, supplied):
+            assert supplied is credentials
+            assert state == {"credentials": False, "supervisor": True}
+            self.bot_id = "bot"
+            events.append("client-constructed")
+
+        def close(self):
+            assert state["supervisor"]
+            events.append("client-closed")
+
+    def resolve_credentials():
+        assert state["credentials"]
+        events.append("credentials-loaded")
+        return credentials, False
+
+    def run_owned(_client, *, database, ownership):
+        assert database == (tmp_path / "runtime.sqlite").resolve()
+        assert ownership.held
+        events.append("runtime")
+        if runner_fails:
+            raise RuntimeError("startup failed")
+
+    monkeypatch.setattr(bot.sys, "argv", ["bot"])
+    monkeypatch.setenv("CODEX_WECHAT_DB", str(tmp_path / "runtime.sqlite"))
+    monkeypatch.setattr(bot, "accounts_dir", lambda: tmp_path / "accounts")
+    monkeypatch.setattr(bot, "CredentialMutationOwnership", CredentialOwnership)
+    monkeypatch.setattr(bot, "SupervisorOwnership", Ownership)
+    monkeypatch.setattr(bot, "_load_or_authenticate_credentials", resolve_credentials)
+    monkeypatch.setattr(bot, "Client", FakeClient)
+    monkeypatch.setattr(bot, "_run_owned_durable", run_owned)
+    monkeypatch.setattr(
+        bot,
+        "login",
+        lambda: (_ for _ in ()).throw(AssertionError("legacy login was used")),
+    )
+
+    if runner_fails:
+        with pytest.raises(RuntimeError, match="startup failed"):
+            bot._durable_main()
+    else:
+        bot._durable_main()
+
+    assert events == [
+        "credentials-acquired",
+        "credentials-loaded",
+        "supervisor-acquired",
+        "credentials-released",
+        "client-constructed",
+        "runtime",
+        "client-closed",
+        "supervisor-released",
+    ]
+
+
+def test_login_publishes_new_credentials_only_under_account_lock(monkeypatch, tmp_path):
+    from src import codex_wechat_bot as bot
+
+    events: list[str] = []
+    state = {"credentials": False, "account": False}
+    credentials = SimpleNamespace(ilink_bot_id="bot")
+
+    class CredentialOwnership:
+        def __init__(self, _root):
+            pass
+
+        def __enter__(self):
+            state["credentials"] = True
+            events.append("credentials-acquired")
+
+        def __exit__(self, *_args):
+            state["credentials"] = False
+            events.append("credentials-released")
+
+    class AccountOwnership:
+        def __init__(self, *, channel, bot_id):
+            assert state["credentials"]
+            assert (channel, bot_id) == ("wechat", "bot")
+
+        def __enter__(self):
+            state["account"] = True
+            events.append("account-acquired")
+
+        def __exit__(self, *_args):
+            state["account"] = False
+            events.append("account-released")
+
+    def save(supplied):
+        assert supplied is credentials
+        assert state == {"credentials": True, "account": True}
+        events.append("saved")
+
+    monkeypatch.setattr(bot, "accounts_dir", lambda: tmp_path / "accounts")
+    monkeypatch.setattr(bot, "CredentialMutationOwnership", CredentialOwnership)
+    monkeypatch.setattr(bot, "ChannelAccountOwnership", AccountOwnership)
+    monkeypatch.setattr(
+        bot, "_load_or_authenticate_credentials", lambda: (credentials, True)
+    )
+    monkeypatch.setattr(bot, "save_credentials", save)
+
+    bot._login_with_ownership()
+    assert events == [
+        "credentials-acquired",
+        "account-acquired",
+        "saved",
+        "account-released",
+        "credentials-released",
+    ]
+
+
+def test_logout_locks_all_accounts_in_deterministic_order(monkeypatch, tmp_path):
+    from src import codex_wechat_bot as bot
+
+    events: list[str] = []
+    held: set[str] = set()
+
+    class CredentialOwnership:
+        def __init__(self, _root):
+            pass
+
+        def __enter__(self):
+            events.append("credentials-acquired")
+
+        def __exit__(self, *_args):
+            events.append("credentials-released")
+
+    class AccountOwnership:
+        def __init__(self, *, channel, bot_id):
+            assert channel == "wechat"
+            self.bot_id = bot_id
+
+        def acquire(self):
+            held.add(self.bot_id)
+            events.append(f"acquire:{self.bot_id}")
+
+        def close(self):
+            events.append(f"release:{self.bot_id}")
+            held.remove(self.bot_id)
+
+    def delete():
+        assert held == {"a", "b"}
+        events.append("delete")
+        return 2
+
+    monkeypatch.setattr(bot, "accounts_dir", lambda: tmp_path / "accounts")
+    monkeypatch.setattr(bot, "CredentialMutationOwnership", CredentialOwnership)
+    monkeypatch.setattr(bot, "ChannelAccountOwnership", AccountOwnership)
+    monkeypatch.setattr(
+        bot,
+        "load_all_credentials",
+        lambda: [
+            SimpleNamespace(ilink_bot_id="b"),
+            SimpleNamespace(ilink_bot_id="a"),
+            SimpleNamespace(ilink_bot_id="b"),
+        ],
+    )
+    monkeypatch.setattr(bot, "delete_all_credentials", delete)
+
+    bot._logout_with_ownership()
+    assert events == [
+        "credentials-acquired",
+        "acquire:a",
+        "acquire:b",
+        "delete",
+        "release:b",
+        "release:a",
+        "credentials-released",
+    ]
 
 
 def test_legacy_flag_is_a_durable_runtime_alias(monkeypatch):

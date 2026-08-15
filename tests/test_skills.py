@@ -90,6 +90,10 @@ def test_skill_parser_requires_a_leading_name_and_description():
     assert invocation.name == "Code-Review"
     assert invocation.skill_id == "code-review"
     assert invocation.description == "inspect the diff\ncarefully"
+    multiline = parse_skill_invocation("$Code-Review\ninspect the diff")
+    assert multiline is not None
+    assert multiline.name == "Code-Review"
+    assert multiline.description == "inspect the diff"
     assert parse_skill_invocation("ordinary task") is None
 
     for malformed in ("$", "$demo", "$1demo task", "$demo! task", "$demo\t"):
@@ -247,7 +251,7 @@ def test_skill_store_fresh_schema_and_migration(tmp_path):
             columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(skills)")
             }
-        assert version == 19
+        assert version == 32
         assert columns == {
             "agent_id",
             "skill_id",

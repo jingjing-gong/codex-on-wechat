@@ -11,10 +11,13 @@ from openai_codex import CodexRpcError, TransportClosedError
 from pydantic import TypeAdapter
 
 from src.agents.base import AgentResult, AgentTask, ReplyTarget
-from src.channels.models import InboundEnvelope, parse_command
+from src.channels.models import ChannelCommand, InboundEnvelope, parse_command
 from src.channels.wechat import (
     COMMAND_HELP,
+    COMMAND_REGISTRY,
     MVPCommandRouter,
+    MVP_COMMANDS,
+    MVP_COMMAND_NAMES,
     _MAX_COMMAND_MARKDOWN,
     command_delivery_id,
 )
@@ -43,18 +46,118 @@ def _envelope(
 
 def test_help_is_deterministic_markdown_with_one_command_per_line():
     assert COMMAND_HELP.startswith("## Commands\n")
-    assert "### Conversation" in COMMAND_HELP
-    assert "- `/help` -" in COMMAND_HELP
-    assert "- `/clear` -" in COMMAND_HELP
-    assert "- `/sh <command>` -" in COMMAND_HELP
-    assert "- `/mode [chat|plan|review|execute]` -" in COMMAND_HELP
-    assert "\n- `/status` -" in COMMAND_HELP
+    assert [group.title for group in COMMAND_REGISTRY] == [
+        "Conversation",
+        "Tasks",
+        "Agents",
+        "Agent Configuration",
+        "Delivery",
+    ]
+    public_entries = [
+        entry for group in COMMAND_REGISTRY for entry in group.entries
+    ]
+    assert len({entry.syntax for entry in public_entries}) == len(public_entries)
+    for entry in public_entries:
+        assert COMMAND_HELP.count(f"- `{entry.syntax}` - ") == 1
+
+    expected_names = {
+        "agent",
+        "agents",
+        "ask",
+        "cancel",
+        "clear",
+        "delagent",
+        "help",
+        "inbox",
+        "listskill",
+        "listskills",
+        "mode",
+        "model",
+        "models",
+        "modes",
+        "notify",
+        "recv",
+        "reset",
+        "retry",
+        "sh",
+        "skills",
+        "status",
+        "system",
+        "tasks",
+    }
+    assert MVP_COMMANDS == expected_names
+    assert MVP_COMMAND_NAMES == {f"/{name}" for name in expected_names}
+    assert "`/listskill`" not in COMMAND_HELP
+    assert "`/listskills`" not in COMMAND_HELP
+    assert COMMAND_HELP.count("`$<skill> <task description>`") == 1
+    assert "`/model [<model-id> <effort|default>|effort <effort|default>]`" in COMMAND_HELP
+    assert "`/retry <task-id>`" in COMMAND_HELP
+    assert "`/cancel [task-id]`" in COMMAND_HELP
+    assert "`/agent [agent-id]`" in COMMAND_HELP
+    assert "`/delagent <agent-id>`" in COMMAND_HELP
+    assert "`/ask <agent-id> <prompt>`" in COMMAND_HELP
+    assert "`/inbox [agent-id|all]`" in COMMAND_HELP
     assert "`/execute`" not in COMMAND_HELP
     assert "`/interrupt" not in COMMAND_HELP
     assert sum(1 for line in COMMAND_HELP.splitlines() if line.startswith("- `/model ")) == 1
-    assert "`/delagent <agent_id>`" in COMMAND_HELP
     assert "`/recv`" in COMMAND_HELP
     assert not COMMAND_HELP.endswith("\n\n")
+
+
+def test_system_command_rejects_missing_or_mismatched_raw_compatibility_input():
+    class Manager:
+        async def get_active_agent(self, **_kwargs):
+            return "codex"
+
+        async def get_system_role(self, **_kwargs):
+            raise AssertionError("malformed commands must not read role state")
+
+    async def scenario() -> None:
+        router = MVPCommandRouter(Manager())
+        for command in (
+            ChannelCommand(name="system", args=("planner",), raw=""),
+            ChannelCommand(name="system", args=(), raw="/mode"),
+        ):
+            assert await router.handle_command(
+                command, _envelope(command.raw or "/system planner")
+            ) == "invalid system command"
+
+    asyncio.run(scenario())
+
+
+def test_system_command_bounds_and_sanitizes_manager_failures():
+    unsafe_detail = ("private\n`value` " * 100) + "tail"
+
+    class ReadManager:
+        async def get_active_agent(self, **_kwargs):
+            return "codex"
+
+        async def get_system_role(self, **_kwargs):
+            raise RuntimeError(unsafe_detail)
+
+    class SetManager:
+        async def get_active_agent(self, **_kwargs):
+            return "codex"
+
+        async def set_system_role(self, _role_text, **_kwargs):
+            raise RuntimeError(unsafe_detail)
+
+    async def scenario() -> None:
+        read = await MVPCommandRouter(ReadManager()).handle_command(
+            parse_command("/system"), _envelope("/system")
+        )
+        write = await MVPCommandRouter(SetManager()).handle_command(
+            parse_command("/system planner"), _envelope("/system planner")
+        )
+        assert read.startswith("cannot get system role: private 'value'")
+        assert write.startswith("cannot set system role: private 'value'")
+        for response in (read, write):
+            assert "\n" not in response
+            assert "`" not in response
+            assert response.endswith("...")
+            assert len(response) < 550
+
+    asyncio.run(scenario())
 
 
 def test_recv_delegates_one_idempotent_batch_without_extra_acknowledgement():
@@ -123,10 +226,10 @@ def test_delagent_command_validates_arity_and_delegates():
         ) == "Agent deleted: planner"
         assert await router.handle_command(
             parse_command("/delagent"), _envelope("/delagent")
-        ) == "usage: /delagent <agent_id>"
+        ) == "usage: /delagent <agent-id>"
         assert await router.handle_command(
             parse_command("/delagent a b"), _envelope("/delagent a b")
-        ) == "usage: /delagent <agent_id>"
+        ) == "usage: /delagent <agent-id>"
 
     asyncio.run(scenario())
 
@@ -746,18 +849,18 @@ def test_command_arities_are_rejected_before_dispatch():
         "/modes extra": "usage: /modes",
         "/models extra": "usage: /models",
         "/model gpt-deep": (
-            "usage: /model <model-id> <effort|default> | "
-            "/model effort <effort|default>"
+            "usage: /model [<model-id> <effort|default>|effort "
+            "<effort|default>]"
         ),
         "/model gpt-deep high extra": (
-            "usage: /model <model-id> <effort|default> | "
-            "/model effort <effort|default>"
+            "usage: /model [<model-id> <effort|default>|effort "
+            "<effort|default>]"
         ),
         "/model effort": (
-            "usage: /model <model-id> <effort|default> | "
-            "/model effort <effort|default>"
+            "usage: /model [<model-id> <effort|default>|effort "
+            "<effort|default>]"
         ),
-        "/cancel task-1 extra": "usage: /cancel [task_id]",
+        "/cancel task-1 extra": "usage: /cancel [task-id]",
     }
 
     async def scenario() -> None:

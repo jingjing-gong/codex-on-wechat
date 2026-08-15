@@ -26,6 +26,7 @@ import subprocess
 import threading
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass, replace
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from pydantic import ValidationError
@@ -84,6 +85,13 @@ from src.runtime.media import (
 )
 from src.runtime.identity import conversation_id, scoped_id
 from src.runtime.models import USER_REPLY_FORMAT_AGENT_PREFIX_V1
+from src.runtime.store import QueueFullError
+from src.runtime.roles import (
+    RoleValidationError,
+    is_default_role_token,
+    normalize_role_text,
+    validate_role_snapshot,
+)
 from src.runtime.skills import (
     SkillDefinition,
     SkillInvocation,
@@ -100,46 +108,204 @@ logger = logging.getLogger(__name__)
 CHANNEL = "wechat"
 DEFAULT_AGENT_ID = "codex"
 DEFAULT_SESSION_ID = "default"
-MVP_COMMANDS = frozenset({
-    "status", "tasks", "retry", "cancel",
-    "help", "clear", "reset", "sh", "skills", "listskill", "listskills",
-    "agents", "agent", "mode", "modes", "model", "models", "notify", "inbox", "recv",
-    "ask", "delagent",
-})
+
+
+@dataclass(frozen=True, slots=True)
+class CommandRegistryEntry:
+    """One public command row and any help-hidden compatibility aliases."""
+
+    name: str | None
+    syntax: str
+    description: str
+    hidden_aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CommandRegistryGroup:
+    """An ordered help section in the immutable command registry."""
+
+    title: str
+    entries: tuple[CommandRegistryEntry, ...]
+
+
+COMMAND_REGISTRY = (
+    CommandRegistryGroup(
+        "Conversation",
+        (
+            CommandRegistryEntry("help", "/help", "Show this help"),
+            CommandRegistryEntry(
+                "clear",
+                "/clear",
+                "Clear the active conversation and start a fresh thread",
+            ),
+            CommandRegistryEntry("reset", "/reset", "Alias for `/clear`"),
+            CommandRegistryEntry(
+                "sh",
+                "/sh <command>",
+                "Run a bounded shell command in the bot workspace",
+            ),
+            CommandRegistryEntry(
+                "skills",
+                "/skills",
+                "List enabled skills",
+                hidden_aliases=("listskill", "listskills"),
+            ),
+            CommandRegistryEntry(
+                None,
+                "$<skill> <task description>",
+                "Run a task with a selected skill",
+            ),
+        ),
+    ),
+    CommandRegistryGroup(
+        "Tasks",
+        (
+            CommandRegistryEntry("status", "/status", "Show active tasks"),
+            CommandRegistryEntry("tasks", "/tasks [limit]", "List your tasks"),
+            CommandRegistryEntry(
+                "retry",
+                "/retry <task-id>",
+                "Explicitly retry a failed or orphaned task",
+            ),
+            CommandRegistryEntry(
+                "cancel",
+                "/cancel [task-id]",
+                "Cancel a task, or the current running task when omitted",
+            ),
+        ),
+    ),
+    CommandRegistryGroup(
+        "Agents",
+        (
+            CommandRegistryEntry("agents", "/agents", "List Agents"),
+            CommandRegistryEntry(
+                "agent",
+                "/agent [agent-id]",
+                "Show, switch, or create the front Agent",
+            ),
+            CommandRegistryEntry(
+                "delagent",
+                "/delagent <agent-id>",
+                "Delete a dynamically created Agent",
+            ),
+            CommandRegistryEntry(
+                "ask",
+                "/ask <agent-id> <prompt>",
+                "Send a correlated Agent request",
+            ),
+        ),
+    ),
+    CommandRegistryGroup(
+        "Agent Configuration",
+        (
+            CommandRegistryEntry(
+                "system",
+                "/system [default|<role>]",
+                "Show, set, or clear the current Agent's role",
+            ),
+            CommandRegistryEntry(
+                "mode",
+                "/mode [chat|plan|review|execute]",
+                "Show or set the operating mode",
+            ),
+            CommandRegistryEntry(
+                "modes",
+                "/modes",
+                "List operating modes and mark the current mode",
+            ),
+            CommandRegistryEntry(
+                "model",
+                "/model [<model-id> <effort|default>|effort <effort|default>]",
+                "Show or set the model and reasoning effort",
+            ),
+            CommandRegistryEntry(
+                "models",
+                "/models",
+                "List models and their supported reasoning efforts",
+            ),
+            CommandRegistryEntry(
+                "notify",
+                "/notify [on|off]",
+                "Show or set notifications",
+            ),
+        ),
+    ),
+    CommandRegistryGroup(
+        "Delivery",
+        (
+            CommandRegistryEntry(
+                "inbox",
+                "/inbox [agent-id|all]",
+                "Present unseen notifications",
+            ),
+            CommandRegistryEntry(
+                "recv",
+                "/recv",
+                "Receive the next replies deferred by WeChat's ten-message quota",
+            ),
+        ),
+    ),
+)
+
+
+def _command_registry_indexes() -> tuple[
+    frozenset[str], Mapping[str, CommandRegistryEntry]
+]:
+    names: dict[str, CommandRegistryEntry] = {}
+    syntaxes: set[str] = set()
+    for group in COMMAND_REGISTRY:
+        for entry in group.entries:
+            if entry.syntax in syntaxes:
+                raise RuntimeError(f"duplicate public command syntax: {entry.syntax}")
+            syntaxes.add(entry.syntax)
+            if entry.name is None:
+                if entry.hidden_aliases:
+                    raise RuntimeError("a pseudo-command cannot have slash aliases")
+            elif entry.syntax.split(maxsplit=1)[0] != f"/{entry.name}":
+                raise RuntimeError(
+                    f"command name and public syntax conflict: {entry.name}"
+                )
+            entry_names = (() if entry.name is None else (entry.name,)) + tuple(
+                entry.hidden_aliases
+            )
+            for name in entry_names:
+                canonical = str(name or "").strip().lower()
+                if not canonical or canonical in names:
+                    raise RuntimeError(f"duplicate or empty command name: {name}")
+                names[canonical] = entry
+    return frozenset(names), MappingProxyType(names)
+
+
+MVP_COMMANDS, _COMMAND_ENTRY_BY_NAME = _command_registry_indexes()
 MVP_COMMAND_NAMES = frozenset(f"/{name}" for name in MVP_COMMANDS)
+
+
+def _render_command_help() -> str:
+    lines = ["## Commands"]
+    for group in COMMAND_REGISTRY:
+        lines.extend(("", f"### {group.title}"))
+        lines.extend(
+            f"- `{entry.syntax}` - {entry.description}" for entry in group.entries
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _command_usage(name: str) -> str:
+    canonical = str(name or "").strip().lower()
+    entry = _COMMAND_ENTRY_BY_NAME.get(canonical)
+    if entry is None:
+        return f"usage: /{canonical}" if canonical else "usage: /"
+    syntax = entry.syntax
+    if canonical != entry.name:
+        _slash, separator, tail = syntax.partition(" ")
+        syntax = f"/{canonical}" + (separator + tail if separator else "")
+    return f"usage: {syntax}"
+
+
+COMMAND_HELP = _render_command_help()
 ACTIVE_TASK_STATES = frozenset({"queued", "claimed", "running", "cancel_requested"})
 RETRYABLE_TASK_STATES = frozenset({"failed", "orphaned", "interrupted"})
 TERMINAL_TASK_STATES = frozenset({"completed", "failed", "interrupted", "cancelled", "canceled"})
-
-COMMAND_HELP = """## Commands
-
-### Conversation
-- `/help` - Show this help
-- `/clear` - Clear the active conversation and start a fresh thread
-- `/reset` - Alias for `/clear`
-- `/sh <command>` - Run a bounded shell command in the bot workspace
-- `/skills` - List enabled skills
-- `$<skill> <task description>` - Run a task with a selected skill
-- `/mode [chat|plan|review|execute]` - Show or set the operating mode
-- `/modes` - List operating modes and mark the current mode
-- `/model [<model_id> <effort|default>|effort <effort|default>]` - Show or set the model and reasoning effort
-- `/models` - List models and their supported reasoning efforts
-
-### Tasks
-- `/status` - Show active tasks
-- `/tasks [limit]` - List your tasks
-- `/retry <task_id>` - Explicitly retry a failed or orphaned task
-- `/cancel [task_id]` - Cancel a task, or the current running task when omitted
-
-### Agents And Notifications
-- `/agents` - List Agents
-- `/agent [name]` - Show, switch, or create the front Agent
-- `/delagent <agent_id>` - Delete a dynamically created Agent
-- `/notify [on|off]` - Show or set notifications
-- `/inbox [agent_id|all]` - Present unseen notifications
-- `/recv` - Receive the next replies deferred by WeChat's ten-message quota
-- `/ask <agent_id> <prompt>` - Send a correlated Agent request
-"""
 
 _MAX_COMMAND_MARKDOWN = 6000
 _MAX_SHELL_OUTPUT = 6000
@@ -151,6 +317,8 @@ _MAX_PUBLIC_ID = 256
 _MAX_PUBLIC_TEXT = 512
 _MAX_EFFORT_NAME = 96
 _MAX_EFFORT_LIST = 1024
+_WECHAT_REPLY_TEXT_LIMIT = 3_000
+_REPLY_CONTINUATION_SUFFIX = "\n\nReply /recv to continue."
 _OUTBOX_INITIAL_RETRY_DELAY_SECONDS = 5.0
 _OUTBOX_MAX_RETRY_DELAY_SECONDS = 300.0
 
@@ -291,7 +459,11 @@ class InboundAcceptor(Protocol):
 
 class CommandHandler(Protocol):
     async def handle_command(
-        self, command: ChannelCommand, envelope: InboundEnvelope
+        self,
+        command: ChannelCommand,
+        envelope: InboundEnvelope,
+        *,
+        command_id: str = "",
     ) -> Any: ...
 
 
@@ -321,6 +493,12 @@ class Acceptance:
     # Keeping the IDs on the acceptance lets the gateway complete that second
     # half in one store transaction where supported.
     presentation_ids: tuple[str, ...] = ()
+    # Some command renderings need transport-aware fragments.  In particular,
+    # a long `/system` role must put a complete Markdown fence in every WeChat
+    # message instead of letting the generic 3,000-character slicer split one
+    # fence across messages.  The command receipt still owns the complete
+    # response text; these are a deterministic presentation of those bytes.
+    response_fragments: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def status(self) -> str:
@@ -330,13 +508,20 @@ class Acceptance:
 
 
 class CommandResponse(str):
-    """String-compatible command result carrying deferred presentation IDs."""
+    """String-compatible command result carrying projection metadata."""
 
     def __new__(
-        cls, value: str, presentation_ids: Sequence[str] = ()
+        cls,
+        value: str,
+        presentation_ids: Sequence[str] = (),
+        *,
+        response_fragments: Sequence[Mapping[str, Any]] = (),
     ) -> "CommandResponse":
         result = str.__new__(cls, value)
         result.presentation_ids = tuple(str(item) for item in presentation_ids if item)
+        result.response_fragments = tuple(
+            dict(fragment) for fragment in response_fragments
+        )
         return result
 
 
@@ -2029,7 +2214,24 @@ def _format_agent(record: Any, *, active: bool = False) -> str:
     )
     marker = " **(current)**" if active else ""
     suffix = f": {summary}" if summary else ""
-    return f"- **`{agent_id}`**{marker} - {display}{suffix}"
+    process_suffix = ""
+    if bool(_value(record, "process_isolated", default=False)):
+        pid = _bounded_public_value(
+            _value(record, "pid", default=None) or "pending",
+            max_length=_MAX_PUBLIC_ID,
+        )
+        generation = _bounded_public_value(
+            _value(record, "generation", default=None) or "pending",
+            max_length=_MAX_PUBLIC_ID,
+        )
+        health = _bounded_public_value(
+            _value(record, "health", default="unknown") or "unknown",
+            max_length=_MAX_PUBLIC_ID,
+        )
+        process_suffix = (
+            f" · process pid `{pid}`, generation `{generation}`, health `{health}`"
+        )
+    return f"- **`{agent_id}`**{marker} - {display}{suffix}{process_suffix}"
 
 
 def _format_agents_markdown(records: Sequence[Any], *, active_agent: str) -> str:
@@ -2103,6 +2305,85 @@ def _bounded_markdown_fence(
         else:
             high = middle - 1
     return truncated(low)
+
+
+_SYSTEM_ROLE_RESPONSE_PREFIX = "system role:\n"
+
+
+def _system_role_fragment_specs(content: str) -> tuple[dict[str, str], ...]:
+    """Render role text as independently valid WeChat Markdown fragments.
+
+    Reply-candidate fragmentation normally slices an opaque string every
+    3,000 characters.  That is unsafe for a fenced role: fragment one can lose
+    its closing fence while fragment two starts without an opening fence.  A
+    role can also contain arbitrarily long backtick runs, so a fixed fence is
+    insufficient.  Partition the *content* losslessly and choose a safe fence
+    for each piece instead.
+    """
+
+    remaining = str(content)
+    fragments: list[dict[str, str]] = []
+    while remaining:
+        heading = _SYSTEM_ROLE_RESPONSE_PREFIX if not fragments else ""
+        available = _WECHAT_REPLY_TEXT_LIMIT - len(heading)
+        if len(fragments) + 1 >= 10:
+            available -= len(_REPLY_CONTINUATION_SUFFIX)
+        low = 1
+        high = len(remaining)
+        best = 0
+        while low <= high:
+            middle = (low + high) // 2
+            rendered = _markdown_fence(remaining[:middle], language="text")
+            if len(rendered) <= available:
+                best = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best <= 0:  # Defensive: even one scalar easily fits in 3,000.
+            raise ValueError("system role cannot be represented as a reply fragment")
+        piece = remaining[:best]
+        fragments.append(
+            {
+                "kind": "text",
+                "content": heading + _markdown_fence(piece, language="text"),
+            }
+        )
+        remaining = remaining[best:]
+    return tuple(fragments)
+
+
+def _system_role_command_response(content: str) -> CommandResponse:
+    """Return the complete receipt text plus its lossless wire presentation."""
+
+    canonical = str(content)
+    return CommandResponse(
+        _SYSTEM_ROLE_RESPONSE_PREFIX + _markdown_fence(canonical, language="text"),
+        response_fragments=_system_role_fragment_specs(canonical),
+    )
+
+
+def _system_role_fragments_from_response(
+    response: str,
+) -> tuple[dict[str, str], ...]:
+    """Rebuild role fragments from a completed receipt after redelivery."""
+
+    rendered = str(response or "")
+    if not rendered.startswith(_SYSTEM_ROLE_RESPONSE_PREFIX):
+        return ()
+    fenced = rendered[len(_SYSTEM_ROLE_RESPONSE_PREFIX) :]
+    opening, separator, remainder = fenced.partition("\n")
+    if not separator or not opening.endswith("text"):
+        return ()
+    fence = opening[: -len("text")]
+    if len(fence) < 3 or set(fence) != {"`"}:
+        return ()
+    closing = "\n" + fence
+    if not remainder.endswith(closing):
+        return ()
+    content = remainder[: -len(closing)]
+    if not content:
+        return ()
+    return _system_role_fragment_specs(content)
 
 
 def _format_shell_markdown(command: str, result: Any) -> str:
@@ -2497,14 +2778,49 @@ def _format_inbox_item(record: Any) -> str:
 
 
 def _inbox_ids(records: Sequence[Any]) -> tuple[str, ...]:
-    """Extract durable outbox IDs from presentation candidates."""
+    """Extract durable outbox/item IDs from presentation candidates."""
 
     values: list[str] = []
     for record in records:
-        identifier = _value(record, "outbox_id", "delivery_id", "id", default="")
+        identifier = _value(
+            record,
+            "outbox_id",
+            "delivery_id",
+            "reply_candidate_id",
+            "presentation_id",
+            "id",
+            default="",
+        )
         if identifier:
             values.append(str(identifier))
     return tuple(dict.fromkeys(values))
+
+
+def _switch_back_fragment_specs(
+    acknowledgement: str,
+    records: Sequence[Any],
+) -> tuple[dict[str, str], ...]:
+    """Keep every retained Agent item on its own WeChat fragment boundary."""
+
+    logical_items = [
+        str(acknowledgement) + "\n\nunseen messages:",
+        *(_format_inbox_item(record) for record in records),
+    ]
+    fragments: list[dict[str, str]] = []
+    for logical_item in logical_items:
+        remaining = str(logical_item)
+        while remaining:
+            wire_ordinal = len(fragments) + 1
+            limit = (
+                _WECHAT_REPLY_TEXT_LIMIT
+                if wire_ordinal < 10
+                else _WECHAT_REPLY_TEXT_LIMIT
+                - len(_REPLY_CONTINUATION_SUFFIX)
+            )
+            piece = remaining[:limit]
+            fragments.append({"kind": "text", "content": piece})
+            remaining = remaining[len(piece) :]
+    return tuple(fragments)
 
 
 def _task_belongs_to(record: Any, envelope: InboundEnvelope) -> bool:
@@ -2668,7 +2984,11 @@ class MVPCommandRouter:
         self.shell_runner = shell_runner
 
     async def handle_command(
-        self, command: ChannelCommand, envelope: InboundEnvelope
+        self,
+        command: ChannelCommand,
+        envelope: InboundEnvelope,
+        *,
+        command_id: str = "",
     ) -> str | None:
         name = command.name
         if name == "__file_upload__":
@@ -2705,6 +3025,8 @@ class MVPCommandRouter:
                 if command.args
                 else "I couldn't transcribe that audio; please resend it or type the instruction."
             )
+        if name == "__queue_full__":
+            return "Agent queue is full; try again later."
         if name not in MVP_COMMANDS:
             # A slash-prefixed message is a control-plane input even when the
             # command is unsupported.  Returning a response here lets the
@@ -2755,11 +3077,11 @@ class MVPCommandRouter:
             route_scope["conversation_id"] = str(command_snapshot["conversation_id"])
         scope = {**route_scope, "agent_id": active_agent}
         if name == "help":
-            return COMMAND_HELP if not command.args else "usage: /help"
+            return COMMAND_HELP if not command.args else _command_usage(name)
 
         if name in {"skills", "listskill", "listskills"}:
             if command.args:
-                return f"usage: /{name}"
+                return _command_usage(name)
             try:
                 result = await _invoke_compatible(
                     self.manager,
@@ -2773,7 +3095,7 @@ class MVPCommandRouter:
 
         if name in {"clear", "reset"}:
             if command.args:
-                return f"usage: /{name}"
+                return _command_usage(name)
             # ``/clear`` is a compatibility command, but it still has to use
             # the durable manager boundary.  A manager implementation can
             # clear its SQLite thread binding and reset the selected runtime
@@ -2820,9 +3142,102 @@ class MVPCommandRouter:
             # rotated on the next task claim.
             return "context cleared, starting a new conversation"
 
+        if name == "system":
+            # Role content is an exact raw-tail contract.  Consume only the
+            # command token and its horizontal separator; normalization owns
+            # outer Unicode whitespace while preserving internal layout.
+            raw_command = str(command.raw or "")
+            match = re.match(
+                r"^\s*/system(?=$|\s)",
+                raw_command,
+                flags=re.IGNORECASE,
+            )
+            if match is None:
+                # ``ChannelCommand.raw`` is required for this command because
+                # whitespace and newlines in the role are semantically
+                # significant.  Compatibility callers must not accidentally
+                # turn a malformed/missing raw command into a read request.
+                return "invalid system command"
+            raw_tail = raw_command[match.end() :]
+            raw_tail = re.sub(r"^[ \t]*", "", raw_tail, count=1)
+            try:
+                canonical = normalize_role_text(raw_tail)
+            except RoleValidationError as exc:
+                detail = _bounded_public_value(exc, max_length=_MAX_PUBLIC_TEXT)
+                return f"invalid system role: {detail or 'invalid role'}"
+
+            if not canonical:
+                try:
+                    value = await _invoke_compatible(
+                        self.manager,
+                        ("get_system_role", "get_session_role", "get_role"),
+                        keyword=scope,
+                    )
+                    role = validate_role_snapshot(value)
+                except AttributeError:
+                    return "system role is unavailable"
+                except RoleValidationError:
+                    return "cannot get system role: invalid stored role"
+                except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
+                    detail = _bounded_public_value(exc, max_length=_MAX_PUBLIC_TEXT)
+                    return f"cannot get system role: {detail or 'operation failed'}"
+                if role["kind"] == "default":
+                    return "system role: default"
+                return _system_role_command_response(role["normalized_content"])
+
+            requested_kind = (
+                "default" if is_default_role_token(canonical) else "custom"
+            )
+            role_text = "" if requested_kind == "default" else canonical
+            try:
+                role_keywords = {
+                    **scope,
+                    "kind": requested_kind,
+                    "actor": envelope.external_user_id,
+                }
+                if command_id:
+                    # Only the gateway receipt owner supplies this correlation.
+                    # Standalone router calls intentionally omit it and retain
+                    # the compatibility manager/store path.
+                    role_keywords["command_id"] = str(command_id)
+                value = await _invoke_compatible(
+                    self.manager,
+                    ("set_system_role", "set_session_role", "set_role"),
+                    positional=(role_text,),
+                    keyword=role_keywords,
+                )
+                if not isinstance(value, Mapping):
+                    raise RuntimeError("invalid role persistence response")
+                role = validate_role_snapshot(value)
+                changed = bool(value.get("changed", True))
+            except AttributeError:
+                return "system role is unavailable"
+            except RoleValidationError as exc:
+                detail = _bounded_public_value(exc, max_length=_MAX_PUBLIC_TEXT)
+                return f"invalid system role: {detail or 'invalid role'}"
+            except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
+                detail = _bounded_public_value(exc, max_length=_MAX_PUBLIC_TEXT)
+                return f"cannot set system role: {detail or 'operation failed'}"
+            response = (
+                "system role: unchanged"
+                if not changed
+                else (
+                    "system role: default"
+                    if role["kind"] == "default"
+                    else "system role: updated"
+                )
+            )
+            stored_response = value.get("command_response")
+            if stored_response is not None and (
+                not isinstance(stored_response, str)
+                or stored_response != response
+            ):
+                return "cannot set system role: invalid persistence response"
+            return stored_response or response
+
         if name == "mode":
             if len(command.args) > 1:
-                return "usage: /mode [chat|plan|review|execute]"
+                return _command_usage(name)
             if not command.args:
                 try:
                     mode = await _invoke_compatible(
@@ -2840,7 +3255,7 @@ class MVPCommandRouter:
                 return f"mode: {mode}"
             requested_mode = command.args[0].strip().lower()
             if requested_mode not in {"chat", "plan", "review", "execute"}:
-                return "usage: /mode [chat|plan|review|execute]"
+                return _command_usage(name)
             try:
                 mode = await _invoke_compatible(
                     self.manager,
@@ -2858,7 +3273,7 @@ class MVPCommandRouter:
 
         if name == "modes":
             if command.args:
-                return "usage: /modes"
+                return _command_usage(name)
             try:
                 modes = await _invoke_compatible(
                     self.manager,
@@ -2880,12 +3295,9 @@ class MVPCommandRouter:
 
         if name in {"model", "models"}:
             if name == "models" and command.args:
-                return "usage: /models"
+                return _command_usage(name)
             if name == "model" and command.args and len(command.args) != 2:
-                return (
-                    "usage: /model <model-id> <effort|default> | "
-                    "/model effort <effort|default>"
-                )
+                return _command_usage(name)
             clears_effort = (
                 name == "model"
                 and len(command.args) == 2
@@ -3026,7 +3438,7 @@ class MVPCommandRouter:
                 else command.argument.strip()
             )
             if not command_text:
-                return "usage: /sh <command>"
+                return _command_usage(name)
 
             def invoke_shell() -> str:
                 # Inspect the injected helper before invoking it so a genuine
@@ -3058,7 +3470,7 @@ class MVPCommandRouter:
 
         if name == "ask":
             if len(command.args) < 2:
-                return "usage: /ask <agent_id> <prompt>"
+                return _command_usage(name)
             destination = command.args[0].strip()
             # ``ChannelCommand.args`` is whitespace-normalized for control
             # syntax. The prompt is user input, so split only the command and
@@ -3076,7 +3488,7 @@ class MVPCommandRouter:
                 else " ".join(command.args[1:]).strip()
             )
             if not prompt:
-                return "usage: /ask <agent_id> <prompt>"
+                return _command_usage(name)
             request_id = command_request_id(envelope)
             task_id = command_task_id(envelope)
             acknowledgement = f"Agent task queued: {task_id}"
@@ -3114,6 +3526,8 @@ class MVPCommandRouter:
                         },
                     },
                 )
+            except QueueFullError:
+                return "cannot ask Agent: queue is full"
             except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
                 return f"cannot ask Agent: {exc}"
             resolved_task_id = _task_id(result) or task_id
@@ -3128,7 +3542,7 @@ class MVPCommandRouter:
 
         if name == "agents":
             if command.args:
-                return "usage: /agents"
+                return _command_usage(name)
             try:
                 result = await _invoke_compatible(
                     self.manager,
@@ -3155,7 +3569,7 @@ class MVPCommandRouter:
 
         if name == "delagent":
             if len(command.args) != 1:
-                return "usage: /delagent <agent_id>"
+                return _command_usage(name)
             selected = command.args[0].strip().lower()
             try:
                 await _invoke_compatible(
@@ -3175,7 +3589,7 @@ class MVPCommandRouter:
 
         if name == "agent":
             if len(command.args) > 1:
-                return "usage: /agent [name]"
+                return _command_usage(name)
             if not command.args:
                 try:
                     active = await _invoke_compatible(
@@ -3209,16 +3623,48 @@ class MVPCommandRouter:
                 )
             except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
                 return f"cannot switch Agent: {exc}"
-            # Switching changes only the front route and never replays prior
-            # output. Stored notifications remain available through the
-            # explicit `/inbox` command.
-            return f"switched to Agent: {selected}"
+            # Only completed items retained while this Agent was in the
+            # background are eligible here.  The manager deliberately keeps
+            # allocated/sent history and `/recv` quota deferrals off this
+            # surface, so switching cannot replay a transcript.
+            try:
+                unseen = list(
+                    await _invoke_compatible(
+                        self.manager,
+                        ("switch_back_inbox",),
+                        keyword={
+                            "channel": envelope.channel,
+                            "bot_id": envelope.bot_id,
+                            "external_user_id": envelope.external_user_id,
+                            "session_id": envelope.session_id,
+                            "agent_id": selected,
+                            "limit": 100,
+                            "present": False,
+                        },
+                    )
+                    or ()
+                )
+            except AttributeError:
+                # Narrow compatibility managers predate durable candidate
+                # presentation; retain their route-only behavior.
+                unseen = []
+            response = f"switched to Agent: {selected}"
+            if not unseen:
+                return response
+            formatted = tuple(_format_inbox_item(item) for item in unseen)
+            return CommandResponse(
+                response
+                + "\n\nunseen messages:\n"
+                + "\n".join(formatted),
+                _inbox_ids(unseen),
+                response_fragments=_switch_back_fragment_specs(response, unseen),
+            )
 
         if name == "notify":
             if len(command.args) > 1 or (
                 command.args and command.args[0].lower() not in {"on", "off"}
             ):
-                return "usage: /notify [on|off]"
+                return _command_usage(name)
             if not command.args:
                 try:
                     enabled = await _invoke_compatible(
@@ -3243,7 +3689,7 @@ class MVPCommandRouter:
 
         if name == "inbox":
             if len(command.args) > 1:
-                return "usage: /inbox [agent_id|all]"
+                return _command_usage(name)
             requested = command.args[0] if command.args else active_agent
             if requested.lower() == "all":
                 try:
@@ -3280,7 +3726,7 @@ class MVPCommandRouter:
 
         if name == "recv":
             if command.args:
-                return "usage: /recv"
+                return _command_usage(name)
             try:
                 projection = await _invoke_compatible(
                     self.manager,
@@ -3314,7 +3760,7 @@ class MVPCommandRouter:
 
         if name == "status":
             if command.args:
-                return "usage: /status"
+                return _command_usage(name)
             try:
                 result = await _invoke_compatible(
                     self.manager,
@@ -3352,7 +3798,7 @@ class MVPCommandRouter:
             if len(command.args) > 1 or (
                 command.args and not command.args[0].isdigit()
             ):
-                return "usage: /tasks [limit]"
+                return _command_usage(name)
             limit = int(command.args[0]) if command.args else 20
             limit = min(max(limit, 1), 100)
             try:
@@ -3402,12 +3848,12 @@ class MVPCommandRouter:
             elif not active_records:
                 return "no running task for current Agent"
             else:
-                return "multiple running tasks; use /cancel <task_id>"
+                return "multiple running tasks; use /cancel <task-id>"
 
         if len(command.args) != 1:
             if name == "cancel":
-                return "usage: /cancel [task_id]"
-            return f"usage: /{name} <task_id>"
+                return _command_usage(name)
+            return _command_usage(name)
         task_id = command.args[0]
         # Authorization is performed before invoking a control operation when
         # the facade exposes a public task lookup.  Missing/foreign tasks use
@@ -3446,6 +3892,8 @@ class MVPCommandRouter:
             )
         except AttributeError:
             return f"{name} is unavailable"
+        except QueueFullError:
+            return f"cannot {name} task {task_id}: queue is full"
         except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
             # A durable command acknowledgement should not make the monitor
             # retain its cursor indefinitely when the store rejects a stale
@@ -3820,17 +4268,47 @@ class WeChatGateway:
                     "conversation_id": envelope.conversation_id,
                 }
 
-        result = await _invoke_compatible(
-            self.runtime,
-            ("accept_inbound", "submit_inbound", "enqueue_inbound"),
-            # Both TaskManager and SQLiteStore accept channel-neutral objects
-            # by attribute (the store filters channel-specific fields at its
-            # boundary).  Keeping the immutable envelope here preserves the
-            # original reply target while still allowing lightweight mapping
-            # fakes through the compatibility shim.
-            positional=(envelope,),
-            keyword=acceptance_kwargs,
-        )
+        try:
+            result = await _invoke_compatible(
+                self.runtime,
+                ("accept_inbound", "submit_inbound", "enqueue_inbound"),
+                # Both TaskManager and SQLiteStore accept channel-neutral objects
+                # by attribute (the store filters channel-specific fields at its
+                # boundary).  Keeping the immutable envelope here preserves the
+                # original reply target while still allowing lightweight mapping
+                # fakes through the compatibility shim.
+                positional=(envelope,),
+                keyword=acceptance_kwargs,
+            )
+        except QueueFullError:
+            # Capacity rejection must advance the inbound cursor and produce a
+            # replay-stable reply without creating a task or consuming another
+            # ready sequence.  Re-run only the inbound/control-plane half after
+            # the failed all-or-nothing task transaction has rolled back.
+            command = ChannelCommand(
+                name="__queue_full__",
+                args=(),
+                raw=envelope.text,
+            )
+            skill_invocation = None
+            skill_snapshot = None
+            skill_error = ""
+            rejection_kwargs = dict(acceptance_kwargs)
+            rejection_kwargs["create_task"] = False
+            rejection_kwargs.pop("skill_snapshot", None)
+            rejection_kwargs["_synthetic_command_name"] = "__queue_full__"
+            if not hasattr(self.runtime, "active_agent_for"):
+                rejection_kwargs["command_snapshot"] = {
+                    "agent_id": envelope.agent_id,
+                    "conversation_id": envelope.conversation_id,
+                    "synthetic_command_name": "__queue_full__",
+                }
+            result = await _invoke_compatible(
+                self.runtime,
+                ("accept_inbound", "submit_inbound", "enqueue_inbound"),
+                positional=(envelope,),
+                keyword=rejection_kwargs,
+            )
         # Restore immutable ingress fields for command handling.  The inbound
         # row is the source of truth on both first delivery and duplicate
         # redelivery; a live `/agent` switch or rolling context-token refresh
@@ -3931,6 +4409,15 @@ class WeChatGateway:
                 conversation_id=snapshot_conversation,
                 raw=raw,
             )
+            synthetic_command_name = str(
+                persisted_snapshot.get("synthetic_command_name") or ""
+            )
+            if command is None and synthetic_command_name == "__queue_full__":
+                command = ChannelCommand(
+                    name="__queue_full__",
+                    args=(),
+                    raw=envelope.text,
+                )
         duplicate = _is_duplicate(result)
         accepted = _is_accepted(result)
 
@@ -3961,6 +4448,7 @@ class WeChatGateway:
         command_response = ""
         command_id = command_delivery_id(envelope) if command is not None else ""
         presentation_ids: tuple[str, ...] = ()
+        response_fragments: tuple[Mapping[str, Any], ...] = ()
         response_agent_id = envelope.agent_id
         raw_candidate_ids = _value(
             result, "confirmation_ids", "candidate_ids", default=()
@@ -4066,6 +4554,18 @@ class WeChatGateway:
                                     or ()
                                 )
                                 if identifier
+                            )
+                            response_fragments = tuple(
+                                dict(fragment)
+                                for fragment in (
+                                    _value(
+                                        replay_receipt,
+                                        "response_fragments",
+                                        default=(),
+                                    )
+                                    or ()
+                                )
+                                if isinstance(fragment, Mapping)
                             )
                             stored_agent = _value(
                                 replay_receipt,
@@ -4200,6 +4700,18 @@ class WeChatGateway:
                                 _value(receipt, "presentation_ids", default=()) or ()
                             )
                             if identifier
+                        )
+                        response_fragments = tuple(
+                            dict(fragment)
+                            for fragment in (
+                                _value(
+                                    receipt,
+                                    "response_fragments",
+                                    default=(),
+                                )
+                                or ()
+                            )
+                            if isinstance(fragment, Mapping)
                         )
                         stored_agent = _value(
                             receipt,
@@ -4380,8 +4892,15 @@ class WeChatGateway:
 
                 if owns_receipt:
                     try:
-                        response = await self.command_router.handle_command(
-                            command, envelope
+                        response = await _invoke_compatible(
+                            self.command_router,
+                            ("handle_command",),
+                            positional=(command, envelope),
+                            keyword={
+                                "command_id": (
+                                    command_id if receipt_target is not None else ""
+                                )
+                            },
                         )
                         if response is None and command.name not in MVP_COMMANDS:
                             token = f"/{command.name}" if command.name else "/"
@@ -4393,6 +4912,13 @@ class WeChatGateway:
                                 response, "presentation_ids", ()
                             )
                             if identifier
+                        )
+                        response_fragments = tuple(
+                            dict(fragment)
+                            for fragment in (
+                                getattr(response, "response_fragments", ()) or ()
+                            )
+                            if isinstance(fragment, Mapping)
                         )
                         # ``/agent B`` mutates the front route before building
                         # its acknowledgement. Resolve the route again for the
@@ -4446,6 +4972,7 @@ class WeChatGateway:
                                         "response_text": command_response,
                                         "response_agent_id": response_agent_id,
                                         "presentation_ids": presentation_ids,
+                                        "response_fragments": response_fragments,
                                     },
                                 )
                             except Exception as exc:
@@ -4473,6 +5000,18 @@ class WeChatGateway:
                                 )
                                 if identifier
                             )
+                            response_fragments = tuple(
+                                dict(fragment)
+                                for fragment in (
+                                    _value(
+                                        completed,
+                                        "response_fragments",
+                                        default=response_fragments,
+                                    )
+                                    or ()
+                                )
+                                if isinstance(fragment, Mapping)
+                            )
                     except asyncio.CancelledError:
                         # Monitor timeouts and shutdown cancel this coroutine in
                         # process. This invocation owns the receipt, so no live
@@ -4487,6 +5026,18 @@ class WeChatGateway:
                         # always drain the same cleanup boundary before failing.
                         await drain_owned_receipt_interrupt()
                         raise
+        if (
+            not response_fragments
+            and command is not None
+            and command.name == "system"
+            and command_response
+        ):
+            # A completed command receipt survives process restart without
+            # Python-side ``CommandResponse`` attributes.  Reconstruct the
+            # deterministic role presentation from its full immutable text.
+            response_fragments = _system_role_fragments_from_response(
+                command_response
+            )
         return Acceptance(
             envelope=envelope,
             accepted=accepted,
@@ -4496,6 +5047,7 @@ class WeChatGateway:
             response_agent_id=response_agent_id,
             response_delivery_id=command_id if command is not None else "",
             presentation_ids=presentation_ids,
+            response_fragments=response_fragments,
             confirmation_ids=tuple(candidate_ids),
             raw_result=result,
         )
@@ -4545,6 +5097,10 @@ class WeChatGateway:
                 # once a facade advertises the capability, however, every
                 # failure below is fatal to acceptance and must not bypass the
                 # durable projection.
+                if len(outcome.response_fragments) > 1:
+                    raise RuntimeError(
+                        "command response requires a fragment-aware outbox"
+                    )
                 receipt = await send_user_delivery_async(client, delivery)
                 if not receipt.sent:
                     logger.warning(
@@ -4584,21 +5140,59 @@ class WeChatGateway:
                         break
             if persisted is None:
                 try:
-                    persisted = await _invoke_compatible(
-                        enqueue_target,
-                        enqueue_names,
-                        keyword={
-                            "delivery": delivery.to_dict(),
-                            # Keep the command response's resolved route on the
-                            # durable projection.  This is normally the inbound
-                            # Agent and is the post-switch Agent for ``/agent B``.
-                            "agent_id": response_agent_id,
-                            # A command acknowledgement is an interactive
-                            # foreground response even when notifications are off.
-                            "foreground": True,
-                            "present_outbox_ids": outcome.presentation_ids,
-                        },
-                    )
+                    fragment_projector = None
+                    if outcome.response_fragments:
+                        for target in (
+                            self.runtime,
+                            getattr(self.runtime, "store", None),
+                        ):
+                            if target is None:
+                                continue
+                            fragment_projector = _capability_target(
+                                target, ("project_reply_candidate",)
+                            )
+                            if fragment_projector is not None:
+                                break
+                    if fragment_projector is not None:
+                        persisted = await _invoke_compatible(
+                            fragment_projector,
+                            ("project_reply_candidate",),
+                            keyword={
+                                "target": delivery.target.to_dict(),
+                                "source_key": f"outbox:{delivery.delivery_id}",
+                                "content": outcome.command_response,
+                                "fragments": outcome.response_fragments,
+                                "agent_id": response_agent_id,
+                                "foreground": True,
+                                "outbox_id": delivery.delivery_id,
+                                "client_id": delivery.client_id,
+                                "contextless_client_id": (
+                                    delivery.contextless_client_id or None
+                                ),
+                                "from_user_id": delivery.from_user_id,
+                                "present_outbox_ids": outcome.presentation_ids,
+                            },
+                        )
+                    elif len(outcome.response_fragments) > 1:
+                        raise RuntimeError(
+                            "command response store cannot preserve explicit fragments"
+                        )
+                    else:
+                        persisted = await _invoke_compatible(
+                            enqueue_target,
+                            enqueue_names,
+                            keyword={
+                                "delivery": delivery.to_dict(),
+                                # Keep the command response's resolved route on the
+                                # durable projection.  This is normally the inbound
+                                # Agent and is the post-switch Agent for ``/agent B``.
+                                "agent_id": response_agent_id,
+                                # A command acknowledgement is an interactive
+                                # foreground response even when notifications are off.
+                                "foreground": True,
+                                "present_outbox_ids": outcome.presentation_ids,
+                            },
+                        )
                 except Exception as exc:
                     logger.warning(
                         "command response outbox persistence failed for %s",
@@ -6636,6 +7230,9 @@ send_wechat_delivery = send_user_delivery
 __all__ = [
     "Acceptance",
     "CHANNEL",
+    "COMMAND_REGISTRY",
+    "CommandRegistryEntry",
+    "CommandRegistryGroup",
     "CommandResponse",
     "COMMAND_HELP",
     "DEFAULT_AGENT_ID",
