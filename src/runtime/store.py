@@ -19,6 +19,31 @@ from __future__ import annotations
 from typing import Any, Protocol, runtime_checkable
 
 
+WORKING_DIRECTORY_RESPONSE_PREFIX = "working directory: "
+WORKING_DIRECTORY_RESPONSE_MAX_CHARS = 512
+
+
+def format_working_directory_response(path: Any) -> str:
+    """Return the canonical public acknowledgement for one resolved cwd.
+
+    Filesystem paths may legally contain newlines, other control whitespace,
+    and Markdown delimiters.  A command acknowledgement must not let those
+    characters create extra lines or Markdown structure, and it must retain a
+    fixed public size even when the canonical path is very long.
+    """
+
+    public_path = " ".join(str(path or "").split()).replace("`", "'")
+    if not public_path:
+        raise ValueError("working directory response has no path")
+    path_budget = (
+        WORKING_DIRECTORY_RESPONSE_MAX_CHARS
+        - len(WORKING_DIRECTORY_RESPONSE_PREFIX)
+    )
+    if len(public_path) > path_budget:
+        public_path = public_path[: path_budget - 3].rstrip() + "..."
+    return WORKING_DIRECTORY_RESPONSE_PREFIX + public_path
+
+
 class StoreError(RuntimeError):
     """Base exception exposed by every durable-store backend."""
 
@@ -180,6 +205,24 @@ class DurableStore(Protocol):
 
     async def project_reply_candidate(self, **kwargs: Any) -> Any: ...
 
+    async def append_reply_aggregate_member(self, **kwargs: Any) -> Any: ...
+
+    async def get_reply_aggregate(self, reply_aggregate_id: str) -> Any | None: ...
+
+    async def list_reply_aggregates(self, **kwargs: Any) -> list[Any]: ...
+
+    async def list_reply_aggregate_members(
+        self, reply_aggregate_id: str
+    ) -> list[Any]: ...
+
+    async def seal_reply_aggregates(self, **kwargs: Any) -> Any: ...
+
+    async def seal_due_reply_aggregates(self, **kwargs: Any) -> Any: ...
+
+    async def materialize_sealed_reply_aggregate(
+        self, reply_aggregate_id: str, **kwargs: Any
+    ) -> Any: ...
+
     async def drain_deferred_replies(self, **kwargs: Any) -> Any: ...
 
     async def activate_outbox_contextless_variant(
@@ -244,6 +287,12 @@ class DurableStore(Protocol):
     async def get_session_role(self, **kwargs: Any) -> Any: ...
 
     async def set_session_role(self, role_text: str, **kwargs: Any) -> Any: ...
+
+    async def get_session_working_directory(self, **kwargs: Any) -> Any | None: ...
+
+    async def set_session_working_directory(
+        self, relative_path: str, **kwargs: Any
+    ) -> Any: ...
 
     async def mark_agent_deleted(self, agent_id: str, **kwargs: Any) -> bool: ...
 

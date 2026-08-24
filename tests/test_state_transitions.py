@@ -346,6 +346,52 @@ def test_outbox_retry_deadline_uses_transaction_time(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+def test_delivery_unknown_retry_reports_accepted_and_rejected_transitions(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        path = tmp_path / "delivery-unknown-retry.sqlite"
+        first = SQLiteStore(path)
+        await first.initialize()
+        try:
+            outbox = await first.create_user_outbox(
+                target=_target(),
+                content="ambiguous send",
+                outbox_id="delivery-unknown-retry",
+            )
+            claim = (
+                await first.claim_outbox(
+                    "outbox-worker",
+                    automatic=False,
+                )
+            )[0]
+            assert claim.outbox_id == outbox.outbox_id
+            assert await first.mark_outbox_sending(
+                outbox.outbox_id,
+                claim.claim_token,
+            )
+        finally:
+            await first.close()
+
+        restarted = SQLiteStore(path)
+        await restarted.initialize()
+        try:
+            recovered = await restarted.get_outbox_item(outbox.outbox_id)
+            assert recovered is not None
+            assert recovered.state.value == "delivery_unknown"
+
+            assert await restarted.retry_outbox(outbox.outbox_id) is True
+            pending = await restarted.get_outbox_item(outbox.outbox_id)
+            assert pending is not None
+            assert pending.state.value == "pending"
+            assert await restarted.retry_outbox(outbox.outbox_id) is False
+            assert await restarted.retry_outbox("missing-outbox") is False
+        finally:
+            await restarted.close()
+
+    asyncio.run(scenario())
+
+
 def test_store_first_task_failure_is_not_acknowledged_as_duplicate(tmp_path) -> None:
     async def scenario() -> None:
         store = SQLiteStore(tmp_path / "runtime.sqlite")

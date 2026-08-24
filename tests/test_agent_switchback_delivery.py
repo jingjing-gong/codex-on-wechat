@@ -368,7 +368,9 @@ def test_v32_migration_marks_preexisting_reply_candidates_as_history(tmp_path):
         # v31 database without having to maintain a second copy of the full
         # historical schema in this focused regression.
         with sqlite3.connect(database) as connection:
-            connection.execute("DELETE FROM schema_migrations WHERE version=32")
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version IN (32,33,34,35)"
+            )
             connection.commit()
 
         migrated = SQLiteStore(database)
@@ -546,10 +548,11 @@ def test_agent_switchback_gateway_replays_receipt_once_and_caps_reply_quota(
             assert "unseen messages:" in first.command_response
             assert all(marker in first.command_response for marker in markers)
             assert first.presentation_ids == tuple(missed_ids)
-            # Fragment one is the command acknowledgement. Every following
-            # fragment belongs to one completed Agent item; adjacent logical
-            # items are never coalesced even when they would fit together.
-            assert len(first.response_fragments) == 12
+            # Completed items keep their durable identities, but compatible
+            # text shares bounded wire messages.  The acknowledgement and
+            # first item fit together; every later 2,900-character item needs
+            # its own message.
+            assert len(first.response_fragments) == 11
             assert first.response_fragments[0]["content"].startswith(
                 "switched to Agent: alpha"
             )
@@ -660,7 +663,7 @@ def test_switchback_crash_after_receipt_replays_fragments_without_rerouting(
         accepted = await first_gateway.accept(message)
         assert accepted is not None and not accepted.duplicate
         assert accepted.presentation_ids == (missed_id,)
-        assert len(accepted.response_fragments) == 2
+        assert len(accepted.response_fragments) == 1
         assert first_manager.switch_calls == 1
         assert first_manager.inbox_calls == 1
         assert await first_store.get_outbox_item(

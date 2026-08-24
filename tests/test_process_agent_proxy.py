@@ -11,6 +11,10 @@ from typing import Any
 import pytest
 
 from src.agents.base import AgentTask, ReplyTarget
+from src.agents.workspace import (
+    EXECUTION_WORKSPACE_KEY,
+    build_workspace_snapshot,
+)
 from src.runtime.process_agent import (
     ProcessAgentCapacityError,
     ProcessAgentError,
@@ -197,6 +201,102 @@ def test_artifact_relay_uses_original_parent_task_and_reply_target(
                 "source_item_id": "image-item-1",
                 "source_item_ordinal": 1,
             }
+        finally:
+            await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_snapshots_cross_one_process_without_changing_process_cwd(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    first_directory = workspace / "first"
+    second_directory = workspace / "second"
+    first_directory.mkdir(parents=True)
+    second_directory.mkdir()
+    first_snapshot = build_workspace_snapshot(workspace, first_directory)
+    second_snapshot = build_workspace_snapshot(workspace, second_directory)
+
+    async def scenario() -> None:
+        runtime = _runtime("alpha", workspace)
+        try:
+            first = await runtime.run(
+                AgentTask(
+                    task_id="workspace-first",
+                    execution_id="execution-workspace-first",
+                    agent_id="alpha",
+                    conversation_id="conversation-alpha",
+                    inputs="inspect first",
+                    metadata={
+                        "probe_workspace": True,
+                        EXECUTION_WORKSPACE_KEY: first_snapshot,
+                    },
+                )
+            )
+            first_pid = runtime.pid
+            second = await runtime.run(
+                AgentTask(
+                    task_id="workspace-second",
+                    execution_id="execution-workspace-second",
+                    agent_id="alpha",
+                    conversation_id="conversation-alpha",
+                    inputs="inspect second",
+                    metadata={
+                        "probe_workspace": True,
+                        EXECUTION_WORKSPACE_KEY: second_snapshot,
+                    },
+                )
+            )
+
+            assert first.status == second.status == "completed"
+            assert isinstance(first_pid, int) and first_pid > 0
+            assert runtime.pid == first_pid
+            assert first.metadata["pid"] == second.metadata["pid"] == first_pid
+            assert first.metadata["configured_cwd"] == str(workspace.resolve())
+            assert second.metadata["configured_cwd"] == str(workspace.resolve())
+            assert first.metadata["process_cwd"] == second.metadata["process_cwd"]
+            assert first.metadata["process_cwd"] not in {
+                str(first_directory.resolve()),
+                str(second_directory.resolve()),
+            }
+            assert first.metadata["execution_workspace"] == first_snapshot
+            assert second.metadata["execution_workspace"] == second_snapshot
+            assert (
+                first.metadata["execution_workspace"]["path"]
+                != second.metadata["execution_workspace"]["path"]
+            )
+        finally:
+            await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_compaction_control_runs_in_the_selected_agent_process(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        runtime = _runtime("alpha", tmp_path)
+        try:
+            await runtime.start()
+            child_pid = runtime.pid
+            result = await runtime.compact_session(
+                "conversation-alpha",
+                thread_id="thread-alpha",
+                mode_id="execute",
+                profile_version=3,
+                policy_version=2,
+                session_role={"kind": "test"},
+            )
+            assert result == {
+                "thread_id": "thread-alpha",
+                "compaction": {
+                    "agent_id": "alpha",
+                    "conversation_id": "conversation-alpha",
+                    "pid": child_pid,
+                },
+            }
+            assert runtime.pid == child_pid
         finally:
             await runtime.stop()
 

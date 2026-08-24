@@ -55,6 +55,9 @@ class _ModelRuntime:
     def __init__(self, catalog: Iterable[Mapping[str, Any]]) -> None:
         self.catalog = tuple(deepcopy(dict(model)) for model in catalog)
         self.compatibility_calls: list[tuple[str, str, str]] = []
+        self.current_model = ""
+        self.current_effort = ""
+        self.reset_calls: list[tuple[str, str, str]] = []
 
     async def start(self) -> None:
         return None
@@ -76,6 +79,7 @@ class _ModelRuntime:
 
     def set_model(self, conversation_id: str, model_id: str) -> None:
         self.compatibility_calls.append(("model", conversation_id, model_id))
+        self.current_model = model_id
 
     def set_reasoning_effort(
         self, conversation_id: str, reasoning_effort: str
@@ -83,6 +87,13 @@ class _ModelRuntime:
         self.compatibility_calls.append(
             ("effort", conversation_id, reasoning_effort)
         )
+        self.current_effort = reasoning_effort
+
+    async def reset_session(self, conversation_id: str) -> str:
+        self.reset_calls.append(
+            (conversation_id, self.current_model, self.current_effort)
+        )
+        return ""
 
 
 def _manager_for(
@@ -237,6 +248,108 @@ def test_luna_rejects_ultra_without_mutating_model_or_effort(tmp_path) -> None:
                 "reasoning effort: ultra"
             )
             assert await _selection(manager) == before_effort_rejection
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_default_effort_forgets_the_sticky_ultra_thread(tmp_path) -> None:
+    async def scenario() -> None:
+        manager, runtime = _manager_for(tmp_path / "runtime.sqlite")
+        await manager.start()
+        try:
+            router = MVPCommandRouter(manager)
+            await _route(router, "/model gpt-5.6-sol ultra")
+            accepted = await manager.accept_inbound(
+                _envelope("bind ultra", message_id="bind-ultra"),
+                create_task=True,
+            )
+            assert accepted.task is not None
+            conversation_id = accepted.task.conversation_id
+            assert await manager.store.set_task_thread(
+                accepted.task.task_id,
+                thread_id="native-ultra-thread",
+            )
+            assert await manager.store.get_thread_binding(
+                conversation_id,
+                mode_id=accepted.task.mode_id,
+                profile_version=accepted.task.profile_version,
+                policy_version=accepted.task.policy_version,
+            ) == "native-ultra-thread"
+
+            rendered = await _route(router, "/model effort default")
+
+            assert "- **Reasoning effort:** `model default` (default)" in rendered
+            assert (await _selection(manager))["reasoning_effort"] == ""
+            assert runtime.reset_calls == [
+                (conversation_id, "gpt-5.6-sol", "")
+            ]
+            assert await manager.store.get_thread_binding(
+                conversation_id,
+                mode_id=accepted.task.mode_id,
+                profile_version=accepted.task.profile_version,
+                policy_version=accepted.task.policy_version,
+            ) is None
+            future = await manager.accept_inbound(
+                _envelope("after default", message_id="after-default"),
+                create_task=True,
+            )
+            assert future.task is not None
+            assert future.task.thread_id is None
+            assert future.task.reasoning_effort == ""
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_incompatible_model_switch_forgets_the_sticky_ultra_thread(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        manager, runtime = _manager_for(tmp_path / "runtime.sqlite")
+        await manager.start()
+        try:
+            scope = {
+                "channel": "wechat",
+                "bot_id": "bot",
+                "external_user_id": "user",
+                "session_id": "default",
+                "agent_id": "codex",
+            }
+            await manager.set_model(
+                "gpt-5.6-sol",
+                reasoning_effort="ultra",
+                **scope,
+            )
+            accepted = await manager.accept_inbound(
+                _envelope("bind ultra", message_id="bind-before-luna"),
+                create_task=True,
+            )
+            assert accepted.task is not None
+            assert await manager.store.set_task_thread(
+                accepted.task.task_id,
+                thread_id="native-ultra-thread",
+            )
+
+            selected = await manager.set_model("gpt-5.6-luna", **scope)
+
+            assert selected["model_id"] == "gpt-5.6-luna"
+            assert selected["reasoning_effort"] == ""
+            assert runtime.reset_calls == [
+                (
+                    accepted.task.conversation_id,
+                    "gpt-5.6-luna",
+                    "",
+                )
+            ]
+            assert await manager.store.get_thread_binding(
+                accepted.task.conversation_id,
+                mode_id=accepted.task.mode_id,
+                profile_version=accepted.task.profile_version,
+                policy_version=accepted.task.policy_version,
+            ) is None
         finally:
             await manager.stop()
 

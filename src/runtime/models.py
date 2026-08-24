@@ -195,6 +195,13 @@ class ReplyFragmentState(StrEnum):
     INBOX_ONLY = "inbox_only"
 
 
+class ReplyAggregateState(StrEnum):
+    """Durable construction state for one bounded wire-text aggregate."""
+
+    OPEN = "open"
+    SEALED = "sealed"
+
+
 class PresentationState(StrEnum):
     UNSEEN = "unseen"
     PRESENTED = "presented"
@@ -749,6 +756,7 @@ class UserOutboxItem:
     reply_ordinal: int | None = None
     reply_candidate_id: str | None = None
     reply_fragment_id: str | None = None
+    reply_aggregate_id: str | None = None
     # The sender identity and the only permitted wire-ID fallback are
     # delivery properties, not part of ReplyTarget identity.
     from_user_id: str = ""
@@ -852,6 +860,7 @@ class ReplyFragmentRecord:
     deferred_sequence: int | None = None
     created_at: datetime | None = None
     allocated_at: datetime | None = None
+    reply_aggregate_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -869,6 +878,7 @@ class ReplySlotRecord:
     outbox_id: str | None = None
     payload: Mapping[str, Any] = field(default_factory=dict)
     created_at: datetime | None = None
+    reply_aggregate_id: str | None = None
 
     @property
     def wire_client_id(self) -> str:
@@ -886,6 +896,85 @@ class ReplyProjectionResult:
     slots: tuple[ReplySlotRecord, ...] = ()
     outbox_items: tuple[UserOutboxItem, ...] = ()
     batch_id: str | None = None
+    replayed: bool = False
+
+
+@dataclass(frozen=True)
+class ReplyAggregateRecord:
+    """One durable, bounded wire unit before or after deterministic sealing."""
+
+    reply_aggregate_id: str
+    aggregation_key_hash: str
+    aggregation_key: Mapping[str, Any]
+    origin_reply_scope_id: str
+    channel: str
+    bot_id: str
+    external_user_id: str
+    session_id: str
+    reply_target: ReplyTarget
+    provenance_kind: str
+    provenance_id: str
+    agent_id: str
+    sender_format: str
+    sender_prefix: str
+    notify_enabled: bool
+    foreground: bool
+    priority: EventPriority
+    delivery_mode: DeliveryMode
+    presentation_class: str
+    renderer_version: str
+    wire_kind: str
+    state: ReplyAggregateState
+    content: str
+    content_hash: str
+    payload_hash: str
+    character_count: int
+    first_source_sequence: int
+    last_source_sequence: int
+    representative_reply_candidate_id: str
+    task_id: str | None = None
+    execution_id: str | None = None
+    command_id: str | None = None
+    attachments: tuple[Any, ...] = ()
+    flush_due_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    sealed_at: datetime | None = None
+    seal_reason: str | None = None
+    wire_reply_fragment_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ReplyAggregateMemberRecord:
+    """Ordered source-candidate slice retained inside one wire aggregate."""
+
+    reply_aggregate_member_id: str
+    reply_aggregate_id: str
+    member_ordinal: int
+    reply_candidate_id: str
+    source_fragment_ordinal: int
+    source_reply_fragment_id: str | None
+    source_sequence: int
+    source_character_start: int
+    source_character_count: int
+    prefix_before: str
+    separator_before: str
+    rendered_content: str
+    rendered_content_hash: str
+    source_rendered_content_hash: str
+    source_rendered_character_count: int
+    aggregate_character_start: int
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ReplyAggregationResult:
+    """Idempotent result of appending, sealing, or deadline reconciliation."""
+
+    aggregates: tuple[ReplyAggregateRecord, ...] = ()
+    members: tuple[ReplyAggregateMemberRecord, ...] = ()
+    sealed_aggregates: tuple[ReplyAggregateRecord, ...] = ()
+    open_aggregate: ReplyAggregateRecord | None = None
     replayed: bool = False
 
 

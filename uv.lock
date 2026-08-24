@@ -636,6 +636,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "qrcode", extra = ["pil"] },
     { name = "requests" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "unicodedata2" },
 ]
 
@@ -652,6 +653,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
     { name = "qrcode", extras = ["pil"], specifier = ">=7.4" },
     { name = "requests", specifier = ">=2.31" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
     { name = "unicodedata2", specifier = "==15.1.0" },
 ]
 provides-extras = ["test"]

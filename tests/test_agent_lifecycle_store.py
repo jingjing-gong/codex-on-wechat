@@ -111,7 +111,7 @@ def test_migrations_24_and_25_backfill_lifecycle_and_seed_events(
             connection.execute("DROP TABLE agent_processes")
             connection.execute("DROP TABLE agent_lifecycle")
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (24, 25, 26, 27, 28, 29, 30, 31, 32)"
+                "DELETE FROM schema_migrations WHERE version IN (24, 25, 26, 27, 28, 29, 30, 31, 32, 33,34,35)"
             )
             connection.commit()
 
@@ -141,7 +141,7 @@ def test_migrations_24_and_25_backfill_lifecycle_and_seed_events(
         # Replaying a fully landed migration marker is exact and additive.
         with sqlite3.connect(path) as connection:
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (24, 25, 26, 27, 28, 29, 30, 31, 32)"
+                "DELETE FROM schema_migrations WHERE version IN (24, 25, 26, 27, 28, 29, 30, 31, 32, 33,34,35)"
             )
             connection.commit()
         replayed = SQLiteStore(path)
@@ -150,7 +150,7 @@ def test_migrations_24_and_25_backfill_lifecycle_and_seed_events(
         with sqlite3.connect(path) as connection:
             assert connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone() == (32,)
+            ).fetchone() == (35,)
             assert connection.execute(
                 "SELECT COUNT(*) FROM agent_lifecycle WHERE agent_id='disabled'"
             ).fetchone() == (1,)

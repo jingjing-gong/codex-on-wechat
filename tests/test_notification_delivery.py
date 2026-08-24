@@ -259,13 +259,11 @@ def test_completed_item_replay_preserves_initial_route_delivery_snapshot(
             assert event.source_item_type == "agentmessage"
             assert event.source_item_ordinal == 0
 
+            # Push-eligible text remains in its durable open aggregate until
+            # the terminal boundary; notification-suppressed text is retained
+            # as inbox-only. Neither path publishes an early wire message.
             initial_outbox = await store.list_outbox(limit=10)
-            assert len(initial_outbox) == expected_outbox_count
-            if initial_outbox:
-                assert (
-                    initial_outbox[0].notify_enabled,
-                    initial_outbox[0].foreground,
-                ) == expected_delivery_snapshot
+            assert initial_outbox == []
             with sqlite3.connect(path) as connection:
                 assert connection.execute(
                     "SELECT notify_enabled, foreground FROM reply_candidates"
@@ -292,7 +290,6 @@ def test_completed_item_replay_preserves_initial_route_delivery_snapshot(
             replayed_outbox = await store.list_outbox(limit=10)
             assert len(replayed_outbox) == expected_outbox_count
             if replayed_outbox:
-                assert replayed_outbox[0].outbox_id == initial_outbox[0].outbox_id
                 assert (
                     replayed_outbox[0].notify_enabled,
                     replayed_outbox[0].foreground,
@@ -412,9 +409,12 @@ def test_foreground_migration_recovers_after_partial_schema_application(tmp_path
                     28,
                     29,
                     30,
-                    31,
-                    32,
-                }
+                        31,
+                        32,
+                        33,
+                        34,
+                        35,
+                    }
         finally:
             await recovered.close()
 

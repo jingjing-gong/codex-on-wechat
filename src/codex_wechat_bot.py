@@ -43,6 +43,7 @@ from src.runtime.agent_bridge import (  # noqa: E402
     AgentBridgeCapabilityAuthority,
     AgentBridgeServer,
 )
+from src.runtime.diagnostics import configure_persistent_logging  # noqa: E402
 from src.runtime.manager import TaskManager  # noqa: E402
 from src.runtime.process_agent import ProcessAgentRuntime  # noqa: E402
 from src.runtime.media import (  # noqa: E402
@@ -54,6 +55,7 @@ from src.runtime.sqlite_store import (  # noqa: E402
     DEFAULT_MAILBOX_TTL_SECONDS,
     DEFAULT_MAX_AGENT_QUEUE,
     DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+    DEFAULT_REPLY_AGGREGATION_MAX_AGE_SECONDS,
     SQLiteStore,
 )
 from src.runtime.supervisor import (  # noqa: E402
@@ -68,6 +70,7 @@ from src.channels.wechat import (  # noqa: E402
     WeChatDeliveryWorker,
     WeChatGateway,
     WeChatMediaDeliveryWorker,
+    _bounded_public_error as _sanitize_public_error,
     _format_shell_error as _format_bounded_shell_error,
     _format_shell_markdown as _format_bounded_shell_markdown,
     send_media_delivery,
@@ -97,9 +100,6 @@ from wechat_ilink.types import (  # noqa: E402
     MESSAGE_TYPE_USER,
 )
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
 logger = logging.getLogger("codex_wechat_bot")
 
 KNOWN_COMMANDS = [
@@ -173,6 +173,12 @@ def _format_shell_result(command: str, exit_code: int, output: str) -> str:
 def _format_shell_error(message: Any) -> str:
     """Format a bounded shell failure without trusting exception text."""
     return _format_bounded_shell_error(message)
+
+
+def _public_error(value: Any) -> str:
+    """Sanitize a legacy response even though public launch uses durability."""
+
+    return _sanitize_public_error(value, max_length=512) or "operation failed"
 
 
 def run_shell_command(
@@ -269,18 +275,34 @@ def _format_models(
         is_current = current is not None and model["id"] == current.get("id")
         marker = " (current)" if is_current else ""
         marker += " [default]" if model.get("isDefault") else ""
-        lines.append(f"- {model['id']}: {model.get('displayName', '')}{marker}")
+        public_model_id = _sanitize_public_error(
+            model["id"], max_length=512
+        )
+        public_display_name = _sanitize_public_error(
+            model.get("displayName", ""), max_length=512
+        )
+        lines.append(f"- {public_model_id}: {public_display_name}{marker}")
 
-        efforts = ", ".join(_reasoning_efforts(model)) or "(not reported)"
+        efforts = ", ".join(
+            _sanitize_public_error(effort, max_length=128)
+            for effort in _reasoning_efforts(model)
+        ) or "(not reported)"
         details: list[str] = []
         default_effort = model.get("defaultReasoningEffort")
         if default_effort:
-            details.append(f"default: {default_effort}")
+            details.append(
+                "default: "
+                + _sanitize_public_error(default_effort, max_length=128)
+            )
         if is_current:
             effective_effort = configured_effort or default_effort
             if effective_effort:
                 source = "override" if configured_effort else "default"
-                details.append(f"current: {effective_effort} ({source})")
+                details.append(
+                    "current: "
+                    + _sanitize_public_error(effective_effort, max_length=128)
+                    + f" ({source})"
+                )
         suffix = f" [{', '.join(details)}]" if details else ""
         lines.append(f"  reasoning: {efforts}{suffix}")
     lines.append("use /model <model-id> <effort> to switch")
@@ -882,7 +904,10 @@ def _serve_legacy(
                             resume_saved_thread(current_conversation, session.thread_id)
                             session = sessions.current(msg.from_user_id)
                         except Exception as exc:
-                            reply = f"cannot resume session {session.session_id}: {exc}"
+                            reply = (
+                                f"cannot resume session {session.session_id}: "
+                                f"{_public_error(exc)}"
+                            )
                             send_text_reply(
                                 client, msg.from_user_id, reply, msg.context_token
                             )
@@ -916,11 +941,12 @@ def _serve_legacy(
                             )
                         except OSError as exc:
                             reply = _format_shell_error(
-                                f"shell command failed to start: {exc}"
+                                "shell command failed to start: "
+                                f"{_public_error(exc)}"
                             )
                         except Exception as exc:
                             reply = _format_shell_error(
-                                f"shell command failed: {exc}"
+                                f"shell command failed: {_public_error(exc)}"
                             )
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     logger.info(
@@ -960,7 +986,7 @@ def _serve_legacy(
                                     f"current session: {active.session_id}"
                                 )
                             except Exception as exc:
-                                reply = f"(codex error: {exc})"
+                                reply = f"(codex error: {_public_error(exc)})"
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     continue
 
@@ -974,7 +1000,7 @@ def _serve_legacy(
                         sessions.set_thread_id(msg.from_user_id, new_thread_id)
                         reply = "context cleared, starting a new conversation"
                     except Exception as exc:
-                        reply = f"(codex error: {exc})"
+                        reply = f"(codex error: {_public_error(exc)})"
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     logger.info("cleared session for %s", msg.from_user_id)
                     continue
@@ -1148,9 +1174,9 @@ def _serve_legacy(
                                     if default_effort:
                                         reply += f"\nreasoning level: {default_effort} (default)"
                     except ValueError as exc:
-                        reply = str(exc)
+                        reply = _public_error(exc)
                     except Exception as exc:
-                        reply = f"(codex error: {exc})"
+                        reply = f"(codex error: {_public_error(exc)})"
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     logger.info(
                         "model command for %s: %r", msg.from_user_id, arg or "<show>"
@@ -1167,7 +1193,7 @@ def _serve_legacy(
                             agent.get_reasoning_effort(current_conversation),
                         )
                     except Exception as exc:
-                        reply = f"(codex error: {exc})"
+                        reply = f"(codex error: {_public_error(exc)})"
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     logger.info("listed models for %s", msg.from_user_id)
                     continue
@@ -1275,7 +1301,7 @@ def _serve_legacy(
                     )
                     save_current_thread(msg.from_user_id, current_conversation)
                 except Exception as exc:
-                    reply = f"(codex error: {exc})"
+                    reply = f"(codex error: {_public_error(exc)})"
                     send_text_reply(client, msg.from_user_id, reply, msg.context_token)
                     logger.exception("codex chat failed for %s", msg.from_user_id)
 
@@ -1562,6 +1588,16 @@ def _run_owned_durable(
         for value in os.environ.get("CODEX_WECHAT_SKILL_ROOTS", "").split(os.pathsep)
         if value.strip()
     )
+    allowed_codex_config_profiles = tuple(
+        value.strip()
+        for value in os.environ.get(
+            "CODEX_WECHAT_ALLOWED_CONFIG_PROFILES",
+            "qwen",
+        )
+        .replace(",", os.pathsep)
+        .split(os.pathsep)
+        if value.strip()
+    )
     turn_timeout_text = os.environ.get("CODEX_WECHAT_TURN_TIMEOUT", "")
     try:
         turn_timeout = float(turn_timeout_text) if turn_timeout_text else None
@@ -1577,6 +1613,14 @@ def _run_owned_durable(
     mailbox_ttl_seconds = _nonnegative_environment_number(
         "CODEX_WECHAT_MAILBOX_TTL", DEFAULT_MAILBOX_TTL_SECONDS
     )
+    reply_aggregation_max_age_seconds = _nonnegative_environment_number(
+        "CODEX_WECHAT_REPLY_AGGREGATION_MAX_AGE",
+        DEFAULT_REPLY_AGGREGATION_MAX_AGE_SECONDS,
+    )
+    if reply_aggregation_max_age_seconds <= 0:
+        raise RuntimeError(
+            "CODEX_WECHAT_REPLY_AGGREGATION_MAX_AGE must be positive"
+        )
     if max_agent_queue > max_global_queue:
         raise RuntimeError(
             "CODEX_WECHAT_MAX_AGENT_QUEUE cannot exceed "
@@ -1613,6 +1657,9 @@ def _run_owned_durable(
             max_agent_queue=max_agent_queue,
             max_global_queue=max_global_queue,
             mailbox_ttl_seconds=mailbox_ttl_seconds,
+            reply_aggregation_max_age_seconds=(
+                reply_aggregation_max_age_seconds
+            ),
         )
         try:
             # Migrate without touching abandoned work.  The next transaction
@@ -1701,7 +1748,9 @@ def _run_owned_durable(
                 # the manager persists/restores its immutable profile while
                 # the static `codex` runtime remains the transport template.
                 allow_dynamic_agents=True,
+                allowed_codex_config_profiles=allowed_codex_config_profiles,
                 require_process_isolation=True,
+                workspace_root=workspace_path,
             )
             agent_bridge = AgentBridgeServer(
                 manager,
@@ -2022,4 +2071,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    log_path = configure_persistent_logging()
+    logger.info("persistent runtime log: %s", log_path)
     main()

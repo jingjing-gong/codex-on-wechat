@@ -22,8 +22,10 @@ import logging
 import math
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import threading
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from types import MappingProxyType
@@ -85,7 +87,11 @@ from src.runtime.media import (
 )
 from src.runtime.identity import conversation_id, scoped_id
 from src.runtime.models import USER_REPLY_FORMAT_AGENT_PREFIX_V1
-from src.runtime.store import QueueFullError
+from src.runtime.store import (
+    QueueFullError,
+    WORKING_DIRECTORY_RESPONSE_MAX_CHARS,
+    format_working_directory_response,
+)
 from src.runtime.roles import (
     RoleValidationError,
     is_default_role_token,
@@ -140,9 +146,19 @@ COMMAND_REGISTRY = (
             ),
             CommandRegistryEntry("reset", "/reset", "Alias for `/clear`"),
             CommandRegistryEntry(
+                "compact",
+                "/compact",
+                "Compact the active conversation while preserving context",
+            ),
+            CommandRegistryEntry(
+                "cd",
+                "/cd [path]",
+                "Show or change the current Agent's working directory",
+            ),
+            CommandRegistryEntry(
                 "sh",
                 "/sh <command>",
-                "Run a bounded shell command in the bot workspace",
+                "Run a bounded shell command in the current Agent's workspace",
             ),
             CommandRegistryEntry(
                 "skills",
@@ -180,7 +196,7 @@ COMMAND_REGISTRY = (
             CommandRegistryEntry("agents", "/agents", "List Agents"),
             CommandRegistryEntry(
                 "agent",
-                "/agent [agent-id]",
+                "/agent [agent-id] [profile]",
                 "Show, switch, or create the front Agent",
             ),
             CommandRegistryEntry(
@@ -314,7 +330,7 @@ _SHELL_TIMEOUT = 30
 _LIST_TRUNCATION_MARKER = "_... (list truncated)_"
 _CONTENT_TRUNCATION_MARKER = "... (content truncated)"
 _MAX_PUBLIC_ID = 256
-_MAX_PUBLIC_TEXT = 512
+_MAX_PUBLIC_TEXT = WORKING_DIRECTORY_RESPONSE_MAX_CHARS
 _MAX_EFFORT_NAME = 96
 _MAX_EFFORT_LIST = 1024
 _WECHAT_REPLY_TEXT_LIMIT = 3_000
@@ -2131,7 +2147,10 @@ def _format_task(record: Any) -> str:
     status = str(_value(record, "status", "state", default="unknown") or "unknown")
     agent_id = str(_value(record, "agent_id", default="") or "")
     attempts = _value(record, "attempts", "attempt", default=None)
-    error = str(_value(record, "last_error", "error", default="") or "")
+    error = _bounded_public_error(
+        _value(record, "last_error", "error", default=""),
+        max_length=_MAX_PUBLIC_TEXT,
+    )
     suffix = f" agent={agent_id}" if agent_id else ""
     if attempts is not None:
         suffix += f" attempts={attempts}"
@@ -2148,19 +2167,110 @@ def _task_state(record: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _normalized_public_text(value: Any) -> str:
+    """Flatten public text and remove invisible control obfuscation."""
+
+    without_escapes = _ANSI_ESCAPE_PATTERN.sub("", str(value or ""))
+    cleaned = "".join(
+        " "
+        if character.isspace()
+        else ""
+        if unicodedata.category(character).startswith("C")
+        else character
+        for character in without_escapes
+    )
+    return " ".join(cleaned.split()).replace("`", "'")
+
+
 def _bounded_public_value(value: Any, *, max_length: int) -> str:
     """Normalize one public catalog field without allowing it to own a reply."""
 
-    normalized = " ".join(str(value or "").split()).replace("`", "'")
+    normalized = _normalized_public_text(value)
     if len(normalized) <= max_length:
         return normalized
     return normalized[: max(0, max_length - 3)].rstrip() + "..."
 
 
+_ANSI_ESCAPE_PATTERN = re.compile(
+    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\)|"
+    r"\x1b\[[0-?]*[ -/]*[@-~]|"
+    r"\x9b[0-?]*[ -/]*[@-~]|"
+    r"\x1b[@-Z\\-_])"
+)
+_PUBLIC_ERROR_URL_PATTERN = re.compile(
+    r"(?i)\b[a-z][a-z0-9+.-]*://[^\s,)\]}>\"']+"
+)
+_PUBLIC_ERROR_AUTH_SCHEME_PATTERN = re.compile(
+    r'''(?i)(?<![\w-])(?:"(?:bearer|basic)"|'(?:bearer|basic)'|'''
+    r'''(?:bearer|basic))(?:\s*[:=]\s*|\s+)'''
+    r'''(?:"[^\"]*"|'[^']*'|\[[^\]]*\]|<[^>]*>|\([^)]*\)|'''
+    r'''\{[^}]*\}|[^\s,;)\]}>]+)'''
+)
+_PUBLIC_ERROR_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(?<![\w-])[\"']?"
+    r"((?:[a-z0-9][a-z0-9_-]{0,63})?(?:"
+    r"api[_-]?key|authorization|credential|password|secret|token))"
+    r"[\"']?\s*[:=]\s*"
+    r'''(?:"[^\"]*"|'[^']*'|\[[^\]]*\]|<[^>]*>|\([^)]*\)|'''
+    r'''\{[^}]*\}|[^\s,;)\]}>]+)'''
+)
+_PUBLIC_ERROR_HOST_PATTERN = re.compile(
+    r"(?i)(?<![\w@/.-])(?:"
+    r"\[(?=[0-9a-f:.%]*:)[0-9a-f:.]+(?:%[a-z0-9_.-]+)?\]|"
+    r"localhost|"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+[a-z]{2,63}|"
+    r"(?:\d{1,3}\.){3}\d{1,3}"
+    r")(?::\d{1,5})?(?:/[^\s,)\]}>\"']*)?"
+)
+
+
+def _bounded_public_error(value: Any, *, max_length: int) -> str:
+    """Render an actionable exception without exposing transport secrets."""
+
+    normalized = _normalized_public_text(value)
+    normalized = _PUBLIC_ERROR_URL_PATTERN.sub("<redacted-url>", normalized)
+    normalized = _PUBLIC_ERROR_AUTH_SCHEME_PATTERN.sub(
+        "<redacted-authorization>", normalized
+    )
+    normalized = _PUBLIC_ERROR_ASSIGNMENT_PATTERN.sub(
+        lambda match: f"{match.group(1)}=<redacted>", normalized
+    )
+    normalized = _PUBLIC_ERROR_HOST_PATTERN.sub(
+        "<redacted-host>", normalized
+    )
+    return _bounded_public_value(normalized, max_length=max_length)
+
+
+def _working_directory_path(
+    value: Any,
+    *,
+    fallback: str | Path | None = None,
+) -> tuple[str | Path, str]:
+    """Return a validated facade path and its display representation."""
+
+    raw_path = _value(value, "path", default=None)
+    if raw_path is None and not isinstance(value, Mapping):
+        raw_path = value
+    if raw_path is None:
+        raw_path = fallback
+    if not isinstance(raw_path, (str, Path)):
+        raise ValueError("working directory response has no path")
+    display_path = str(raw_path)
+    if not display_path.strip():
+        raise ValueError("working directory response has no path")
+    return raw_path, display_path
+
+
+def _format_working_directory(path: Any) -> str:
+    """Render one bounded, single-line working-directory acknowledgement."""
+
+    return format_working_directory_response(path)
+
+
 def _format_model_capability_error(action: str, exc: ValueError) -> str:
     """Return one bounded line for an expected model capability rejection."""
 
-    detail = _bounded_public_value(exc, max_length=_MAX_PUBLIC_TEXT)
+    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
     return f"cannot {action} model: {detail or 'invalid model selection'}"
 
 
@@ -2550,15 +2660,15 @@ def _format_model_selection_markdown(
     default_effort = _model_default_effort(selected) if selected is not None else ""
     effective_effort = configured_effort or default_effort or "model default"
     effort_source = "override" if configured_effort else "default"
-    public_agent_id = _bounded_public_value(
+    public_agent_id = _bounded_public_error(
         agent_id,
         max_length=_MAX_PUBLIC_ID,
     )
-    public_model_id = _bounded_public_value(
+    public_model_id = _bounded_public_error(
         selected_id or "runtime default",
         max_length=_MAX_PUBLIC_ID,
     )
-    public_effort = _bounded_public_value(
+    public_effort = _bounded_public_error(
         effective_effort,
         max_length=_MAX_EFFORT_NAME,
     )
@@ -2586,18 +2696,18 @@ def _format_models_markdown(
         "## Models",
         "",
         "**Current Agent:** `"
-        + _bounded_public_value(agent_id, max_length=_MAX_PUBLIC_ID)
+        + _bounded_public_error(agent_id, max_length=_MAX_PUBLIC_ID)
         + "`",
         "",
     ]
     entries: list[tuple[str, bool]] = []
     if not records:
         if configured_model:
-            model_id = _bounded_public_value(
+            model_id = _bounded_public_error(
                 configured_model,
                 max_length=_MAX_PUBLIC_ID,
             )
-            effective_effort = _bounded_public_value(
+            effective_effort = _bounded_public_error(
                 configured_effort or "model default",
                 max_length=_MAX_EFFORT_NAME,
             )
@@ -2614,7 +2724,7 @@ def _format_models_markdown(
                 (
                     "- **`runtime default`** **(current)** **(unavailable)**. "
                     "Efforts: not reported; current effort: "
-                    f"`{_bounded_public_value(configured_effort or 'model default', max_length=_MAX_EFFORT_NAME)}` "
+                    f"`{_bounded_public_error(configured_effort or 'model default', max_length=_MAX_EFFORT_NAME)}` "
                     f"({'override' if configured_effort else 'default'}).",
                     True,
                 )
@@ -2622,7 +2732,7 @@ def _format_models_markdown(
         return _bounded_catalog_markdown(prefix, entries)
     for record in records:
         raw_model_id = _model_id(record) or "unknown"
-        model_id = _bounded_public_value(
+        model_id = _bounded_public_error(
             raw_model_id,
             max_length=_MAX_PUBLIC_ID,
         )
@@ -2630,7 +2740,7 @@ def _format_models_markdown(
         marker = " **(current)**" if is_current else ""
         if _model_is_default(record):
             marker += " **(default)**"
-        display = _bounded_public_value(
+        display = _bounded_public_error(
             _model_display_name(record),
             max_length=_MAX_PUBLIC_TEXT,
         )
@@ -2638,7 +2748,7 @@ def _format_models_markdown(
         effort_length = 0
         efforts_truncated = False
         for raw_effort in _model_efforts(record):
-            effort = _bounded_public_value(raw_effort, max_length=_MAX_EFFORT_NAME)
+            effort = _bounded_public_error(raw_effort, max_length=_MAX_EFFORT_NAME)
             addition = len(effort) + 2 + (2 if efforts else 0)
             if effort_length + addition > _MAX_EFFORT_LIST:
                 efforts_truncated = True
@@ -2648,14 +2758,14 @@ def _format_models_markdown(
         effort_text = ", ".join(efforts) or "not reported"
         if efforts_truncated:
             effort_text += ", ..."
-        default_effort = _bounded_public_value(
+        default_effort = _bounded_public_error(
             _model_default_effort(record),
             max_length=_MAX_EFFORT_NAME,
         )
         details = f"; default effort: `{default_effort}`" if default_effort else ""
         current_effort = ""
         if is_current:
-            effective_effort = _bounded_public_value(
+            effective_effort = _bounded_public_error(
                 configured_effort or default_effort or "model default",
                 max_length=_MAX_EFFORT_NAME,
             )
@@ -2675,11 +2785,11 @@ def _format_models_markdown(
         # carry the stored selection until the user changes it.  Keeping the
         # unavailable selection visible also preserves the `/models`
         # exactly-one-current-marker contract without mutating a read command.
-        model_id = _bounded_public_value(
+        model_id = _bounded_public_error(
             configured_model,
             max_length=_MAX_PUBLIC_ID,
         )
-        effective_effort = _bounded_public_value(
+        effective_effort = _bounded_public_error(
             configured_effort or "model default",
             max_length=_MAX_EFFORT_NAME,
         )
@@ -2695,7 +2805,7 @@ def _format_models_markdown(
         # Some runtimes report a catalog without flagging a default.  There
         # is still one effective selection: the runtime's opaque default.
         # Keep it explicit instead of marking an arbitrary catalog row.
-        effective_effort = _bounded_public_value(
+        effective_effort = _bounded_public_error(
             configured_effort or "model default",
             max_length=_MAX_EFFORT_NAME,
         )
@@ -2800,26 +2910,59 @@ def _switch_back_fragment_specs(
     acknowledgement: str,
     records: Sequence[Any],
 ) -> tuple[dict[str, str], ...]:
-    """Keep every retained Agent item on its own WeChat fragment boundary."""
+    """Pack retained items into bounded terminal WeChat text messages.
+
+    Completed items remain the durable presentation/deduplication boundary,
+    but they are not forced to consume one ``SendMsg`` each.  Adjacent text is
+    joined with exactly one blank line; a long individual item is continued
+    losslessly without adding a synthetic separator inside that item.
+    """
 
     logical_items = [
         str(acknowledgement) + "\n\nunseen messages:",
         *(_format_inbox_item(record) for record in records),
     ]
     fragments: list[dict[str, str]] = []
+    current = ""
+
+    def limit_for_next_fragment() -> int:
+        return (
+            _WECHAT_REPLY_TEXT_LIMIT
+            if len(fragments) + 1 < 10
+            else _WECHAT_REPLY_TEXT_LIMIT - len(_REPLY_CONTINUATION_SUFFIX)
+        )
+
+    def seal() -> None:
+        nonlocal current
+        if current:
+            fragments.append({"kind": "text", "content": current})
+            current = ""
+
     for logical_item in logical_items:
         remaining = str(logical_item)
+        if not remaining:
+            continue
+        separator = "\n\n" if current else ""
+        limit = limit_for_next_fragment()
+        if current and len(current) + len(separator) + len(remaining) <= limit:
+            current += separator + remaining
+            continue
+        if current:
+            seal()
+        # Keep an item whole when it fits an empty message.  Only an item that
+        # is itself too large is divided; continuation chunks receive no item
+        # separator because they are still one logical source item.
         while remaining:
-            wire_ordinal = len(fragments) + 1
-            limit = (
-                _WECHAT_REPLY_TEXT_LIMIT
-                if wire_ordinal < 10
-                else _WECHAT_REPLY_TEXT_LIMIT
-                - len(_REPLY_CONTINUATION_SUFFIX)
-            )
-            piece = remaining[:limit]
-            fragments.append({"kind": "text", "content": piece})
-            remaining = remaining[len(piece) :]
+            limit = limit_for_next_fragment()
+            if len(remaining) <= limit:
+                current = remaining
+                remaining = ""
+            else:
+                fragments.append(
+                    {"kind": "text", "content": remaining[:limit]}
+                )
+                remaining = remaining[limit:]
+    seal()
     return tuple(fragments)
 
 
@@ -3086,7 +3229,16 @@ class MVPCommandRouter:
                 result = await _invoke_compatible(
                     self.manager,
                     ("list_skills", "skills"),
-                    keyword={"agent_id": active_agent, "refresh": False},
+                    keyword={
+                        **scope,
+                        "agent_id": active_agent,
+                        "refresh": False,
+                        "workspace_snapshot": (
+                            command_snapshot.get("execution_workspace")
+                            if isinstance(command_snapshot, Mapping)
+                            else None
+                        ),
+                    },
                 )
             except Exception:
                 logger.debug("skill listing unavailable", exc_info=True)
@@ -3134,13 +3286,59 @@ class MVPCommandRouter:
                         keyword={"conversation_id": envelope.conversation_id},
                     )
                 except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                    return f"cannot clear conversation: {exc}"
+                    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                    return (
+                        "cannot clear conversation: "
+                        f"{detail or 'operation failed'}"
+                    )
             except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                return f"cannot clear conversation: {exc}"
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return (
+                    "cannot clear conversation: "
+                    f"{detail or 'operation failed'}"
+                )
             # Do not expose a provider-specific thread identifier in the
             # command response; it is an implementation detail and may be
             # rotated on the next task claim.
             return "context cleared, starting a new conversation"
+
+        if name == "compact":
+            if command.args:
+                return _command_usage(name)
+            # Manual compaction belongs at the durable manager boundary so it
+            # shares the per-session control lock with route changes, model
+            # changes, and `/clear`.  The manager also owns persistence of any
+            # exact provider thread binding.
+            try:
+                result = await _invoke_compatible(
+                    self.manager,
+                    ("compact_session", "compact_conversation"),
+                    keyword={
+                        **scope,
+                        "agent_id": active_agent,
+                        "actor": envelope.external_user_id,
+                    },
+                )
+            except AttributeError:
+                return "cannot compact conversation: context compaction is unavailable"
+            except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return (
+                    "cannot compact conversation: "
+                    f"{detail or 'operation failed'}"
+                )
+            # The pinned SDK reports request acceptance before asynchronous
+            # compaction finishes.  A runtime without the public thread-read
+            # confirmation surface therefore receives a truthful "started"
+            # acknowledgement instead of a false completion claim.
+            if (
+                isinstance(result, Mapping)
+                and result.get("completion_confirmed") is False
+            ):
+                return "context compaction started"
+            # Keep the provider-specific thread identifier out of the channel
+            # acknowledgement; in-place compaction preserves that identity.
+            return "context compacted"
 
         if name == "system":
             # Role content is an exact raw-tail contract.  Consume only the
@@ -3163,7 +3361,7 @@ class MVPCommandRouter:
             try:
                 canonical = normalize_role_text(raw_tail)
             except RoleValidationError as exc:
-                detail = _bounded_public_value(exc, max_length=_MAX_PUBLIC_TEXT)
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
                 return f"invalid system role: {detail or 'invalid role'}"
 
             if not canonical:
@@ -3179,7 +3377,7 @@ class MVPCommandRouter:
                 except RoleValidationError:
                     return "cannot get system role: invalid stored role"
                 except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                    detail = _bounded_public_value(exc, max_length=_MAX_PUBLIC_TEXT)
+                    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
                     return f"cannot get system role: {detail or 'operation failed'}"
                 if role["kind"] == "default":
                     return "system role: default"
@@ -3213,10 +3411,10 @@ class MVPCommandRouter:
             except AttributeError:
                 return "system role is unavailable"
             except RoleValidationError as exc:
-                detail = _bounded_public_value(exc, max_length=_MAX_PUBLIC_TEXT)
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
                 return f"invalid system role: {detail or 'invalid role'}"
             except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                detail = _bounded_public_value(exc, max_length=_MAX_PUBLIC_TEXT)
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
                 return f"cannot set system role: {detail or 'operation failed'}"
             response = (
                 "system role: unchanged"
@@ -3251,7 +3449,8 @@ class MVPCommandRouter:
                     # A malformed or revoked persisted mode must produce a
                     # durable command response rather than escaping through
                     # the gateway and leaving the inbound command unhandled.
-                    return f"cannot get mode: {exc}"
+                    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                    return f"cannot get mode: {detail or 'operation failed'}"
                 return f"mode: {mode}"
             requested_mode = command.args[0].strip().lower()
             if requested_mode not in {"chat", "plan", "review", "execute"}:
@@ -3268,7 +3467,8 @@ class MVPCommandRouter:
                     },
                 )
             except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                return f"cannot set mode: {exc}"
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return f"cannot set mode: {detail or 'operation failed'}"
             return f"mode: {mode}"
 
         if name == "modes":
@@ -3288,7 +3488,8 @@ class MVPCommandRouter:
             except AttributeError:
                 return "mode registry is unavailable"
             except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                return f"cannot list modes: {exc}"
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return f"cannot list modes: {detail or 'operation failed'}"
             return _format_modes_markdown(
                 list(modes or ()), current_mode=str(current_mode or "")
             )
@@ -3320,26 +3521,26 @@ class MVPCommandRouter:
                     )
                 except AttributeError:
                     return "model selection is unavailable"
-                except ValidationError:
+                except ValidationError as exc:
                     logger.warning(
-                        "cannot reset model effort after invalid runtime response",
-                        exc_info=True,
+                        "cannot reset model effort after invalid runtime response: %s",
+                        _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
                     )
                     return "cannot set model: model service is unavailable"
                 except (KeyError, PermissionError):
                     return "model selection is unavailable"
                 except ValueError as exc:
                     return _format_model_capability_error("set", exc)
-                except RuntimeError:
+                except RuntimeError as exc:
                     logger.warning(
-                        "cannot reset model effort through runtime",
-                        exc_info=True,
+                        "cannot reset model effort through runtime: %s",
+                        _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
                     )
                     return "cannot set model: model service is unavailable"
-                except Exception:
+                except Exception as exc:
                     logger.warning(
-                        "cannot reset model effort through runtime",
-                        exc_info=True,
+                        "cannot reset model effort through runtime: %s",
+                        _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
                     )
                     return "cannot set model: model service is unavailable"
                 selected_model, selected_effort = _model_selection(selection)
@@ -3386,12 +3587,12 @@ class MVPCommandRouter:
                     )
             except AttributeError:
                 return "model selection is unavailable"
-            except ValidationError:
+            except ValidationError as exc:
                 action = "set" if name == "model" and command.args else "list"
                 logger.warning(
-                    "cannot %s model after invalid runtime response",
+                    "cannot %s model after invalid runtime response: %s",
                     action,
-                    exc_info=True,
+                    _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
                 )
                 return f"cannot {action} model: model service is unavailable"
             except (KeyError, PermissionError):
@@ -3399,17 +3600,25 @@ class MVPCommandRouter:
             except ValueError as exc:
                 action = "set" if name == "model" and command.args else "list"
                 return _format_model_capability_error(action, exc)
-            except RuntimeError:
+            except RuntimeError as exc:
                 action = "set" if name == "model" and command.args else "list"
-                logger.warning("cannot %s model through runtime", action, exc_info=True)
+                logger.warning(
+                    "cannot %s model through runtime: %s",
+                    action,
+                    _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
+                )
                 return f"cannot {action} model: model service is unavailable"
-            except Exception:
+            except Exception as exc:
                 # SDK transport/RPC failures are ordinary Exceptions. Convert
                 # them into a deterministic command result so the durable
                 # receipt completes and redelivery never reports an ambiguous
                 # unknown outcome. Cancellation remains outside this boundary.
                 action = "set" if name == "model" and command.args else "list"
-                logger.warning("cannot %s model through runtime", action, exc_info=True)
+                logger.warning(
+                    "cannot %s model through runtime: %s",
+                    action,
+                    _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
+                )
                 return f"cannot {action} model: model service is unavailable"
             selected_model, selected_effort = _model_selection(selection)
             if name == "models":
@@ -3426,6 +3635,88 @@ class MVPCommandRouter:
                 configured_effort=selected_effort,
             )
 
+        if name == "cd":
+            # A path is one shell-like token so quoted spaces remain usable,
+            # while the raw command remains the authority instead of the
+            # generic whitespace-normalized ``ChannelCommand.args`` tuple.
+            raw_command = str(command.raw or "")
+            match = re.match(r"^\s*/cd(?=$|\s)", raw_command, flags=re.IGNORECASE)
+            if match is None:
+                return _command_usage(name)
+            raw_tail = raw_command[match.end() :].strip()
+            if not raw_tail:
+                try:
+                    value = await _invoke_compatible(
+                        self.manager,
+                        ("get_working_directory",),
+                        keyword={
+                            **scope,
+                            "workspace_snapshot": (
+                                command_snapshot.get("execution_workspace")
+                                if isinstance(command_snapshot, Mapping)
+                                else None
+                            ),
+                        },
+                    )
+                    _cwd, display_path = _working_directory_path(value)
+                    return _format_working_directory(display_path)
+                except AttributeError:
+                    return "working directory is unavailable"
+                except Exception as exc:
+                    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                    return (
+                        "cannot get working directory: "
+                        f"{detail or 'operation failed'}"
+                    )
+
+            try:
+                path_values = shlex.split(raw_tail, posix=True)
+            except ValueError:
+                return _command_usage(name)
+            if len(path_values) != 1 or not path_values[0]:
+                return _command_usage(name)
+            requested_path = path_values[0]
+            try:
+                set_keywords = {
+                    **scope,
+                    "actor": envelope.external_user_id,
+                }
+                if command_id:
+                    set_keywords["command_id"] = str(command_id)
+                if isinstance(command_snapshot, Mapping):
+                    set_keywords["workspace_snapshot"] = command_snapshot.get(
+                        "execution_workspace"
+                    )
+                value = await _invoke_compatible(
+                    self.manager,
+                    ("set_working_directory",),
+                    positional=(requested_path,),
+                    keyword=set_keywords,
+                )
+                if not isinstance(value, Mapping):
+                    raise ValueError("invalid working directory persistence response")
+                _cwd, display_path = _working_directory_path(
+                    value,
+                    fallback=requested_path,
+                )
+                stored_response = value.get("command_response")
+                if stored_response is not None and not isinstance(
+                    stored_response, str
+                ):
+                    raise ValueError("invalid working directory persistence response")
+                response = _format_working_directory(display_path)
+                if stored_response is not None and stored_response != response:
+                    raise ValueError("invalid working directory persistence response")
+                return response
+            except AttributeError:
+                return "working directory is unavailable"
+            except Exception as exc:
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return (
+                    "cannot set working directory: "
+                    f"{detail or 'operation failed'}"
+                )
+
         if name == "sh":
             # ``ChannelCommand.args`` is intentionally whitespace-normalized
             # for most controls.  `/sh` is different: preserve the original
@@ -3440,6 +3731,33 @@ class MVPCommandRouter:
             if not command_text:
                 return _command_usage(name)
 
+            shell_cwd: str | Path | None = self.shell_cwd
+            working_directory_reader = getattr(
+                self.manager, "get_working_directory", None
+            )
+            if callable(working_directory_reader):
+                workspace_snapshot = (
+                    command_snapshot.get("execution_workspace")
+                    if isinstance(command_snapshot, Mapping)
+                    else None
+                )
+                try:
+                    directory = await _invoke_compatible(
+                        self.manager,
+                        ("get_working_directory",),
+                        keyword={
+                            **scope,
+                            "workspace_snapshot": workspace_snapshot,
+                        },
+                    )
+                    shell_cwd, _display_path = _working_directory_path(directory)
+                except Exception as exc:
+                    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                    return _format_shell_error(
+                        "cannot get working directory: "
+                        f"{detail or 'operation failed'}"
+                    )
+
             def invoke_shell() -> str:
                 # Inspect the injected helper before invoking it so a genuine
                 # TypeError raised by the command itself is not mistaken for
@@ -3447,13 +3765,13 @@ class MVPCommandRouter:
                 try:
                     signature = inspect.signature(self.shell_runner)
                 except (TypeError, ValueError):
-                    return self.shell_runner(command_text, cwd=self.shell_cwd)
+                    return self.shell_runner(command_text, cwd=shell_cwd)
                 accepts_var_kw = any(
                     parameter.kind == inspect.Parameter.VAR_KEYWORD
                     for parameter in signature.parameters.values()
                 )
                 if accepts_var_kw or "cwd" in signature.parameters:
-                    return self.shell_runner(command_text, cwd=self.shell_cwd)
+                    return self.shell_runner(command_text, cwd=shell_cwd)
                 return self.shell_runner(command_text)
 
             try:
@@ -3463,9 +3781,15 @@ class MVPCommandRouter:
                     f"shell command timed out after {_SHELL_TIMEOUT} seconds"
                 )
             except OSError as exc:
-                return _format_shell_error(f"shell command failed to start: {exc}")
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return _format_shell_error(
+                    f"shell command failed to start: {detail or 'operation failed'}"
+                )
             except Exception as exc:
-                return _format_shell_error(f"shell command failed: {exc}")
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return _format_shell_error(
+                    f"shell command failed: {detail or 'operation failed'}"
+                )
             return _format_shell_markdown(command_text, result)
 
         if name == "ask":
@@ -3529,7 +3853,8 @@ class MVPCommandRouter:
             except QueueFullError:
                 return "cannot ask Agent: queue is full"
             except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                return f"cannot ask Agent: {exc}"
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return f"cannot ask Agent: {detail or 'operation failed'}"
             resolved_task_id = _task_id(result) or task_id
             if resolved_task_id != task_id:
                 # A pre-framed legacy dedupe winner may carry a different
@@ -3584,11 +3909,12 @@ class MVPCommandRouter:
                     },
                 )
             except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                return f"cannot delete Agent: {exc}"
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return f"cannot delete Agent: {detail or 'operation failed'}"
             return f"Agent deleted: {selected}"
 
         if name == "agent":
-            if len(command.args) > 1:
+            if len(command.args) > 2:
                 return _command_usage(name)
             if not command.args:
                 try:
@@ -3609,12 +3935,16 @@ class MVPCommandRouter:
             # Agent IDs are canonicalized by the manager so routes and
             # conversation identities remain stable across casing variants.
             selected = command.args[0].strip().lower()
+            codex_config_profile = (
+                command.args[1].strip() if len(command.args) == 2 else None
+            )
             try:
                 await _invoke_compatible(
                     self.manager,
                     ("set_active_agent", "switch_agent", "set_agent"),
                     positional=(selected,),
                     keyword={
+                        "codex_config_profile": codex_config_profile,
                         "channel": envelope.channel,
                         "bot_id": envelope.bot_id,
                         "external_user_id": envelope.external_user_id,
@@ -3622,7 +3952,8 @@ class MVPCommandRouter:
                     },
                 )
             except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                return f"cannot switch Agent: {exc}"
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return f"cannot switch Agent: {detail or 'operation failed'}"
             # Only completed items retained while this Agent was in the
             # background are eligible here.  The manager deliberately keeps
             # allocated/sent history and `/recv` quota deferrals off this
@@ -3684,7 +4015,8 @@ class MVPCommandRouter:
                     keyword=scope,
                 )
             except (AttributeError, ValueError, PermissionError, RuntimeError) as exc:
-                return f"cannot set notifications: {exc}"
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return f"cannot set notifications: {detail or 'operation failed'}"
             return f"notifications: {'on' if bool(result) else 'off'}"
 
         if name == "inbox":
@@ -3747,7 +4079,11 @@ class MVPCommandRouter:
             except AttributeError:
                 return "reply continuation is unavailable"
             except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                return f"cannot receive deferred replies: {exc}"
+                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
+                return (
+                    "cannot receive deferred replies: "
+                    f"{detail or 'operation failed'}"
+                )
             outbox_items = tuple(
                 _value(projection, "outbox_items", default=()) or ()
             )
@@ -3968,6 +4304,34 @@ class WeChatGateway:
     ) -> dict[str, Any] | None:
         """Resolve a skill through a trusted runtime/SDK catalog."""
 
+        resolved_agent = str(envelope.agent_id or DEFAULT_AGENT_ID)
+        route_reader = getattr(self.runtime, "get_active_agent", None)
+        if callable(route_reader):
+            try:
+                selected = await _maybe_await(
+                    route_reader(
+                        channel=envelope.channel,
+                        bot_id=envelope.bot_id,
+                        external_user_id=envelope.external_user_id,
+                        session_id=envelope.session_id,
+                    )
+                )
+                selected = _value(selected, "agent_id", "id", default=selected)
+                if selected:
+                    resolved_agent = str(selected)
+            except Exception:
+                logger.debug(
+                    "could not resolve Agent for skill discovery",
+                    exc_info=True,
+                )
+        resolution_scope = {
+            "agent_id": resolved_agent,
+            "channel": envelope.channel,
+            "bot_id": envelope.bot_id,
+            "external_user_id": envelope.external_user_id,
+            "session_id": envelope.session_id,
+        }
+
         targets: list[Any] = []
         if self.skill_resolver is not None:
             targets.append(self.skill_resolver)
@@ -3987,7 +4351,7 @@ class WeChatGateway:
             try:
                 result = target(
                     invocation.name,
-                    agent_id=envelope.agent_id,
+                    **resolution_scope,
                     refresh=False,
                 )
             except TypeError:
@@ -4048,7 +4412,7 @@ class WeChatGateway:
             if lister is None:
                 continue
             try:
-                result = lister(agent_id=envelope.agent_id, refresh=False)
+                result = lister(**resolution_scope, refresh=False)
             except TypeError:
                 try:
                     result = lister()
@@ -4920,11 +5284,11 @@ class WeChatGateway:
                             )
                             if isinstance(fragment, Mapping)
                         )
-                        # ``/agent B`` mutates the front route before building
+                        # ``/agent B [profile]`` mutates the front route before building
                         # its acknowledgement. Resolve the route again for the
                         # delivery projection without executing the command a
                         # second time.
-                        if command.name == "agent" and len(command.args) == 1:
+                        if command.name == "agent" and command.args:
                             route_scope = {
                                 "channel": envelope.channel,
                                 "bot_id": envelope.bot_id,

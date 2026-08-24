@@ -1,16 +1,17 @@
 # Implemented Architecture
 
-This document describes the code that `./cow` actually runs as of 2026-08-16.
+This document describes the code that `./cow` actually runs as of 2026-08-17.
 It is an implemented one-process-per-Agent system: the supervisor owns WeChat,
 SQLite, routing, and delivery, while every enabled Agent owns a persistent,
 independent OS child process containing its own `CodexRuntime` and SDK client.
 An Agent is not a supervisor coroutine or thread: it has a distinct PID,
 interpreter, address space, event loop, runtime, and SDK client.
 
-The latest SQLite schema is version 32. The process cutover uses the existing
+The latest SQLite schema is version 33. The process cutover uses the existing
 durable task/mailbox claim path; v32 adds reply-candidate presentation state
-and command-receipt `response_fragments_json` without changing which process
-owns durable scheduling.
+and command-receipt `response_fragments_json`, while v33 adds scoped
+`session_agent_working_directories`. Neither changes which process owns durable
+scheduling.
 
 ## 1. Architecture at a glance
 
@@ -21,10 +22,13 @@ owns durable scheduling.
 | Agent state | One child-local asyncio loop, `CodexRuntime`, SDK client, thread cache, and execution slot per Agent |
 | Cross-Agent concurrency | Different Agent children execute concurrently |
 | Same-Agent concurrency | Task and mailbox work share one serialized Agent slot |
-| Durability | Supervisor-owned SQLite v32 with claims, leases, events, reply presentation/projection, and outboxes |
+| Durability | Supervisor-owned SQLite v33 with claims, leases, events, workspace preferences, reply presentation/projection, and outboxes |
+| Working directories | Per-session/Agent selection inside one configured confinement root; immutable per accepted task |
+| Context management | Exact-model provider discovery plus native manual/automatic compaction inside each Agent child |
 | Replies | Stable completed text items, ten sends per inbound scope, 3,000-character fragments |
 | Collaboration | Durable mailbox plus a supervisor-owned capability bridge |
 | Failure isolation | One child can be interrupted, killed, restarted, or deleted without replacing peer children |
+| Diagnostics | Owner-only rotating supervisor log with sanitized structured task lifecycle and typed provider failures |
 | Process security | Lifecycle/failure isolation, not a hostile same-UID sandbox |
 
 The production launcher contains no live `CodexRuntime`. It creates
@@ -37,8 +41,8 @@ generation, or does not become ready.
 ```mermaid
 flowchart LR
     WX[WeChat iLink service]
-    DB[(SQLite v32)]
-    FS[(Managed attachments<br/>and shared workspace)]
+    DB[(SQLite v33)]
+    FS[(Managed attachments<br/>and workspace confinement root)]
 
     subgraph SUP[./cow supervisor OS process]
         MON[Monitor main thread<br/>+ contact worker pool]
@@ -115,13 +119,15 @@ exposed through `/agents` is the dedicated leader PID and generation.
 | WeChat credentials/client, polling, typing, CDN, `SendMsg` | owns | absent |
 | SQLite connection, migrations, claims, leases, reply quotas | owns | absent |
 | Routes, Profiles, Modes, roles, model preferences, skill snapshots | resolves/persists | consumes immutable task snapshot |
+| Working-directory preferences and execution snapshots | resolves, persists, captures | validates and consumes task-local snapshot |
 | Task/mailbox scheduling | owns | executes only assigned work for its Agent |
 | `CodexRuntime` and SDK client | no live production instance | owns exactly one |
 | Provider thread bindings and active turns | no | owns privately |
+| Provider credentials and context resolver/cache | absent | owns privately |
 | Event persistence and user reply projection | owns | proposes events and waits for ACK |
 | Generated-image publication | validates and persists | proposes task-correlated artifact |
 | Agent collaboration policy/mailbox | validates and persists | calls bridge with task capability |
-| Workspace | configures shared path | accesses according to task policy |
+| Workspace confinement root | configures and validates | accesses the accepted directory according to task policy |
 
 The children receive no store, database connection, WeChat client, sender, or
 reply quota allocator. The fresh interpreter and a strict import check keep
@@ -159,7 +165,7 @@ Startup proceeds in this order:
 2. Acquire exclusive advisory locks for the database and `(channel, bot_id)`.
    Another live supervisor fails before SQLite opens.
 3. Start the supervisor asyncio loop, open SQLite, apply consecutive migrations
-   through v32, activate a new supervisor epoch, and reconcile durable state.
+   through v33, activate a new supervisor epoch, and reconcile durable state.
 4. Hydrate ready attachment metadata and create the parent-owned image publisher.
 5. Construct one unstarted `ProcessAgentRuntime` for `codex`; no SDK runtime is
    constructed in the supervisor.
@@ -208,10 +214,11 @@ sequenceDiagram
     S-->>G: accepted or idempotent replay
 
     K->>S: claim next runnable invocation + lease
-    S-->>K: immutable AgentTask snapshot
+    S-->>K: immutable AgentTask + execution_workspace snapshot
     K->>P: run(task, durable emit callback)
     P->>A: RUN over private IPC
-    A->>C: execute in child-local runtime
+    A->>A: validate workspace snapshot
+    A->>C: initialize SDK and validate again before native turn
 
     loop stable completed runtime items
         C-->>A: AgentEvent
@@ -234,7 +241,47 @@ sequenceDiagram
 ```
 
 Commands remain in the supervisor and never enter this RUN path. `/sh` is a
-bounded supervisor-owned subprocess, not Agent work.
+bounded supervisor-owned subprocess, not Agent work, but it runs in the front
+Agent's working-directory snapshot captured when the command was accepted.
+
+### Working-directory selection and execution snapshots
+
+`CODEX_WECHAT_WORKSPACE` is a canonical confinement root, not merely the
+default cwd. Schema v33 stores a root-relative selection plus target
+device/inode identity for each `(channel, bot, user, session, Agent)`. `/cd`
+with no path reads that selection; `/cd <path>` changes only that scope.
+Quoted paths support spaces, and relative paths resolve from the current
+selection. The directory must already exist, be enterable, and resolve inside
+the root; canonical and symlink escapes fail closed. The mutation and command
+receipt complete atomically and persist across restart and switch-back.
+
+Acceptance freezes `execution_workspace` with canonical root/path values and
+root/target device and inode identities. Queued and running tasks retain it,
+so later `/cd` changes only future work. The destination Agent child validates
+the snapshot before SDK or network work and again before the native turn. A
+missing, moved, replaced, or identity-changed root/target fails closed. The
+runtime passes task-local cwd values and never calls process-global
+`os.chdir()` or restarts an Agent for `/cd`.
+
+If the selected target becomes stale, task and cwd-consuming command paths
+fail closed. The supervisor can still persist cwd-independent controls without
+a workspace snapshot, allowing an absolute in-root `/cd` to repair the scope.
+
+For backward compatibility, a legacy durable task without an
+`execution_workspace` continues in that Agent's configured default working
+directory. The device/inode-pinned fail-closed guarantee therefore applies to
+snapshotted and newly accepted work.
+
+Validation is repeated immediately before an SDK/native turn and before the
+supervisor launches `/sh`. Those pathname-based APIs do not provide an open
+directory-descriptor (`dirfd`) contract, so a residual TOCTOU window remains
+between final validation and path consumption.
+
+Explicit `/ask` tasks resolve the destination Agent's selection for the
+originating user/session, not the front/source Agent's selection. Agent-to-Agent
+mailbox turns use the same destination-scoped rule. Dynamic Agent retirement
+clears only that Agent's mutable directory preferences; immutable task/history
+rows and their accepted snapshots remain.
 
 ## 7. Scheduling and real cross-Agent concurrency
 
@@ -273,10 +320,20 @@ mode, Profile version, policy version, and role version/hash.
 
 ### Create and switch
 
-`/agent <id>` canonicalizes the ID, restores or creates a dynamic Profile,
+`/agent <id> [profile]` canonicalizes the ID, validates an optional Codex
+config filename stem, restores or creates a dynamic Profile,
 constructs a new process proxy, persists definitions, starts the child, and
 proves its live unique PID before committing the new route. A failure leaves
 the old route unchanged.
+
+The immutable Profile stores only `codex_config_profile`, never TOML contents
+or provider credentials. The child resolves the base configuration plus
+`$CODEX_HOME/<profile>.config.toml`, passes the selected model/provider subset
+over its private app-server stdio channel on both thread start and resume, and
+merges the provider's bounded `/models` IDs with Codex `model/list`. Unknown
+provider models receive no invented effort or modality capabilities. A
+one-argument switch preserves an existing binding; an explicit conflicting
+binding is rejected before process or route mutation.
 
 Switching changes future ingress and never reads or sends provider transcripts,
 task/event history, conversation history, mailbox contents, or thread caches.
@@ -302,7 +359,8 @@ than being rendered as empty text by `/agent`.
 affected routes. The manager then stops and reaps the exact dynamic child while
 its proxy is still registered. Only proven cleanup permits unregistering the
 last handle. Immutable Profiles, tasks, events, reply rows, and conversations
-remain.
+remain. Only that Agent's mutable working-directory preferences are cleared;
+accepted task snapshots remain immutable history.
 
 The process-local registry may retain those historical Profile values, including
 their pre-retirement `enabled` snapshot. Dynamic definition publication is
@@ -336,8 +394,8 @@ JSON payload
 ```
 
 Supported flows include ready, run, event/ack, result, interrupt/ack, stop,
-ping, model/skill discovery, skill resolution, session reset, generated-image
-publication, and bridge-capability use.
+ping, model/skill discovery, skill resolution, session reset/compaction,
+generated-image publication, and bridge-capability use.
 
 Wire conversion accepts only JSON-safe scalars, finite numbers, string-keyed
 mappings, bounded sequences, dates, paths, enums, and explicit domain
@@ -354,6 +412,30 @@ Model and effort setters are intentionally not child controls. The supervisor
 persists those preferences and places them in every future immutable task.
 Model/skill listing and conversation reset do require child RPC because they
 consult or mutate that Agent's private SDK/runtime state.
+
+### Context discovery and compaction
+
+`/compact` remains a supervisor command. Under the session control lock,
+`TaskManager` resolves the captured/current Agent plus its exact conversation,
+mode, Profile/policy versions, role, model, and workspace. It rejects active
+work, a mismatched conversation, or a missing durable thread binding before
+calling the selected process proxy. The correlated control reaches only that
+Agent child, which invokes the native SDK compaction on the same provider
+thread. The binding and durable task/event history remain unchanged.
+
+Each child also owns a `ProviderModelContextResolver`. It reads the effective
+Codex configuration and queries the configured provider's exact-model detail
+and list endpoints. Valid provider context extensions are authoritative. If a
+catalog omits them—as the OpenAI-compatible catalog contract permits—the
+resolver uses `model_context_window` only when effective configuration selects
+that exact model. It never derives or invents a limit from the model name.
+
+When a window is resolved, thread start/resume receive native context and
+automatic-compaction settings with a total-token threshold at 80% of the
+window, capped by any lower valid advertised/configured threshold. The TTL
+cache is isolated per child and keyed by provider/base URL/exact model and
+fallback. Provider credentials are consumed only in that child; neither
+credentials nor secret-bearing provider responses cross IPC or enter logs.
 
 ## 10. Parent-owned callbacks
 
@@ -459,6 +541,11 @@ Model/effort preferences are durable future-task fields. Effort names are
 capability-driven, so `ultra` appears and is accepted only for models that
 advertise it.
 
+Context-window discovery is separate because catalog context fields are
+provider extensions. Exact-model validated metadata, or an exact effective
+configuration fallback, drives native 80% automatic compaction. `/compact`
+uses the current binding in the owning child and preserves its thread/history.
+
 Skill discovery also runs in the selected child. The supervisor normalizes and
 persists descriptors; task ingress pins the exact trusted bundle path/version/
 hash and fails if those bytes later conflict.
@@ -466,10 +553,11 @@ hash and fails if those bytes later conflict.
 ## 13. Persistence and recovery
 
 SQLite owns all correctness-critical state: inbound deduplication, command
-receipts, Profiles/Modes, Agent lifecycle, routes, roles, tasks/executions,
-events, mailbox invocations, thread bindings, attachments, reply candidates/
-fragments/scopes/slots, and delivery outboxes. IPC wakeups and child memory are
-never durable truth.
+receipts, Profiles/Modes, Agent lifecycle, routes, roles, session/Agent
+working-directory preferences, tasks/executions and their immutable workspace
+snapshots, events, mailbox invocations, thread bindings, attachments, reply
+candidates/fragments/scopes/slots, and delivery outboxes. IPC wakeups and child
+memory are never durable truth.
 
 Task claims carry worker and claim-token leases. Event append, thread binding,
 terminal completion, admission release, and mailbox transitions are conditional
@@ -522,7 +610,9 @@ The process architecture materially isolates runtime lifecycle and failure:
 - WeChat/SQLite survive a single child crash.
 
 It is not a hostile-code confidentiality boundary. Children normally share a
-Unix UID and workspace, and current modes allow network/commands. The leader
+Unix UID and configured workspace root, and current modes allow network/commands.
+Every selected cwd is canonically confined to that root, but same-UID processes
+can still reach overlapping files. The leader
 arms Linux parent-death `SIGKILL`, and normal/lost-child cleanup kills its
 process group. Arbitrary descendants that deliberately escape that group are
 not guaranteed to die if the supervisor itself receives `SIGKILL`.
@@ -538,7 +628,7 @@ startup prerequisite.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CODEX_WECHAT_DB` | user runtime DB | Supervisor SQLite path |
-| `CODEX_WECHAT_WORKSPACE` | durable workspace | Shared Agent and `/sh` workspace |
+| `CODEX_WECHAT_WORKSPACE` | durable workspace | Canonical confinement root for every Agent and `/sh` working directory |
 | `CODEX_WECHAT_ATTACHMENTS` | managed attachment directory | Binary media root |
 | `CODEX_WECHAT_AGENT_SOCKET` | beside DB | Owner-only collaboration socket |
 | `CODEX_WECHAT_SKILL_ROOTS` | empty | Trusted skill roots |
@@ -557,14 +647,17 @@ startup prerequisite.
 | `cow` | Public launcher |
 | `src/codex_wechat_bot.py` | Supervisor construction, topology gate, lifecycle order |
 | `src/runtime/process_agent.py` | Active process proxy, clean spawn bootstrap, child loop, IPC, cleanup |
-| `src/runtime/manager.py` | Routing, dynamic lifecycle, immutable task snapshots, production isolation validation |
+| `src/runtime/manager.py` | Routing, dynamic lifecycle, workspace resolution, immutable task snapshots, production isolation validation |
 | `src/runtime/registry.py` | Runtime ownership and retryable start/stop bookkeeping |
 | `src/runtime/worker.py` | Task/mailbox execution, event commit callbacks, uncertainty mapping |
 | `src/runtime/dispatcher.py` | Durable claim wakeups and compatibility serialization |
-| `src/runtime/sqlite_store.py` | SQLite v32 schema, claims, events, reply presentation/projection, recovery |
+| `src/runtime/sqlite_store.py` | SQLite v35 schema, immutable Agent config-profile bindings, scoped working-directory preferences, claims, events, reply presentation/projection, recovery |
 | `src/channels/wechat.py` | Command registry, gateway, item projection, 3,000-character replies |
 | `src/runtime/agent_bridge.py` | Task capability and local collaboration server |
 | `src/runtime/media.py` | Managed attachments and parent-owned image publication |
+| `src/agents/workspace.py` | Canonical workspace snapshots, confinement, and device/inode revalidation |
+| `src/agents/model_context.py` | Child-local exact-provider/model context discovery and auto-compaction settings |
+| `src/agents/config_profile.py` | Safe named Codex config loading and base-layer merge inside Agent children |
 | `src/agents/codex_runtime.py` | Child-local Codex SDK adapter |
 | `src/runtime/agent_process.py` | Disconnected authenticated-process foundation, not active executor |
 | `src/runtime/agent_child_runtime.py` | Disconnected direct-dispatch foundation, not active executor |
@@ -586,9 +679,20 @@ The process tests do not rely only on mocks. They prove:
   importing SQLite/channel modules;
 - generated-image relay uses the original supervisor task and ReplyTarget;
 - event acknowledgements follow callback completion;
+- `/compact` targets only the exact selected Agent binding, rejects active or
+  unbound contexts, and executes in that Agent child;
+- exact provider/model context resolution, 80% native thresholds, fallback,
+  cache isolation, and secret redaction are covered without live provider calls;
 - immediate interrupt races terminate instead of hanging;
 - capacity transfers only after child cleanup;
 - failed cleanup retains process/group/budget ownership; and
+- `/cd` scope isolation and persistence, path quoting/relative resolution,
+  root containment, symlink rejection, and atomic command receipt are tested;
+- accepted workspace snapshots survive later `/cd`, `/sh` uses its captured
+  front-Agent snapshot, and `/ask`/mailbox work selects the destination Agent's
+  directory;
+- Agent-side double validation rejects missing, moved, or replaced roots and
+  targets without a process-global cwd change; and
 - production rejects in-process runtimes and shared Agent PIDs.
 
 The final release gate is the complete pytest suite, whitespace/diff checks,

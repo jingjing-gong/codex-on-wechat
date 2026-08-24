@@ -19,6 +19,7 @@ from openai_codex import (  # noqa: E402
 )
 from openai_codex.generated.v2_all import (  # noqa: E402
     AgentMessageThreadItem,
+    ContextCompactionThreadItem,
     ImageGenerationThreadItem,
     InputModality,
     Model,
@@ -26,6 +27,7 @@ from openai_codex.generated.v2_all import (  # noqa: E402
     ReasoningEffort,
     ReasoningEffortOption,
     ThreadItem,
+    ThreadCompactStartResponse,
     Turn,
     TurnError,
     TurnStatus,
@@ -42,6 +44,7 @@ from src.agents.codex_runtime import CodexRuntime  # noqa: E402
 from src.codex_agent import CodexAgent  # noqa: E402
 from src.runtime.manager import TaskManager  # noqa: E402
 from src.runtime.registry import AgentRegistry, codex_profile  # noqa: E402
+from src.runtime.roles import implicit_default_role  # noqa: E402
 from src.runtime.skills import hash_skill_bundle  # noqa: E402
 
 
@@ -119,6 +122,12 @@ class _FakeThread:
         self.notifications = tuple(notifications)
         self.turns: list[_FakeTurn] = []
         self.start_kwargs: list[dict[str, Any]] = []
+        self.compact_calls = 0
+        self.compact_result: Any = ThreadCompactStartResponse()
+
+    async def compact(self) -> Any:
+        self.compact_calls += 1
+        return self.compact_result
 
     async def turn(
         self,
@@ -148,6 +157,46 @@ class _FakeThread:
         turn.turn_calls.append((input_value, kwargs))
         self.turns.append(turn)
         return turn
+
+
+def _compaction_snapshot(*item_ids: str) -> dict[str, Any]:
+    return {
+        "thread": {
+            "turns": [
+                {
+                    "id": "turn-history",
+                    "items": [
+                        {
+                            "root": {
+                                "id": item_id,
+                                "type": "contextCompaction",
+                            }
+                        }
+                        for item_id in item_ids
+                    ],
+                }
+            ]
+        }
+    }
+
+
+class _ReadableCompactionThread(_FakeThread):
+    def __init__(
+        self,
+        notifications: Iterable[Notification],
+        *,
+        confirm_after_start: bool,
+    ) -> None:
+        super().__init__(notifications)
+        self.confirm_after_start = confirm_after_start
+        self.read_calls: list[bool] = []
+
+    async def read(self, *, include_turns: bool = False) -> dict[str, Any]:
+        self.read_calls.append(include_turns)
+        item_ids = ["compaction-before"]
+        if self.compact_calls and self.confirm_after_start:
+            item_ids.append("compaction-after")
+        return _compaction_snapshot(*item_ids)
 
 
 class _FakeCodex:
@@ -529,6 +578,84 @@ def test_duplicate_completed_item_id_is_emitted_once_and_keeps_item_order():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("notifications", "expected_content", "expected_events"),
+    (
+        ((), "", ()),
+        (
+            (
+                {
+                    "method": "item/agentMessage/delta",
+                    "payload": {"delta": "unstable partial"},
+                },
+            ),
+            "",
+            (),
+        ),
+        (
+            (
+                {
+                    "method": "item/completed",
+                    "payload": {
+                        "item": {
+                            "type": "agentMessage",
+                            "text": "stable source-less completion",
+                        }
+                    },
+                },
+            ),
+            "stable source-less completion",
+            (("stable source-less completion", None, 0),),
+        ),
+    ),
+)
+def test_stream_disconnect_projects_only_stable_completed_items(
+    notifications,
+    expected_content,
+    expected_events,
+):
+    class DisconnectingTurn(_FakeTurn):
+        def stream(self):
+            async def produce():
+                for notification in self.notifications:
+                    yield notification
+                raise RuntimeError(
+                    "stream disconnected at provider-secret.example:8317/v1"
+                )
+
+            return produce()
+
+    class DisconnectingThread(_FakeThread):
+        async def turn(self, input_value: Any, **kwargs: Any) -> _FakeTurn:
+            self.start_kwargs.append(dict(kwargs))
+            turn = DisconnectingTurn(self.notifications)
+            turn.turn_calls.append((input_value, dict(kwargs)))
+            self.turns.append(turn)
+            return turn
+
+    async def scenario() -> None:
+        fake = _FakeCodex(())
+        fake.thread = DisconnectingThread(notifications)
+        runtime = CodexRuntime(codex=fake, cwd="/workspace")
+        events = []
+
+        result = await runtime.run(_task(), events.append)
+
+        assert result.status == "failed"
+        assert result.content == expected_content
+        assert result.error == (
+            "stream disconnected at provider-secret.example:8317/v1"
+        )
+        assert tuple(
+            (event.content, event.source_item_id, event.source_item_ordinal)
+            for event in events
+        ) == expected_events
+        assert result.events == tuple(events)
+        assert fake.thread.turns[0].interrupt_calls == 1
+
+    asyncio.run(scenario())
+
+
 def test_conflicting_completed_item_id_fails_and_interrupts_the_turn():
     async def scenario() -> None:
         fake = _FakeCodex(
@@ -763,6 +890,10 @@ def test_turn_kwargs_match_openai_codex_01444_surface():
                 "sandbox": Sandbox.full_access,
                 "cwd": "/workspace",
                 "model": "gpt-test",
+                "config": {
+                    "features": {"unified_exec": False},
+                    "tool_output_token_limit": 500,
+                },
                 "developer_instructions": runtime._mode_resolver.require(
                     "chat", 2
                 ).developer_instructions,
@@ -776,6 +907,41 @@ def test_turn_kwargs_match_openai_codex_01444_surface():
         assert turn_kwargs["cwd"] == "/workspace"
         assert turn_kwargs["model"] == "gpt-test"
         assert turn_kwargs["effort"] == "high"
+
+    asyncio.run(scenario())
+
+
+def test_thread_config_safety_override_is_required_on_start_and_resume():
+    class StartWithoutConfig:
+        async def thread_start(self, *, cwd: str) -> _FakeThread:
+            del cwd
+            raise AssertionError("incompatible thread_start must not be called")
+
+    class ResumeWithoutConfig:
+        async def thread_resume(
+            self, thread_id: str, *, cwd: str
+        ) -> _FakeThread:
+            del thread_id, cwd
+            raise AssertionError("incompatible thread_resume must not be called")
+
+    async def scenario() -> None:
+        starting = CodexRuntime(codex=StartWithoutConfig(), cwd="/workspace")
+        await starting.start()
+        with pytest.raises(
+            RuntimeError,
+            match="required thread config override",
+        ):
+            await starting._binding_for(_task())
+
+        resuming = CodexRuntime(codex=ResumeWithoutConfig(), cwd="/workspace")
+        await resuming.start()
+        with pytest.raises(
+            RuntimeError,
+            match="required thread config override",
+        ):
+            await resuming._binding_for(
+                _task(task_id="task-resume", thread_id="persisted-thread")
+            )
 
     asyncio.run(scenario())
 
@@ -895,6 +1061,290 @@ def test_forward_compatible_ultra_effort_is_forwarded_unchanged():
         turn_kwargs = fake.thread.turns[0].turn_calls[0][1]
         assert type(turn_kwargs["effort"]) is str
         assert turn_kwargs["effort"] == task.reasoning_effort == "ultra"
+
+    asyncio.run(scenario())
+
+
+def test_reset_after_ultra_starts_a_fresh_thread_for_default_effort():
+    class FreshThreadCodex:
+        def __init__(self) -> None:
+            self.threads: list[_FakeThread] = []
+
+        async def thread_start(self, **_kwargs: Any) -> _FakeThread:
+            thread = _FakeThread(_message_notifications())
+            thread.id = f"thread-{len(self.threads) + 1}"
+            self.threads.append(thread)
+            return thread
+
+    async def scenario() -> None:
+        fake = FreshThreadCodex()
+        runtime = CodexRuntime(codex=fake, cwd="/workspace")
+
+        ultra = await runtime.run(
+            _task(
+                task_id="task-ultra",
+                execution_id="execution-ultra",
+                policy_version=2,
+                reasoning_effort="ultra",
+            )
+        )
+        assert ultra.status == "completed"
+        assert ultra.thread_id == "thread-1"
+        assert fake.threads[0].turns[0].turn_calls[0][1]["effort"] == "ultra"
+
+        await runtime.reset_session("conversation-1")
+        default = await runtime.run(
+            _task(
+                task_id="task-default",
+                execution_id="execution-default",
+                policy_version=2,
+                reasoning_effort="",
+            )
+        )
+
+        assert default.status == "completed"
+        assert default.thread_id == "thread-2"
+        assert len(fake.threads) == 2
+        assert fake.threads[1].turns[0].turn_calls[0][1]["effort"] is None
+
+    asyncio.run(scenario())
+
+
+def test_compact_session_uses_native_compact_on_exact_live_binding():
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        fake.thread.compact_result = {"accepted": True}
+        runtime = CodexRuntime(codex=fake, cwd="/workspace")
+        completed = await runtime.run(_task())
+        assert completed.status == "completed"
+
+        result = await runtime.compact_session(
+            "conversation-1",
+            mode_id="chat",
+            profile_version=1,
+            policy_version=1,
+            session_role=implicit_default_role(),
+            thread_id="thread-1",
+            model="gpt-test",
+        )
+
+        assert result == {
+            "thread_id": "thread-1",
+            "compaction": {"accepted": True},
+            "completion_confirmed": False,
+        }
+        assert fake.thread.compact_calls == 1
+        assert fake.thread_resume_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_compact_session_resumes_persisted_thread_after_runtime_restart():
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        runtime = CodexRuntime(codex=fake, cwd="/workspace")
+
+        result = await runtime.compact_conversation(
+            "conversation-1",
+            mode_id="chat",
+            profile_version=1,
+            policy_version=1,
+            session_role=implicit_default_role(),
+            thread_id="thread-1",
+            model="gpt-test",
+        )
+
+        assert result == {
+            "thread_id": "thread-1",
+            "compaction": {},
+            "completion_confirmed": False,
+        }
+        assert fake.thread.compact_calls == 1
+        assert len(fake.thread_resume_calls) == 1
+        resumed_id, kwargs = fake.thread_resume_calls[0]
+        assert resumed_id == "thread-1"
+        assert kwargs["cwd"] == "/workspace"
+        assert kwargs["model"] == "gpt-test"
+
+    asyncio.run(scenario())
+
+
+def test_compact_session_confirms_new_context_compaction_via_public_read():
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        fake.thread = _ReadableCompactionThread(
+            _message_notifications(),
+            confirm_after_start=True,
+        )
+        runtime = CodexRuntime(codex=fake, cwd="/workspace")
+        completed = await runtime.run(_task())
+        assert completed.status == "completed"
+
+        result = await runtime.compact_session(
+            "conversation-1",
+            mode_id="chat",
+            profile_version=1,
+            policy_version=1,
+            session_role=implicit_default_role(),
+            thread_id="thread-1",
+            model="gpt-test",
+        )
+
+        assert result == {
+            "thread_id": "thread-1",
+            "compaction": {},
+            "completion_confirmed": True,
+        }
+        assert fake.thread.compact_calls == 1
+        assert fake.thread.read_calls == [True, True]
+
+    asyncio.run(scenario())
+
+
+def test_compaction_item_ids_accept_pinned_sdk_thread_read_shape():
+    from openai_codex.generated.v2_all import Thread, ThreadReadResponse
+
+    item = ThreadItem(
+        root=ContextCompactionThreadItem(
+            id="compaction-typed",
+            type="contextCompaction",
+        )
+    )
+    turn = Turn(
+        id="turn-with-compaction",
+        status=TurnStatus.completed,
+        items=[item],
+    )
+    # Only ``turns`` is accessed by the adapter; model_construct keeps this
+    # regression focused without inventing irrelevant thread metadata.
+    snapshot = ThreadReadResponse(thread=Thread.model_construct(turns=[turn]))
+
+    assert CodexRuntime._context_compaction_item_ids(snapshot) == frozenset(
+        {"compaction-typed"}
+    )
+
+
+def test_compact_session_has_finite_status_unknown_timeout_without_turn_timeout():
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        fake.thread = _ReadableCompactionThread(
+            _message_notifications(),
+            confirm_after_start=False,
+        )
+        runtime = CodexRuntime(
+            codex=fake,
+            cwd="/workspace",
+            turn_timeout=None,
+            compact_timeout=0.03,
+        )
+        runtime._compact_poll_interval = 0.001
+        completed = await runtime.run(_task())
+        assert completed.status == "completed"
+
+        with pytest.raises(RuntimeError, match="after start; status unknown"):
+            await runtime.compact_session(
+                "conversation-1",
+                mode_id="chat",
+                profile_version=1,
+                policy_version=1,
+                session_role=implicit_default_role(),
+                thread_id="thread-1",
+                model="gpt-test",
+            )
+
+        # Confirmation reads may be retried, but the ambiguous compaction
+        # request itself must never be issued a second time.
+        assert fake.thread.compact_calls == 1
+        assert len(fake.thread.read_calls) >= 2
+
+    asyncio.run(scenario())
+
+
+def test_compact_timeout_defaults_to_finite_value_when_turns_are_unbounded():
+    runtime = CodexRuntime(
+        codex=_FakeCodex(_message_notifications()),
+        cwd="/workspace",
+        turn_timeout=None,
+    )
+
+    assert runtime.turn_timeout is None
+    assert runtime.compact_timeout == 120.0
+
+
+def test_compact_session_without_bound_or_persisted_thread_fails_closed():
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        runtime = CodexRuntime(codex=fake, cwd="/workspace")
+
+        with pytest.raises(RuntimeError, match="no Codex thread is bound"):
+            await runtime.compact_session(
+                "conversation-1",
+                mode_id="chat",
+                profile_version=1,
+                policy_version=1,
+                session_role=implicit_default_role(),
+            )
+
+        assert fake.thread_start_calls == []
+        assert fake.thread_resume_calls == []
+        assert fake.thread.compact_calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_compact_session_rejects_active_conversation_before_provider_call():
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        runtime = CodexRuntime(codex=fake, cwd="/workspace")
+        completed = await runtime.run(_task())
+        assert completed.status == "completed"
+        runtime._active_tasks["task-active"] = _task(task_id="task-active")
+
+        with pytest.raises(RuntimeError, match="conversation is executing"):
+            await runtime.compact_session(
+                "conversation-1",
+                mode_id="chat",
+                profile_version=1,
+                policy_version=1,
+                session_role=implicit_default_role(),
+                thread_id="thread-1",
+            )
+
+        assert fake.thread.compact_calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_compact_session_fails_if_native_compaction_rotates_thread_identity():
+    class RotatingThread(_FakeThread):
+        async def compact(self) -> Any:
+            self.compact_calls += 1
+            self.id = "rotated-thread"
+            return ThreadCompactStartResponse()
+
+    class RotatingCodex(_FakeCodex):
+        def __init__(self) -> None:
+            super().__init__(_message_notifications())
+            self.thread = RotatingThread(_message_notifications())
+
+    async def scenario() -> None:
+        fake = RotatingCodex()
+        runtime = CodexRuntime(codex=fake, cwd="/workspace")
+        completed = await runtime.run(_task())
+        assert completed.status == "completed"
+
+        with pytest.raises(RuntimeError, match="identity conflicts"):
+            await runtime.compact_session(
+                "conversation-1",
+                mode_id="chat",
+                profile_version=1,
+                policy_version=1,
+                session_role=implicit_default_role(),
+                thread_id="thread-1",
+            )
+
+        assert fake.thread.compact_calls == 1
+        assert runtime.get_thread_id("conversation-1", mode_id="chat") is None
 
     asyncio.run(scenario())
 

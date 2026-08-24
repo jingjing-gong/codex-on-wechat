@@ -219,7 +219,9 @@ def test_ask_prefixes_one_stable_item_before_chunking_and_replay(tmp_path):
                 await store.list_outbox(limit=10),
                 key=lambda item: item.reply_ordinal or 0,
             )
-            assert len(before_completion) == 4
+            # Two full aggregates seal immediately at the size boundary; the
+            # final short continuation remains open until task completion.
+            assert len(before_completion) == 3
             acknowledgement = before_completion[0]
             assert acknowledgement.reply_ordinal == 1
             assert acknowledgement.content == f"Agent task queued: {task_id}"
@@ -229,10 +231,11 @@ def test_ask_prefixes_one_stable_item_before_chunking_and_replay(tmp_path):
                 item for item in before_completion if item.task_id == task_id
             ]
             assert fragments[0].event_id == event.event_id
-            rendered = "planner: " + raw
-            assert [len(item.content) for item in fragments] == [3000, 3000, 1]
-            assert "".join(item.content for item in fragments) == rendered
-            assert "".join(item.content for item in fragments).count("planner: ") == 1
+            assert [len(item.content) for item in fragments] == [3000, 3000]
+            assert all(item.content.startswith("planner: ") for item in fragments)
+            assert "".join(
+                item.content.removeprefix("planner: ") for item in fragments
+            ) == raw[: 2991 * 2]
 
             await store.complete_task(
                 task_id,
@@ -241,8 +244,9 @@ def test_ask_prefixes_one_stable_item_before_chunking_and_replay(tmp_path):
                 claim_token=claim.claim_token,
                 execution_id=claim.execution_id,
             )
-            # A retried terminal callback is also harmless and must not add a
-            # second prefix or another set of fragments.
+            # A retried terminal callback is also harmless and must not add
+            # another set of aggregates or duplicate any aggregate-local
+            # sender prefix.
             await store.complete_task(
                 task_id,
                 status="completed",
@@ -262,11 +266,17 @@ def test_ask_prefixes_one_stable_item_before_chunking_and_replay(tmp_path):
             assert [len(item.content) for item in replayed_fragments] == [
                 3000,
                 3000,
-                1,
+                19,
             ]
-            replayed = "".join(item.content for item in replayed_fragments)
-            assert replayed == rendered
-            assert replayed.count("planner: ") == 1
+            assert all(
+                item.content.startswith("planner: ")
+                for item in replayed_fragments
+            )
+            replayed = "".join(
+                item.content.removeprefix("planner: ")
+                for item in replayed_fragments
+            )
+            assert replayed == raw
         finally:
             await manager.stop()
 

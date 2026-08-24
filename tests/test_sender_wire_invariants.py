@@ -157,7 +157,7 @@ def test_unscoped_event_persists_sender_and_initialize_repairs_v19_row(
         with sqlite3.connect(path) as connection:
             assert connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone() == (32,)
+            ).fetchone() == (35,)
             connection.execute(
                 "UPDATE user_outbox SET from_user_id='' WHERE outbox_id=?",
                 (outbox_id,),

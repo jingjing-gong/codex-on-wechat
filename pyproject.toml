@@ -13,6 +13,7 @@ dependencies = [
     "pycryptodome>=3.19",
     "qrcode[pil]>=7.4",
     "openai-codex==0.144.4",
+    "tomli>=2.0; python_version < '3.11'",
     "unicodedata2==15.1.0",
 ]
 

@@ -7,11 +7,19 @@ process plus one persistent, fresh-interpreter Agent process for every enabled
 Agent. Process separation is required for lifecycle, concurrency, and failure
 isolation; it is not presented as a hostile-code security sandbox.
 
-The current durable schema is version 32. Version 32 adds a presentation cursor
+The current durable schema is version 33. Version 32 adds a presentation cursor
 to item-based reply candidates and persists command-receipt
 `response_fragments_json`. Its migration marks every older candidate presented,
 so enabling switch-back presentation can never reinterpret a pre-v32 transcript
-as unread output.
+as unread output. Version 33 adds `session_agent_working_directories` for
+durable user/session/Agent working-directory selections.
+
+The bounded WeChat wire-aggregation design in section 8.3 is the next planned
+schema revision, v34; it is not implemented by the current v33 runtime. Version
+34 adds durable aggregation groups and ordered source-item membership while
+migrating every older fragment/outbox as a sealed singleton. It never
+reinterprets already sent, quota-deferred, or inbox-only history as a new
+multi-item aggregate.
 
 ## 1. Command contract
 
@@ -26,9 +34,11 @@ as unread output.
 - Every supported inbound command is durably accepted before its effect or
   acknowledgement. Redelivery reuses the same receipt and presentation.
 - Mutations for one `(channel, bot, user, session)` are serialized so route,
-  role, mode, model, and task snapshots cannot observe half-applied changes.
+  role, mode, model, working directory, and task snapshots cannot observe
+  half-applied changes.
 - Command replies use the same ten-send reply scope, explicit destination, and
-  3,000-character fragmentation rules as Agent replies.
+  3,000-character wire limit as Agent replies. Planned v34 applies terminal
+  wire aggregation before allocating those sends.
 - `/clear` and `/reset` are public aliases. `/listskill` and `/listskills` are
   supported help-hidden compatibility aliases of `/skills`.
 - `/execute`, `/interrupt`, `/commands`, `/listmodel`, `/listmodels`, and the
@@ -47,7 +57,9 @@ combined `/model` line rather than several overlapping commands.
 | `/help` | Render the generated command registry. |
 | `/clear` | Start a fresh conversation for the current session and front Agent. |
 | `/reset` | Public alias of `/clear`. |
-| `/sh <command>` | Run one bounded supervisor-owned shell command in the workspace. |
+| `/compact` | Compact the exact current Agent/session provider context in place. |
+| `/cd [path]` | Show or change the current Agent's working directory. |
+| `/sh <command>` | Run one bounded supervisor-owned shell command in the front Agent's accepted working directory. |
 | `/skills` | List enabled skills for the front Agent. |
 | `$<skill> <task description>` | Queue a task with an immutable skill snapshot. |
 
@@ -102,12 +114,28 @@ combined `/model` line rather than several overlapping commands.
   runtime only after cleanup, and preserves records for audit/retry decisions.
 - Recreating a deleted ID creates a fresh lifecycle identity and child process;
   it does not adopt the old process or provider-thread cache.
+- `/cd` with no path shows the front Agent's selected working directory.
+  `/cd <path>` changes it only for the exact channel, bot, user, session, and
+  Agent. A quoted path may contain spaces, and a relative path resolves from
+  that Agent's current selection.
+- `/cd` accepts only an existing, enterable directory canonically contained by
+  `CODEX_WECHAT_WORKSPACE`. A symlink or canonical-path escape fails closed.
+  The selection is durable across restart and switching away and back; it does
+  not call process-global `os.chdir()` or restart an Agent child.
 - `/ask` is requested output even when the destination is not the front Agent.
   Each nonblank completed text item is rendered as `sender: message`, where
-  `sender` is the canonical Agent that produced the item.
+  `sender` is the canonical Agent that produced the item. Its task uses the
+  destination Agent's selected working directory for the originating session,
+  not the front/source Agent's directory.
 - `/system` affects future tasks for the exact user/session/Agent. A changed
   role rotates the conversation binding. It cannot grant permissions and is
   never an edit of the administrator-owned Agent Profile.
+- `/compact` resolves the front Agent and exact current conversation, mode,
+  Profile/policy versions, role, model, and workspace under the per-session
+  control lock. It rejects an active conversation or missing durable thread
+  binding before provider work. Native compaction preserves the provider thread
+  and never deletes durable task/event history; `/clear` remains the command
+  for starting a fresh conversation.
 - `/model` accepts `ultra`, `max`, and future effort names only when the chosen
   model advertises them. `default` clears the override without guessing.
 - `/cancel` commits the durable cancellation request before asking the owning
@@ -145,9 +173,9 @@ Each Agent child owns its own:
 - provider thread bindings, model/effort compatibility caches, active turns,
   interrupt state, and skill cache.
 
-No live object above is shared between Agents. Agent children may share the
-configured workspace and Unix user, so simultaneous execute-mode tasks can
-still conflict at the filesystem level.
+No live object above is shared between Agents. Agent children share the
+configured confinement root and Unix user, so simultaneous execute-mode tasks
+can still conflict when their selected directories overlap.
 
 The supervisor alone constructs and accesses SQLite, the WeChat client,
 delivery workers, reply quotas, and durable routes. Children are not given a
@@ -251,7 +279,8 @@ SDK-independent value objects.
 Required protocol behavior:
 
 - The child sends `ready` only after its runtime and SDK client start.
-- A parent `run` carries one immutable task snapshot for the exact child Agent.
+- A parent `run` carries one immutable task snapshot for the exact child Agent,
+  including its accepted `execution_workspace`.
 - The child may continue reading priority `interrupt` and `stop` controls while
   a run is active.
 - One child accepts only one run at a time.
@@ -263,6 +292,9 @@ Required protocol behavior:
   fail the child generation closed.
 - IPC and callback waits are bounded; payload nesting, numbers, mapping keys,
   and maximum encoded bytes are validated.
+- Session compaction is a correlated control call sent only to the selected
+  Agent child. Provider configuration, credentials, and context-cache entries
+  never cross IPC.
 
 Two supervisor-owned capabilities are relayed without moving their owners into
 the child:
@@ -292,7 +324,8 @@ version. Consequently:
 - changing role/policy creates a new binding rather than resuming under changed
   instructions;
 - queued/running tasks retain the route, conversation, role, mode, model,
-  effort, skill, media, and reply target accepted with that task; and
+  effort, skill, media, working-directory snapshot, and reply target accepted
+  with that task; and
 - a child restart can resume a durable provider thread ID but never adopts a
   different Agent's cache.
 
@@ -324,6 +357,48 @@ any candidate with allocated, sent, failed/ambiguous, mixed-state, or
 `deferred_quota` output. In particular, `/recv` exclusively owns
 quota-deferred fragments. An attachment-only candidate remains unseen for a
 surface that can represent it; `/agent` never renders it as empty text.
+
+### 6.2 Working-directory selection and execution snapshots
+
+`CODEX_WECHAT_WORKSPACE` is the canonical confinement root for every Agent
+working directory, not merely a default cwd. Schema v33 stores one root-relative
+preference and target device/inode identity for each
+`(channel, bot, user, session, Agent)`. `/cd` query and mutation use that exact
+scope, and a mutation plus its command-receipt completion commit atomically.
+
+At task acceptance, the supervisor resolves the destination Agent's preference
+and stores an immutable `execution_workspace` containing canonical root/path
+values and root/target device and inode identities. Queued and running work
+keeps that accepted snapshot; a later `/cd` affects only future work. The
+selected root and target must already exist, be enterable, and remain
+canonically inside the configured root.
+
+The Agent child validates the snapshot before SDK/client or network work and
+again immediately before the native turn. A missing, moved, replaced, or
+identity-changed root or target fails closed instead of silently changing cwd.
+Selection is task-local: `/cd` never calls process-global `os.chdir()` and does
+not restart a child process.
+
+A stale selected directory does not poison the control plane: cwd-dependent
+tasks, `/sh`, skill discovery, `/cd` queries, and relative `/cd` fail closed, while
+cwd-independent commands and an absolute `/cd` to a valid in-root directory
+remain available for recovery.
+
+For backward compatibility, a legacy durable task without an
+`execution_workspace` continues in that Agent's configured default working
+directory. The device/inode-pinned fail-closed guarantee therefore applies to
+snapshotted and newly accepted work.
+
+Validation is repeated immediately before an SDK/native turn and before the
+supervisor launches `/sh`. Those pathname-based APIs do not provide an open
+directory-descriptor (`dirfd`) contract, so a residual TOCTOU window remains
+between final validation and path consumption.
+
+`/sh` remains a supervisor command and runs with the front Agent snapshot
+captured when that command was accepted. Explicit `/ask` work uses the
+destination Agent's selection for the originating user/session scope. Durable
+Agent-to-Agent mailbox work uses the same destination-scoped rule rather than
+inheriting the sending Agent's directory.
 
 ## 7. Profiles, modes, system roles, models, and skills
 
@@ -383,14 +458,40 @@ supervisor runtime cache.
 Efforts are capability-driven, not hard-coded. `ultra` is enabled exactly for
 models that advertise it. Unsupported model/effort pairs change nothing.
 
-### 7.5 Skills
+### 7.5 Context windows and compaction
+
+Context discovery and native compaction belong to the selected Agent child.
+The child reads Codex's effective configuration, then queries the configured
+provider's same-origin model detail/list endpoints for an exact, case-sensitive
+model ID. Only validated context-window extensions are accepted; ordinary
+OpenAI-compatible catalogs are allowed to omit them.
+
+For a resolved window, thread start and resume receive model-specific native
+Codex settings. The total-token auto-compaction threshold is
+`floor(context_window * 0.80)`, or a lower validated provider/configured
+threshold. If provider metadata is absent, `model_context_window` is a fallback
+only when the effective configuration selects that exact model. Otherwise no
+window is invented and native Codex configuration/catalog behavior remains
+authoritative.
+
+Resolution uses a child-local TTL cache keyed by provider, base URL, exact
+model, and effective fallback. Agent processes never share the cache. Provider
+credentials are read and used only inside the child, are never logged, and do
+not cross IPC.
+
+Manual `/compact` uses the same exact mode/Profile/policy/role binding as the
+current session. The supervisor rejects active or unbound contexts, then the
+owning child invokes native SDK compaction in place. The provider thread ID and
+durable history are preserved; another Agent process cannot be targeted.
+
+### 7.6 Skills
 
 The selected Agent process discovers skills, while the supervisor persists
 canonical descriptors and immutable bundle hashes. `$<skill>` acceptance
 snapshots the exact skill version/path/hash. Changed or missing bytes fail
 closed rather than silently substituting another skill.
 
-## 8. WeChat ingress, typing, and item-based replies
+## 8. WeChat ingress, typing, item identity, and bounded aggregation
 
 ### 8.1 Ingress and typing
 
@@ -406,9 +507,12 @@ does not reject an otherwise valid durable message.
 
 ### 8.2 Stable item boundary
 
-Replies are item-based. A stable completed runtime item is reply-eligible when
-it is an Agent message containing nonblank text. Deltas, reasoning, tool calls,
-status updates, and aggregate terminal text do not create extra replies.
+Reply eligibility, identity, ordering, and deduplication are item-based. A
+stable completed runtime item is reply-eligible when it is an Agent message
+containing nonblank text. Deltas, reasoning, tool calls, status updates, and
+aggregate terminal text do not create extra candidates. One durable source
+item is not necessarily one WeChat `SendMsg`: compatible text candidates may
+be combined only by the wire-aggregation stage defined below.
 
 Identity prefers the SDK item ID and falls back to a deterministic ordinal
 within the task execution. Replaying the same identity with the same canonical
@@ -417,41 +521,128 @@ notification snapshot fails closed. This prevents the former
 `reply candidate identity conflicts: notify_enabled, foreground` failure from
 being caused by mutable route/notification state during replay.
 
-### 8.3 Atomic switch-back acknowledgement
+Aggregation never erases the source boundary. Every rendered byte remains
+traceable to an ordered candidate/member record, so replay, sender attribution,
+inbox presentation, notification policy, and audit continue to operate on
+stable completed items even when the wire uses fewer messages.
+
+### 8.3 Durable bounded wire aggregation (planned schema v34)
+
+The newer `origin/main` implementation provides the behavioral reference: it
+buffers completed Agent-message text, inserts `\n\n` between items, and flushes
+on size, elapsed time, or turn completion before sending terminal messages.
+This design adopts that buffer-before-send ordering, but not its process-local
+per-user buffer, 2,500-character transport limit, event-driven pseudo-timer, or
+tenth-message truncation. Aggregation here is SQLite-backed, exact-scope, and
+uses the existing 3,000-character wire limit.
+
+An open text aggregate is keyed by all immutable properties that could change
+meaning or delivery:
+
+- origin reply scope and full reply target, including channel, bot, user,
+  session, source identity, and context token;
+- aggregation provenance: the exact task and execution for live output, or the
+  exact command receipt for newly rendered command output;
+- producing Agent and sender-prefix format/version;
+- foreground/background class, notification snapshot, priority, delivery
+  mode, presentation class, and renderer version; and
+- text-only wire kind.
+
+Different users, sessions, Agents, commands, notification classes, or
+renderers never share an aggregate. Live output never crosses its source task
+or execution. A `/agent` or `/inbox` command may pack eligible candidates from
+several historical source tasks only inside that exact immutable command
+receipt; the resulting presentation aggregate still preserves every candidate
+identity and source boundary. `/recv` never repacks or combines its already
+sealed aggregates. Media and adapter-defined bundles are hard barriers.
+Notification-suppressed `inbox_only` candidates remain individually unseen
+until an explicit presentation command selects them.
+
+The deterministic packer applies sender rendering first, orders members by
+their stable source ordinal, and inserts exactly two newline characters
+between different source items. Continuations of one long item are lossless
+and receive no artificial item separator. Packing measures the final rendered
+WeChat text in Python characters. Appending content that would exceed 3,000
+seals the largest complete prefix and continues in another aggregate; no text
+is truncated or silently dropped.
+
+An open aggregate is sealed and made eligible for quota allocation when any of
+these conditions occurs:
+
+- it reaches the 3,000-character hard boundary;
+- 120 seconds have elapsed since its first unflushed member;
+- its task becomes completed, failed, interrupted, cancelled, or orphaned;
+- media, a bundle, or any aggregation-key change must preserve source order;
+  or
+- an explicit command, `/agent` switch-back, `/inbox`, or `/recv` response is
+  ready. Command and drain responses never wait for the timer.
+
+The max-age deadline is durable and serviced by a real scheduled/reconciliation
+path; it is not checked only when another item arrives. Event/candidate insert
+and aggregate membership commit together. Terminal task projection and sealing
+of its remaining text commit together. Concurrent deadline and terminal
+flushes must converge on one immutable aggregate ID, member list, rendered
+content, and payload hash. Only sealed aggregates can obtain a reply slot or
+outbox row. Once sealed, membership and content never change; retries reuse the
+same `client_id` and exact terminal `MESSAGE_STATE_FINISH` payload.
+
+Schema v34 adds durable aggregate and ordered membership records containing the
+exact grouping key, state (`open` or `sealed`), renderer version, content hash,
+first/last source sequence, `flush_due_at`, and seal timestamps. Reply-slot and
+outbox allocation points to a sealed aggregate, while membership maps every
+source candidate/fragment to that aggregate in order. Startup restores due open
+groups; replay cannot append a member twice. The migration wraps each pre-v34
+wire fragment in a sealed one-member aggregate while preserving its slot,
+client ID, outbox, delivery state, and deferred FIFO position.
+
+### 8.4 Atomic switch-back acknowledgement
 
 `/agent` selects eligible destination-Agent candidates without marking them.
 It renders them under `unseen messages:` and stores their candidate IDs,
-complete response text, and item-local `response_fragments_json` specification
-in the durable command receipt. Selection alone therefore cannot lose a reply
-if command projection fails.
+complete response text, item-local boundaries, and the deterministic sealed
+aggregate specification in the durable command receipt. Schema v34 persists
+this as `response_aggregates_json` while retaining the older fragment field for
+receipt compatibility. Selection alone therefore cannot lose a reply if
+command projection fails.
 
-Projecting the command response outbox and changing the selected candidates to
-`presentation='presented'` happen in one SQLite transaction. A validation or
-projection failure leaves both effects uncommitted. Crash/redelivery reuses the
-immutable command receipt, response fragments, presentation IDs, and outbox;
-it does not rerun the selector against newer state or mark a different set.
+Projecting every sealed command aggregate and changing all of its selected
+member candidates to `presentation='presented'` happen in one SQLite
+transaction. A validation or projection failure leaves both effects
+uncommitted. Crash/redelivery reuses the immutable command receipt, aggregate
+membership, presentation IDs, content, and outbox; it does not rerun the
+selector against newer state or mark a different set.
 
 The acknowledgement header and each unseen text item retain separate logical
-fragment boundaries. Each boundary is split at 3,000 Python characters. The
-resulting command response uses the new `/agent` inbound message's normal
-ten-slot scope. Overflow from that newly rendered command response may itself
-become `deferred_quota` and later belongs to `/recv`. This does not make an
+membership boundaries, but adjacent rendered text may share one wire aggregate
+when the complete result stays within 3,000 characters. The resulting command
+response uses the new `/agent` inbound message's normal ten-slot scope.
+Overflow from that newly rendered command response may itself become a sealed
+`deferred_quota` aggregate and later belongs to `/recv`. This does not make an
 excluded source candidate eligible: a source candidate that already contains
-a `deferred_quota` fragment is never selected in the first place.
+allocated, sent, mixed-state, or `deferred_quota` material is never selected in
+the first place.
 
-### 8.4 Ten-send quota and 3,000-character chunks
+### 8.5 Ten-send quota and 3,000-character aggregates
 
 Each accepted user message opens one durable reply scope containing at most ten
-logical `SendMsg` identities. Command acknowledgements, Agent text items,
-media, and retries of an already allocated send share those ten slots.
+logical `SendMsg` identities. Command acknowledgements, sealed Agent text
+aggregates, media, and retries of an already allocated send share those ten
+slots. Aggregation and sealing happen before quota allocation, so several
+compatible source items can spend one slot while retaining all member IDs.
 
-Each text item is split into fragments of at most 3,000 Python characters.
-Fragments retain source item identity and ordinal. At most ten are allocated to
-the current scope; overflow is stored FIFO as `deferred_quota` and is delivered
-through later `/recv` scopes. A failed or ambiguous send never recycles its
+Each sealed text aggregate contains at most 3,000 final rendered Python
+characters. At most ten text aggregates/media sends are allocated to the
+current scope; overflow is stored FIFO as `deferred_quota`. `/recv` moves those
+already sealed aggregates into a later scope without reordering, crossing task
+boundaries, or recombining them. A failed or ambiguous send never recycles its
 ordinal.
 
-### 8.5 Sender and destination
+If the final available slot includes a `/recv` continuation notice, the notice
+and its separators count toward the same 3,000-character bound. Any body text
+displaced by that suffix is sealed at the head of the deferred FIFO; it is
+never truncated or dropped.
+
+### 8.6 Sender and destination
 
 Every channel send specifies the destination user explicitly rather than
 relying on ambient contact state. Durable rows retain the full reply target,
@@ -459,17 +650,23 @@ including channel, bot, external user, session, source message/sequence, and
 optional context token.
 
 Explicit `/ask` results and Agent-to-Agent correlated answers include the
-producing Agent prefix in text: `sender: message`. General foreground replies
-retain their normal item text while still carrying the durable producing
-Agent identity.
+producing Agent prefix in text: `sender: message`. Prefix rendering happens
+before packing and counts toward the 3,000-character bound. A live aggregate
+never crosses producing Agents, so several compatible items from one `/ask`
+render as `sender: first\n\nsecond`, not repeated ambiguous sender changes.
+Multi-Agent command views keep an explicit prefix at each producer boundary.
+General foreground replies retain their normal item text while still carrying
+the durable producing Agent identity.
 
-### 8.6 Notifications and delivery
+### 8.7 Notifications and delivery
 
 Foreground replies and explicit `/ask` output are push-eligible regardless of
 `/notify`. Background output is either pushed when enabled or retained for
-`/inbox`. `/inbox` selects unseen items; `/recv` drains only quota-deferred
-fragments. Text and media sends use durable outboxes, stable wire IDs, bounded
-retry, and explicit unknown-outcome states.
+`/inbox`. Aggregation never lets notification-suppressed/background content
+piggyback on a foreground or push-eligible aggregate. `/inbox` selects unseen
+item candidates; `/recv` drains only sealed quota-deferred aggregates. Text and
+media sends use durable outboxes, stable wire IDs, bounded retry, and explicit
+unknown-outcome states.
 
 ## 9. Agent-to-Agent collaboration
 
@@ -481,6 +678,8 @@ the active immutable policy.
 Mailbox scheduling rules:
 
 - the destination Agent's child executes the mailbox turn;
+- the invocation uses that destination Agent's working directory for the
+  originating user/session scope, never the source Agent's directory;
 - task and mailbox work share the same one-invocation Agent slot and FIFO;
 - mailbox conversations are destination/request-scoped and never reuse a user
   conversation or session role;
@@ -493,9 +692,13 @@ different processes.
 
 ## 10. Persistence, recovery, and deletion
 
-SQLite owns inbound deduplication, commands, Profiles/Modes, routes, roles,
-tasks, executions, events, mailboxes, attachments, reply candidates/fragments,
-reply slots, and delivery outboxes. IPC is never the durable source of truth.
+Current v33 SQLite owns inbound deduplication, commands, Profiles/Modes,
+routes, roles, session/Agent working-directory preferences, tasks and their
+immutable execution-workspace snapshots, executions, events, mailboxes,
+attachments, reply candidates/fragments, reply slots, and delivery outboxes.
+Planned v34 additionally owns open/sealed wire aggregates, ordered membership,
+and durable flush deadlines. IPC and process-local aggregation buffers are
+never the durable source of truth.
 
 One supervisor epoch and filesystem ownership locks prevent concurrent owners
 of the database/account. Startup recovery runs only after the new epoch is
@@ -509,12 +712,14 @@ is interrupted/cancelled according to the durable state.
 
 Deletion is retirement, not erasure. `/delagent` redirects routes, rejects new
 work for the retired incarnation, reaps the exact child, and retains historical
-rows. Process-local historical Profile snapshots may remain cached for audit,
-but creating another Agent publishes definitions only for that selected Agent;
-it must never republish an unrelated retired Profile's stale `enabled` value.
-Global startup likewise omits detached tombstoned history while retaining
-strict validation for explicitly registered Agents. Recreating the same string
-ID starts a new process/lifecycle context.
+rows. It clears only that Agent's mutable working-directory preferences;
+immutable task/history rows and their accepted snapshots remain. Process-local
+historical Profile snapshots may remain cached for audit, but creating another
+Agent publishes definitions only for that selected Agent; it must never
+republish an unrelated retired Profile's stale `enabled` value. Global startup
+likewise omits detached tombstoned history while retaining strict validation
+for explicitly registered Agents. Recreating the same string ID starts a new
+process/lifecycle context.
 
 ## 11. Media and generated images
 
@@ -539,18 +744,18 @@ The process design provides failure and lifecycle isolation:
 - process PIDs/generations make the boundary observable and testable.
 
 It does not provide same-UID confidentiality. Agent processes share the host,
-user account, and normally the workspace. Full hostile isolation would require
-containers/namespaces, separate credentials, brokered tools, and a delegated
-cgroup-v2 or equivalent job boundary. The existing cgroup/job modules remain
-optional hardening foundations; production process-per-Agent execution does
-not fail closed merely because a delegated cgroup is unavailable.
+user account, and configured confinement root. Full hostile isolation would
+require containers/namespaces, separate credentials, brokered tools, and a
+delegated cgroup-v2 or equivalent job boundary. The existing cgroup/job modules
+remain optional hardening foundations; production process-per-Agent execution
+does not fail closed merely because a delegated cgroup is unavailable.
 
 ## 13. Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CODEX_WECHAT_DB` | user runtime database | Canonical SQLite path; supervisor only. |
-| `CODEX_WECHAT_WORKSPACE` | durable user workspace | Workspace shared by Agent children and `/sh`. |
+| `CODEX_WECHAT_WORKSPACE` | durable user workspace | Canonical confinement root for every Agent and `/sh` working directory. |
 | `CODEX_WECHAT_ATTACHMENTS` | managed attachment root | Durable binary media directory. |
 | `CODEX_WECHAT_SKILL_ROOTS` | empty | Trusted skill bundle roots. |
 | `CODEX_WECHAT_TURN_TIMEOUT` | runtime default | Per-turn bound passed to each child runtime. |
@@ -558,6 +763,7 @@ not fail closed merely because a delegated cgroup is unavailable.
 | `CODEX_WECHAT_MAX_AGENT_QUEUE` | store default | Per-Agent unfinished invocation limit. |
 | `CODEX_WECHAT_MAX_GLOBAL_QUEUE` | store default | Global unfinished invocation limit. |
 | `CODEX_WECHAT_MAILBOX_TTL` | store default | Mailbox expiry interval. |
+| `CODEX_WECHAT_REPLY_AGGREGATION_MAX_AGE` | `120` | Planned v34 maximum seconds before nonempty compatible text is sealed for delivery. |
 
 `CODEX_WECHAT_WORKERS` is deprecated, logs a warning, and has no scheduling or
 process-count effect.
@@ -586,9 +792,40 @@ The process cutover is accepted only when tests prove all of the following:
 - foreground, pre-v32, presented, allocated/sent/mixed-state, fragmentless,
   attachment-only, and source-`deferred_quota` candidates stay off the switch
   response; command receipt/outbox replay preserves the original presentation
-  IDs and item-local fragments atomically;
-- `/ask` uses `sender: message`, text chunks are at most 3,000 characters, and
-  one inbound scope allocates no more than ten sends;
+  IDs, aggregate membership, and item-local boundaries atomically;
+- stable completed items remain independent source/deduplication records, while
+  two compatible items `first` and `second` seal as one wire message containing
+  exactly `first\n\nsecond` when the final rendering fits;
+- live aggregation never crosses reply scope, full target, task/execution,
+  producing Agent, sender format, notification/foreground class, delivery
+  mode, media, or renderer version; command presentation may cross historical
+  source tasks only within one immutable command receipt;
+- an open aggregate is durable before any outbox exists; 3,000-character,
+  120-second, media-barrier, and every terminal-task flush are lossless and
+  idempotent across restart and a concurrent deadline/terminal race;
+- source-item replay never adds duplicate membership, reply slots, or outbox
+  rows, and existing v33 sends migrate as unchanged sealed singletons;
+- `/ask` uses one unambiguous `sender: message` prefix per single-producer
+  aggregate, final text aggregates are at most 3,000 characters, and one inbound
+  scope allocates no more than ten sends;
+- the tenth-slot continuation suffix is included in the length calculation;
+  displaced body text and all later aggregates remain byte-for-byte recoverable
+  in `/recv` FIFO order;
+- media/bundle barriers preserve source order, concurrent Agents replying to
+  one user never share an aggregate, and switch-back/inbox presentation marks
+  every selected aggregate member atomically;
+- `/cd` query/set is isolated by channel, bot, user, session, and Agent;
+  quoted paths work, relative paths start at the current selection, and the
+  selection persists across restart and switch-back;
+- nonexistent, non-enterable, out-of-root, and symlink-escape directories are
+  rejected, and accepted snapshots fail closed after root/target replacement,
+  movement, or identity change;
+- queued/running work retains its immutable canonical path and root/target
+  device/inode snapshot while a later `/cd` changes only future work;
+- `/sh` uses the front Agent's accepted snapshot, while `/ask` and mailbox work
+  use the destination Agent's selection for the originating session;
+- `/cd` neither changes process-global cwd nor restarts an Agent, and retirement
+  clears only that Agent's mutable directory preferences;
 - every public launcher uses the same durable multi-process topology; and
 - focused suites, the complete pytest suite, `git diff --check`, and a safe
   `./cow --help` smoke test pass.

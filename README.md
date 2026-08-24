@@ -1,170 +1,251 @@
 # codex-on-wechat
 
-`codex-on-wechat` connects a WeChat account to a durable, multi-Agent Codex
-runtime. Messages are accepted into SQLite before execution, Agents can keep
-working in the background, and replies are delivered through a durable outbox.
+`codex-on-wechat` connects a WeChat account to Codex. Each Agent runs in its
+own Linux process, tasks survive restarts in SQLite, and different Agents can
+work concurrently.
 
-The WeChat integration uses the unofficial iLink protocol and is intended for
-personal or educational use.
+The WeChat integration uses the unofficial iLink protocol. Use it only for
+personal or educational purposes and only with trusted WeChat users.
 
 ## Quick start
 
+You need Linux, Python 3.10 or newer, internet access, a WeChat account, and a
+working Codex login.
+
+From the repository root:
+
 ```bash
+# Log in to WeChat by scanning the terminal QR code.
+./cow login
+
+# Log in to Codex separately and verify it.
+uv run codex login
+uv run codex login status
+
+# Start the bot and leave this process running.
 ./cow
 ```
 
-The launcher installs `uv` when necessary, synchronizes dependencies, and
-starts the bot. On first run, scan the terminal QR code with WeChat. Login
-credentials are stored locally and reused on later runs.
+The launcher installs `uv` with `curl` when necessary and synchronizes the
+Python dependencies. On later runs, `./cow` reuses the saved WeChat login.
+Stop the bot with `Ctrl-C`.
 
-Login or remove all saved logins without starting the bot:
+`./cow login` is only for WeChat. `uv run codex login` is for Codex. To remove
+all locally saved WeChat credentials, run `./cow logout`.
 
-```bash
-./cow login
-./cow logout
+## First use
+
+Send an ordinary WeChat message to work with the current Agent. A useful
+multi-Agent workflow is:
+
+```text
+/agent reviewer
+/system You review technical writing for accuracy.
+/agent writer
+/system You are a concise technical writer.
+Draft a release note for this project.
+/ask reviewer Review this draft: <paste the draft here>
 ```
 
-Requirements:
+To bind a new Agent to a named Codex configuration, pass its filename stem:
 
-- Python 3.10 or newer
-- A WeChat account
-- Codex authentication usable by `openai-codex`
+```text
+/agent qwen-agent qwen
+/models
+```
+
+This selects `$CODEX_HOME/qwen.config.toml`; `/models` then uses that Agent's
+provider catalog and configured default. The binding is durable and immutable:
+repeating the same selection is safe, while reusing the Agent ID with another
+profile is rejected. `/agent <id>` preserves an existing binding and uses the
+base Codex configuration for a new Agent.
+
+`/agent <id> [profile]` switches to an existing Agent or creates it. Agent IDs are
+lowercase, start with a letter, and may contain letters, digits, `-`, and `_`.
+Profile names are validated filename stems; paths and command fragments are
+rejected. Provider configuration and credentials are never included in bot
+responses or process arguments.
+Use `/system default` to clear a custom role.
+
+Agents keep separate histories, so include the necessary context in `/ask`.
+
+Switching Agents never replays conversation history. It may include unseen
+background replies produced while that Agent was not selected.
 
 ## Commands
 
-Send `/help` in WeChat for the authoritative command summary.
+Send `/help` in WeChat for the authoritative list.
 
-### Conversation
+| Command | Purpose |
+| --- | --- |
+| `/clear`, `/reset` | Start a fresh conversation for the current Agent. |
+| `/compact` | Compact the current Agent's active context without clearing its conversation. |
+| `/skills`, `$<skill> <task>` | List skills or run a task with one. |
+| `/cd [path]` | Show or change the current Agent's working directory. |
+| `/sh <command>` | Run a shell command in the current Agent's working directory, with a 30-second limit. |
+| `/status`, `/tasks [limit]` | Show active work or task history. |
+| `/cancel [task-id]` | Cancel a task, or the current running task when omitted. |
+| `/retry <task-id>` | Retry failed, orphaned, or interrupted work. |
+| `/agents`, `/agent [agent-id] [profile]` | List Agents or show/switch/create the current Agent, optionally selecting a named Codex config. |
+| `/delagent <agent-id>` | Retire a dynamically created Agent; immutable task and history records remain. |
+| `/ask <agent-id> <prompt>` | Send work to an Agent without switching to it. |
+| `/system [default\|<role>]` | Show, clear, or set the current Agent's role. |
+| `/mode [chat\|plan\|review\|execute]`, `/modes` | Show, change, or list modes. |
+| `/model`, `/models` | Show the current model or list available models and efforts. |
+| `/model <model-id> <effort\|default>` | Set the model and supported reasoning effort. |
+| `/model effort <effort\|default>` | Change or clear only the effort override. |
+| `/notify [on\|off]` | Control background notifications for the current Agent. |
+| `/inbox [agent-id\|all]` | Show unseen background replies. |
+| `/recv` | Receive replies deferred by WeChat's ten-message quota. |
 
-- `/clear` or `/reset` clears the active Agent conversation.
-- `/mode [chat|plan|review|execute]` shows or changes the current mode.
-- `/modes` lists all modes in Markdown and marks the current mode.
-- `/model [<model-id> <effort|default>|effort <effort|default>]` shows or changes the model and reasoning effort.
-- `/models` lists model effort choices in Markdown and keeps a persisted,
-  catalog-missing selection visible as current and unavailable.
-- `/skills` lists enabled skills.
-- `$<skill> <task description>` submits work with an explicit skill snapshot.
+Run `/models` before choosing efforts such as `max` or `ultra`; supported
+efforts depend on the selected model.
 
-All current modes allow command execution and network access. `chat`, `plan`,
-and `review` instruct the Agent not to modify files; `execute` also permits
-workspace changes.
+## Modes and Agent behavior
 
-Reasoning efforts are capability-gated by the live Codex model catalog rather
-than a fixed application list. Forward-compatible values such as `max` and
-`ultra` are listed and accepted only for models that advertise them; use
-`/models` to see the choices available to the current account and runtime.
+All current modes allow network access and command execution:
 
-### Tasks
+- `chat`: conversation and analysis without file changes.
+- `plan`: inspection and planning without file changes.
+- `review`: code and diff review without file changes.
+- `execute`: implementation with workspace changes allowed.
 
-- `/status` shows active work.
-- `/tasks [limit]` lists durable tasks.
-- `/retry <task-id>` creates a new attempt for failed, orphaned, or interrupted work.
-- `/cancel <task-id>` cancels the specified task owned by the current user.
-- `/cancel` interrupts the running task on the current Agent and session.
+The default production Agent starts in `execute` mode. Use `/mode` to inspect
+the current selection.
 
-`/cancel` is the only public cancellation command. There is no `/interrupt`
-command; runtime interruption is an internal operation performed only after
-the cancellation request is stored.
+Settings apply to future tasks. Already queued or running work keeps the
+Agent, role, mode, model, effort, and working-directory snapshot captured when
+it was accepted.
 
-### Agents and notifications
+Each Agent owns one persistent OS process and handles one task at a time.
+Different Agents run in parallel. An Agent may send a supervised request to
+another created Agent; the durable mailbox allows one correlated response and
+does not automatically reply to replies.
 
-- `/agents` lists registered Agents in Markdown and marks the front Agent.
-- `/agent` shows the front Agent.
-- `/agent <name>` switches to an Agent or creates a named Codex Agent context;
-  it returns only a switch confirmation and never replays prior history.
-- `/delagent <agent-id>` deletes a dynamically created Agent and routes affected
-  sessions back to the default Agent. A later `/agent <same-id>` explicitly
-  recreates it after validating its retained immutable Profile metadata.
-- `/ask <agent-id> <prompt>` sends durable work to any valid Agent without changing the front Agent.
-- `/notify [on|off]` shows or changes background notifications for the current Agent.
-- `/inbox [agent-id|all]` presents unseen Agent notifications.
-- `/recv` receives the next FIFO batch when a prior user message produced more
-  than WeChat's ten-reply allowance.
+## Context compaction
 
-An explicit `/ask` receives an immediate task acknowledgement. Its final reply
-is returned to the originating WeChat conversation even when background
-notifications for the destination Agent are disabled. Each non-empty text item
-identifies its source as `<agent-id>: <message>` before 3,000-character reply
-chunking.
+`/compact` compacts only the current Agent's exact session and provider thread.
+It preserves the thread and durable task/event history; unlike `/clear`, it
+does not start a new conversation. The command is rejected if that conversation
+is executing or has no bound provider thread.
 
-New tasks on the durable v3 Agent profile can also contact other Agents created
-with `/agent`. Codex receives a task-scoped local `list`/`send` capability; the
-command carries a short-lived, unguessable token bound to the current task
-execution. The bridge rechecks that execution, the running task's immutable
-mode, peer ACL, and request type before writing to the durable Agent mailbox.
-Repeated identical CLI sends use a stable request ID. Agent mailbox traffic is
-internal and never bypasses the user outbox to send directly to WeChat. Replies
-return to the requesting Agent's conversation without creating an automatic
-reply loop.
+Automatic compaction is model-specific. Inside its own process, each Agent
+queries the configured provider for the exact model's context window and asks
+Codex to compact at 80% of a validated window. Provider catalogs may omit this
+non-standard metadata. In that case the bot uses a context window only when the
+effective Codex configuration supplies one for the exact selected model; it
+never invents a limit. Provider credentials and the context cache remain inside
+that Agent process and never cross supervisor IPC.
 
-### Shell access
+For a provider that omits the extension, set `model` and
+`model_context_window` in the effective Codex configuration to the provider's
+documented values; an optional lower `model_auto_compact_token_limit` is
+honored. The fallback is ignored when `model` does not exactly match.
 
-`/sh <command>` executes a shell through `/bin/sh` in the configured bot
-workspace. The response is bounded and formatted as Markdown with the command,
-exit status, and fence-safe output. It has a 30-second timeout and can execute
-arbitrary host commands, so expose this bot only to trusted WeChat users.
+## Working directories
 
-## Runtime behavior
+Use `/cd` to inspect or change the current Agent's working directory:
 
-The default launcher uses the SQLite-backed durable runtime. Each accepted
-task snapshots its Agent, conversation, mode, policy, model, effort, skill,
-attachments, and reply target. Switching settings affects future tasks only.
-Work for one Agent conversation is serialized; different Agents can run
-concurrently.
-
-For every supported finished user message, the bot sends a best-effort WeChat
-typing state before command, media, or task processing. Typing failures do not
-reject the message and typing does not consume one of the ten reply slots.
-
-Text and voice messages with a non-empty channel transcript create tasks.
-Uploaded files are staged in managed storage and acknowledged without
-implicitly executing their caption.
-
-Completed Codex image-generation items are sent as native WeChat images. The
-runtime accepts the SDK's workspace-local `savedPath` or a bounded
-`data:image/...;base64` result, verifies PNG/JPEG/GIF/WebP bytes, copies them to
-managed attachment storage, and then uses the durable CDN/media worker. Paths
-outside `CODEX_WECHAT_WORKSPACE`, symlinks, spoofed image bytes, and oversized
-outputs fail closed. Delivery retries reuse the same attachment and WeChat
-reply identity.
-Task results and user deliveries survive restart. Work interrupted by an
-uncertain process exit becomes orphaned and requires explicit `/retry`.
-
-Older launch scripts may still pass `--legacy`, but it is now a deprecated
-alias for the same durable runtime. It no longer selects a separate command
-router:
-
-```bash
-uv run src/codex_wechat_bot.py --legacy
+```text
+/cd
+/cd projects/api
+/cd "projects/My App"
 ```
+
+With no path, `/cd` shows the current directory. A path changes it only for the
+current channel, bot, user, session, and Agent. Relative paths start from that
+Agent's currently selected directory. The selection is stored in SQLite, so it
+survives restarts and switching away and back. `/cd` does not change the
+supervisor's process-wide directory or restart an Agent process.
+
+Every selected path must resolve to an existing, enterable directory inside
+`CODEX_WECHAT_WORKSPACE`. This setting is a confinement root, not merely a
+default working directory. Canonical-path checks reject symlink escapes outside
+the root.
+
+When the bot accepts a task, it freezes an immutable `execution_workspace`
+snapshot with the canonical root and path plus their device/inode identities.
+Queued and running work keeps that snapshot, so a later `/cd` affects only
+future work. The Agent validates it before SDK or network work and again before
+the native turn; a missing, moved, or replaced root or directory fails closed.
+If a selected directory disappears, cwd-dependent work and relative `/cd`
+fail, while `/help`, `/agent`, and an absolute `/cd` to a valid in-root
+directory remain available for recovery.
+
+For backward compatibility, a legacy durable task without an
+`execution_workspace` continues in that Agent's configured default working
+directory. The device/inode-pinned fail-closed guarantee therefore applies to
+snapshotted and newly accepted work.
+
+Validation is repeated immediately before an SDK/native turn and before the
+supervisor launches `/sh`. Those pathname-based APIs do not provide an open
+directory-descriptor (`dirfd`) contract, so a residual TOCTOU window remains
+between final validation and path consumption.
+
+`/sh` remains supervisor-owned but uses the front Agent's workspace snapshot
+captured with that command. `/ask <agent-id>` and Agent-to-Agent mailbox work
+instead use the destination Agent's selected directory for the originating
+user and session; they do not inherit the front or sending Agent's directory.
+Retiring a dynamic Agent clears only that Agent's mutable directory selections;
+immutable tasks and history remain.
+
+## Replies and background work
+
+- The bot sends a best-effort typing state when it receives a supported message.
+- Each WeChat text reply is at most 3,000 characters.
+- One received message permits at most ten reply sends. Use `/recv` for overflow.
+- `/inbox` shows unseen background items; it does not drain `/recv` overflow.
+- `/ask` results use `sender: message` so the producing Agent is clear.
+- Tasks and pending deliveries survive a normal restart.
 
 ## Configuration
 
-The durable runtime recognizes these environment variables:
+Export configuration before starting `./cow`; this repository does not load a
+`.env` file.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CODEX_WECHAT_DB` | `~/.codex-wechat-bot/runtime.sqlite3` | SQLite runtime database |
-| `CODEX_WECHAT_ATTACHMENTS` | `~/.codex-wechat-bot/attachments` | Managed attachment root |
-| `CODEX_WECHAT_WORKSPACE` | `~/.codex-on-wechat/workspace` | Shared Codex and `/sh` working directory |
-| `CODEX_WECHAT_AGENT_SOCKET` | `<database>.agent.sock` | Owner-only local Agent mailbox bridge |
-| `CODEX_WECHAT_WORKERS` | `1` | Concurrent task workers |
-| `CODEX_WECHAT_TURN_TIMEOUT` | unset | Optional Codex turn timeout in seconds |
-| `CODEX_WECHAT_SKILL_ROOTS` | unset | Path-separated trusted skill roots |
+| `CODEX_WECHAT_DB` | `~/.codex-wechat-bot/runtime.sqlite3` | Durable SQLite database. |
+| `CODEX_WECHAT_WORKSPACE` | `~/.codex-on-wechat/workspace` | Confinement root for all Agent working directories. |
+| `CODEX_WECHAT_ATTACHMENTS` | `~/.codex-wechat-bot/attachments` | Managed uploaded/generated files. |
+| `CODEX_WECHAT_LOG` | `~/.codex-wechat-bot/logs/codex-wechat.log` | Owner-only rotating supervisor/task diagnostic log. |
+| `CODEX_WECHAT_LOG_LEVEL` | `INFO` | Persistent and console logging level. |
+| `CODEX_WECHAT_LOG_MAX_BYTES` | `20971520` | Maximum size of the active log before rotation. |
+| `CODEX_WECHAT_LOG_BACKUPS` | `5` | Number of rotated log files retained. |
+| `CODEX_WECHAT_MAX_AGENT_PROCESSES` | `16` | Maximum independent Agent processes. |
+| `CODEX_WECHAT_TURN_TIMEOUT` | unset | Optional Codex turn timeout in seconds. |
+| `CODEX_WECHAT_SKILL_ROOTS` | unset | Colon-separated trusted skill directories on Linux. |
 
-Credentials and compatibility cursor files are stored under
-`~/.codex-wechat-bot/accounts/`. Credential publication is atomic and uses
-owner-only filesystem permissions. The durable WeChat cursor is also stored in
-SQLite.
+Example:
 
-## Development
+```bash
+CODEX_WECHAT_WORKSPACE=/absolute/path/to/workspace ./cow
+```
 
-Install dependencies and run the test suite:
+`CODEX_WECHAT_WORKERS` is deprecated and ignored.
+
+## Safety and troubleshooting
+
+- `/sh` can execute arbitrary host commands. All modes also have command and
+  network access, while `execute` can modify the workspace. Use trusted users.
+- Agent processes isolate lifecycle and concurrency; they are not hostile-user
+  sandboxes. They run as the same OS account, and working-directory confinement
+  is not a general filesystem-access sandbox.
+- If Codex work cannot start, run `uv run codex login status`.
+- To inspect recent task/provider failures, run `./cow logs 300`. Structured
+  `agent_task_started` and `agent_task_terminal` records include task, Agent,
+  model, effort, duration, and typed Codex error status, but exclude prompts,
+  response bodies, request headers, and credentials.
+- To force a fresh WeChat QR login, run `./cow logout`, then `./cow login`.
+- For missing output, check `/status`, `/tasks`, `/inbox all`, and `/recv`.
+- Only one `./cow` supervisor may own a database and WeChat account at a time.
+
+## Development and design
 
 ```bash
 uv sync --extra test
 uv run pytest -q
 ```
 
-The complete architecture, invariants, state machines, and verification matrix
-are documented in [`plan.md`](plan.md).
+See [architecture.md](architecture.md) for the implemented process and data
+flow, and [plan.md](plan.md) for the complete behavior and invariants.

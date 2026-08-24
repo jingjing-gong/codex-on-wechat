@@ -8,6 +8,7 @@ explicit so a permissive mode cannot elevate a restrictive profile.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Iterable, Mapping
 
 from .modes import AgentMode
@@ -17,6 +18,28 @@ def _frozen(values: Iterable[str] | None) -> frozenset[str]:
     if isinstance(values, str):
         values = (values,)
     return frozenset(str(value).strip() for value in (values or ()) if str(value).strip())
+
+
+_CODEX_CONFIG_PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def normalize_codex_config_profile(value: Any) -> str:
+    """Return one safe Codex named-config stem.
+
+    The empty value deliberately means the ordinary base Codex config.  A
+    non-empty value is persisted as metadata and later resolved only as
+    ``$CODEX_HOME/<value>.config.toml``; paths and command fragments are not
+    part of this vocabulary.
+    """
+
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("Codex config profile must be a safe profile name")
+    normalized = value.strip()
+    if normalized and not _CODEX_CONFIG_PROFILE_RE.fullmatch(normalized):
+        raise ValueError("Codex config profile must be a safe profile name")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +75,7 @@ class AgentProfile:
     enabled: bool = True
     profile_version: int = 1
     default_mode_id: str = "chat"
+    codex_config_profile: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "responsibilities", tuple(self.responsibilities or ()))
@@ -61,6 +85,11 @@ class AgentProfile:
         object.__setattr__(self, "denied_peers", _frozen(self.denied_peers))
         object.__setattr__(self, "allowed_request_types", _frozen(self.allowed_request_types))
         object.__setattr__(self, "denied_request_types", _frozen(self.denied_request_types))
+        object.__setattr__(
+            self,
+            "codex_config_profile",
+            normalize_codex_config_profile(self.codex_config_profile),
+        )
         if self.max_child_depth < 0 or self.max_children_per_task < 0:
             raise ValueError("child limits cannot be negative")
 
@@ -97,6 +126,7 @@ class AgentProfile:
             "enabled": self.enabled,
             "profile_version": self.profile_version,
             "default_mode_id": self.default_mode_id,
+            "codex_config_profile": self.codex_config_profile,
         }
 
 

@@ -157,12 +157,14 @@ def test_v28_migrates_expiry_and_seeds_append_only_invocation_history(tmp_path):
                 "WHERE work_kind='mailbox'"
             )
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (28, 29, 30, 31, 32)"
+                "DELETE FROM schema_migrations WHERE version IN (28, 29, 30, 31, 32, 33, 34, 35)"
             )
             connection.commit()
 
         migrated = SQLiteStore(path)
-        await migrated.initialize()
+        # This regression verifies migration output, not age-dependent startup
+        # recovery of the deliberately old queued fixture.
+        await migrated.initialize(recover_startup_state=False)
         try:
             facts = await migrated._call(
                 lambda conn: {
@@ -193,9 +195,10 @@ def test_v28_migrates_expiry_and_seeds_append_only_invocation_history(tmp_path):
                     "foreign_keys": conn.execute(
                         "PRAGMA foreign_key_check"
                     ).fetchall(),
-                }
+                },
+                allow_deferred_startup=True,
             )
-            assert facts["version"] == 32
+            assert facts["version"] == 35
             assert facts["mailbox_expiry"] == facts["invocation_expiry"]
             assert facts["mailbox_expiry"] == (
                 BASE + timedelta(days=1)
@@ -211,14 +214,16 @@ def test_v28_migrates_expiry_and_seeds_append_only_invocation_history(tmp_path):
                     lambda conn: conn.execute(
                         "UPDATE agent_mailbox SET expires_at=? WHERE mailbox_id=?",
                         ((BASE + timedelta(days=2)).isoformat(), mailbox.mailbox_id),
-                    )
+                    ),
+                    allow_deferred_startup=True,
                 )
             with pytest.raises(sqlite3.IntegrityError, match="append-only"):
                 await migrated._call(
                     lambda conn: conn.execute(
                         "DELETE FROM agent_invocation_events WHERE invocation_id=?",
                         (mailbox.current_invocation_id,),
-                    )
+                    ),
+                    allow_deferred_startup=True,
                 )
         finally:
             await migrated.close()

@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
+import math
 import shlex
 import time
 import uuid
@@ -28,6 +29,15 @@ from .base import (
     EventVisibility,
     emit_if_awaitable,
 )
+from .config_profile import LoadedCodexConfigProfile, load_config_profile
+from .model_context import (
+    ModelContextResolutionError,
+    ModelContextSettings,
+    ProviderModelContextResolver,
+    list_provider_model_descriptors,
+)
+from .workspace import EXECUTION_WORKSPACE_KEY, validate_workspace_snapshot
+from src.runtime.diagnostics import safe_diagnostic_value, sanitize_diagnostic_text
 from src.runtime.media import canonical_media_input, sniff_mime
 from src.runtime.roles import (
     ROLE_PERSONA_COMPOSITION_VERSION,
@@ -53,6 +63,31 @@ except ImportError:  # pragma: no cover - only used in minimal installations
 logger = logging.getLogger(__name__)
 
 
+# The pinned Codex 0.144.4 runtime does not apply its general tool-output
+# policy to the experimental unified-exec path.  Some otherwise-valid large
+# outputs are rejected upstream before a provider turn begins, leaving the
+# thread unable to continue.  Keep this policy scoped to bot-owned threads:
+# the shell fallback enforces the cap, while agents can still page through
+# larger results with focused commands.
+CODEX_TOOL_OUTPUT_TOKEN_LIMIT = 500
+
+
+def _thread_config_overrides(
+    context_settings: ModelContextSettings | None,
+    config_profile: LoadedCodexConfigProfile | None = None,
+) -> dict[str, Any]:
+    """Return a fresh fail-safe config for one new or resumed Codex thread."""
+
+    overrides: dict[str, Any] = (
+        config_profile.thread_config() if config_profile is not None else {}
+    )
+    if context_settings is not None:
+        overrides.update(context_settings.as_config_overrides())
+    overrides["features"] = {"unified_exec": False}
+    overrides["tool_output_token_limit"] = CODEX_TOOL_OUTPUT_TOKEN_LIMIT
+    return overrides
+
+
 def default_workspace() -> str:
     """Return and create the canonical durable Codex workspace."""
 
@@ -75,6 +110,9 @@ class ThreadBinding:
     role_version: int
     role_snapshot_hash: str
     persona_composition_version: str
+    provider_id: str
+    model_id: str
+    context_config_fingerprint: str
     thread_id: str
     thread: Any
 
@@ -155,10 +193,13 @@ class CodexRuntime:
         self,
         *,
         model: str = "",
+        codex_config_profile: str = "",
         cwd: str | None = None,
         turn_timeout: float | None = 60,
+        compact_timeout: float = 120,
         codex: Any | None = None,
         codex_factory: Callable[[], Any] | None = None,
+        model_context_resolver: Any | None = None,
         mode_resolver: Callable[[str], Any] | Mapping[str, Any] | None = None,
         profile_prompt: str = "",
         managed_root: str | Path | None = None,
@@ -170,14 +211,48 @@ class CodexRuntime:
         agent_bridge_command: Sequence[str] | str | None = None,
         agent_bridge_capability_issuer: Callable[[AgentTask], str] | None = None,
     ) -> None:
-        self.model = model
+        self._loaded_config_profile = load_config_profile(codex_config_profile)
+        self.codex_config_profile = (
+            self._loaded_config_profile.name
+            if self._loaded_config_profile is not None
+            else ""
+        )
+        self.model = str(
+            model
+            or (
+                self._loaded_config_profile.model
+                if self._loaded_config_profile is not None
+                else ""
+            )
+            or ""
+        )
         self.cwd = cwd or default_workspace()
         self.turn_timeout = turn_timeout
+        try:
+            normalized_compact_timeout = float(compact_timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("compact_timeout must be a finite positive number") from exc
+        if (
+            not math.isfinite(normalized_compact_timeout)
+            or normalized_compact_timeout <= 0
+        ):
+            raise ValueError("compact_timeout must be a finite positive number")
+        self.compact_timeout = normalized_compact_timeout
+        self._compact_poll_interval = 0.25
         if codex is not None and codex_factory is not None:
             raise ValueError("pass codex or codex_factory, not both")
         self._codex = codex
         self._codex_factory = codex_factory or (lambda: AsyncCodex()) if AsyncCodex is not None else codex_factory
         self._owns_codex = codex is None
+        if model_context_resolver is not None and not (
+            callable(model_context_resolver)
+            or callable(getattr(model_context_resolver, "resolve", None))
+        ):
+            raise TypeError("model_context_resolver must be callable")
+        self._model_context_resolver = model_context_resolver
+        self._model_context_resolvers_by_cwd: dict[
+            str, ProviderModelContextResolver
+        ] = {}
         self._codex_context: Any | None = None
         self._codex_entered = False
         self._started = False
@@ -202,6 +277,9 @@ class CodexRuntime:
         self._conversation_models: dict[str, str] = {}
         self._conversation_reasoning_efforts: dict[str, str] = {}
         self._skills_cache: list[dict[str, Any]] | None = None
+        # Keep the historical direct-cache test/adapter surface associated
+        # with the configured cwd until a live catalog records another one.
+        self._skills_cache_cwd: str | None = self.cwd
         if mode_resolver is None:
             # Import application modes lazily to avoid making the Agent
             # contract depend on the runtime package during module loading.
@@ -352,6 +430,8 @@ class CodexRuntime:
                 self._streaming_task_ids.clear()
                 self._run_locks.clear()
                 self._skills_cache = None
+                self._skills_cache_cwd = None
+                self._model_context_resolvers_by_cwd.clear()
                 if self._owns_codex:
                     self._codex = None
             if errors:
@@ -436,6 +516,235 @@ class CodexRuntime:
         # next immutable task snapshot; that task owns creation of the fresh
         # correctly keyed SDK thread.
         return ""
+
+    async def compact_session(
+        self,
+        conversation_id: str,
+        *,
+        mode_id: str,
+        profile_version: int | str,
+        policy_version: int | str,
+        session_role: Mapping[str, Any],
+        thread_id: str | None = None,
+        agent_id: str | None = None,
+        model: str = "",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Compact one exact Codex thread binding with the native SDK API.
+
+        Compaction is conversation-wide execution control, so it must never
+        overlap a turn.  A live binding is preferred.  After a process restart
+        the manager may supply the persisted ``thread_id`` together with the
+        complete policy/role identity; without either source there is no
+        context to compact and starting an empty thread would be misleading.
+        """
+
+        self._assert_loop()
+        canonical_conversation_id = str(conversation_id or "").strip()
+        canonical_mode_id = str(mode_id or "").strip()
+        canonical_agent_id = str(agent_id or self.agent_id or "").strip()
+        persisted_thread_id = str(thread_id or "").strip() or None
+        if not canonical_conversation_id:
+            raise ValueError("conversation_id is required for Codex compaction")
+        if not canonical_mode_id:
+            raise ValueError("mode_id is required for Codex compaction")
+        if not str(profile_version).strip():
+            raise ValueError("profile_version is required for Codex compaction")
+        if not str(policy_version).strip():
+            raise ValueError("policy_version is required for Codex compaction")
+        if not canonical_agent_id or canonical_agent_id != str(self.agent_id):
+            raise RuntimeError("Codex compaction Agent identity conflicts")
+
+        canonical_role = validate_role_snapshot(session_role)
+        task_metadata = dict(metadata or {})
+        supplied_role = task_metadata.get("session_role")
+        if supplied_role is not None:
+            supplied_role = validate_role_snapshot(supplied_role)
+            if role_binding_key(supplied_role) != role_binding_key(canonical_role):
+                raise RuntimeError("Codex compaction role metadata conflicts")
+        task_metadata["session_role"] = canonical_role
+        task = AgentTask(
+            task_id=f"compact-{uuid.uuid4().hex}",
+            agent_id=canonical_agent_id,
+            conversation_id=canonical_conversation_id,
+            thread_id=persisted_thread_id,
+            mode_id=canonical_mode_id,
+            profile_version=profile_version,
+            policy_version=policy_version,
+            model=str(model or ""),
+            metadata=task_metadata,
+        )
+        # Validate workspace and execute-mode policy snapshots before client
+        # initialization or any provider operation.
+        task_cwd = self._cwd_for_task(task)
+        self._require_execute_policy_snapshot(task)
+        key = self._thread_key(task, session_role=canonical_role)
+        existing = self._bindings.get(key)
+        if existing is None and persisted_thread_id is None:
+            raise RuntimeError("cannot compact session: no Codex thread is bound")
+        if existing is not None and (
+            persisted_thread_id is not None
+            and persisted_thread_id != existing.thread_id
+        ):
+            raise RuntimeError(
+                "persisted Codex thread conflicts with the active binding"
+            )
+        if persisted_thread_id is not None and any(
+            other_key != key and binding.thread_id == persisted_thread_id
+            for other_key, binding in self._bindings.items()
+        ):
+            raise RuntimeError(
+                "persisted Codex thread conflicts with another active binding"
+            )
+
+        lock = self._run_locks.setdefault(
+            (canonical_conversation_id, canonical_agent_id), asyncio.Lock()
+        )
+        if lock.locked() or any(
+            active.conversation_id == canonical_conversation_id
+            for active in self._active_tasks.values()
+        ):
+            raise RuntimeError(
+                "cannot compact session while the conversation is executing"
+            )
+
+        async with lock:
+            # Recheck after taking the lock so direct runtime callers cannot
+            # win a scheduling race between the initial status test and the
+            # control operation.
+            if any(
+                active.conversation_id == canonical_conversation_id
+                for active in self._active_tasks.values()
+            ):
+                raise RuntimeError(
+                    "cannot compact session while the conversation is executing"
+                )
+            # Native compaction is an asynchronous control operation.  Its
+            # deadline must remain finite even when ordinary turns are
+            # intentionally unbounded, otherwise one child-process control
+            # slot could remain occupied forever.
+            deadline = time.monotonic() + self.compact_timeout
+            compaction_requested = False
+            try:
+                await self._await_with_deadline(self.start(), deadline)
+                binding = await self._await_with_deadline(
+                    self._binding_for(
+                        task,
+                        session_role=canonical_role,
+                        task_cwd=task_cwd,
+                    ),
+                    deadline,
+                )
+                self._require_thread_identity(binding)
+                compact = getattr(binding.thread, "compact", None)
+                if not callable(compact):
+                    raise RuntimeError(
+                        "Codex thread does not expose native compact()"
+                    )
+                read = getattr(binding.thread, "read", None)
+                baseline_compaction_ids: frozenset[str] | None = None
+                if callable(read):
+                    snapshot = await self._await_with_deadline(
+                        self._call_async(read, include_turns=True), deadline
+                    )
+                    baseline_compaction_ids = self._context_compaction_item_ids(
+                        snapshot
+                    )
+                # Mark the result as ambiguous before issuing the request: a
+                # timeout can race with the provider accepting the operation.
+                # The caller must never retry that ambiguous request.
+                compaction_requested = True
+                response = await self._await_with_deadline(
+                    self._call_async(compact), deadline
+                )
+                self._require_thread_identity(binding)
+                completion_confirmed = False
+                if baseline_compaction_ids is not None:
+                    await self._wait_for_context_compaction(
+                        read,
+                        baseline_compaction_ids,
+                        deadline,
+                    )
+                    completion_confirmed = True
+            except asyncio.TimeoutError as exc:
+                if compaction_requested:
+                    raise RuntimeError(
+                        "Codex context compaction timed out after start; "
+                        "status unknown"
+                    ) from exc
+                raise RuntimeError(
+                    "Codex context compaction timed out before start"
+                ) from exc
+        return {
+            "thread_id": binding.thread_id,
+            "compaction": self._to_dict(response) if response is not None else {},
+            "completion_confirmed": completion_confirmed,
+        }
+
+    # Name used by a few conversation-oriented manager integrations.
+    compact_conversation = compact_session
+
+    @staticmethod
+    def _context_compaction_item_ids(snapshot: Any) -> frozenset[str]:
+        """Return native compaction item IDs from a public thread read."""
+
+        def field(value: Any, *names: str) -> Any:
+            if isinstance(value, Mapping):
+                for name in names:
+                    if name in value:
+                        return value[name]
+                return None
+            for name in names:
+                if hasattr(value, name):
+                    return getattr(value, name)
+            return None
+
+        thread = field(snapshot, "thread") or snapshot
+        turns = field(thread, "turns") or ()
+        item_ids: set[str] = set()
+        for turn in turns:
+            for envelope in field(turn, "items") or ():
+                item = field(envelope, "root") or envelope
+                raw_type = field(item, "type")
+                kind = "".join(
+                    character
+                    for character in str(
+                        getattr(raw_type, "value", raw_type) or ""
+                    ).lower()
+                    if character.isalnum()
+                )
+                if kind != "contextcompaction":
+                    continue
+                item_id = field(item, "id", "item_id", "itemId")
+                if item_id is None:
+                    item_id = field(envelope, "id", "item_id", "itemId")
+                canonical_item_id = str(item_id or "").strip()
+                if canonical_item_id:
+                    item_ids.add(canonical_item_id)
+        return frozenset(item_ids)
+
+    async def _wait_for_context_compaction(
+        self,
+        read: Callable[..., Any],
+        baseline_item_ids: frozenset[str],
+        deadline: float,
+    ) -> None:
+        """Wait until a newly persisted native compaction item is visible."""
+
+        while True:
+            snapshot = await self._await_with_deadline(
+                self._call_async(read, include_turns=True), deadline
+            )
+            current_ids = self._context_compaction_item_ids(snapshot)
+            if current_ids - baseline_item_ids:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            await self._await_with_deadline(
+                asyncio.sleep(min(self._compact_poll_interval, remaining)),
+                deadline,
+            )
 
     async def chat(self, conversation_id: str, message: Any) -> str:
         chunks: list[str] = []
@@ -556,47 +865,95 @@ class CodexRuntime:
     async def list_models(self, *, include_hidden: bool = False) -> list[dict[str, Any]]:
         await self.start()
         method = getattr(self._codex, "models", None)
-        if method is None:
-            return []
-        result = await self._call_async(method, include_hidden=include_hidden)
-        pages: list[Any] = [result]
-        cursor = self._catalog_cursor(result)
-        seen_cursors: set[str] = set()
-        client = getattr(self._codex, "_client", None)
-        request = getattr(client, "request", None)
-        while cursor and cursor not in seen_cursors and request is not None:
-            seen_cursors.add(cursor)
-            try:
-                from openai_codex.generated.v2_all import (
-                    ModelListParams,
-                    ModelListResponse,
-                )
-            except ImportError:
-                break
-            try:
-                params = ModelListParams(
-                    cursor=cursor,
-                    includeHidden=include_hidden,
-                ).model_dump(mode="json", by_alias=True, exclude_none=True)
-            except (AttributeError, TypeError, ValueError):
-                # Older SDKs may expose a cursor without the generated
-                # pagination request types used by the pinned adapter. Keep
-                # compatibility detection separate from the request itself:
-                # request failures must not be mistaken for an old SDK and
-                # silently turn a complete catalog into a partial one.
-                break
-            result = await self._call_async(
-                request,
-                "model/list",
-                params,
-                response_model=ModelListResponse,
-            )
+        pages: list[Any] = []
+        if method is not None:
+            result = await self._call_async(method, include_hidden=include_hidden)
             pages.append(result)
             cursor = self._catalog_cursor(result)
+            seen_cursors: set[str] = set()
+            client = getattr(self._codex, "_client", None)
+            request = getattr(client, "request", None)
+            while cursor and cursor not in seen_cursors and request is not None:
+                seen_cursors.add(cursor)
+                try:
+                    from openai_codex.generated.v2_all import (
+                        ModelListParams,
+                        ModelListResponse,
+                    )
+                except ImportError:
+                    break
+                try:
+                    params = ModelListParams(
+                        cursor=cursor,
+                        includeHidden=include_hidden,
+                    ).model_dump(mode="json", by_alias=True, exclude_none=True)
+                except (AttributeError, TypeError, ValueError):
+                    # Older SDKs may expose a cursor without the generated
+                    # pagination request types used by the pinned adapter.
+                    break
+                result = await self._call_async(
+                    request,
+                    "model/list",
+                    params,
+                    response_model=ModelListResponse,
+                )
+                pages.append(result)
+                cursor = self._catalog_cursor(result)
 
         from src.runtime.models import iter_model_descriptors
 
-        return [self._to_dict(item) for item in iter_model_descriptors(pages)]
+        catalog = [self._to_dict(item) for item in iter_model_descriptors(pages)]
+        if self._loaded_config_profile is not None:
+            catalog.extend(
+                await list_provider_model_descriptors(
+                    self._loaded_config_profile.effective_config,
+                    include_hidden=include_hidden,
+                )
+            )
+        merged: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for record in catalog:
+            model_id = str(
+                record.get("id", record.get("model_id", record.get("model", "")))
+                or ""
+            ).strip()
+            key = model_id.casefold()
+            if not model_id or key in seen_ids:
+                continue
+            seen_ids.add(key)
+            merged.append(record)
+        # Provider discovery is best-effort, but the validated profile's
+        # explicit default remains a legitimate selectable model even when a
+        # catalog endpoint is unavailable or omits custom IDs.
+        if self._loaded_config_profile is not None and self.model:
+            key = self.model.casefold()
+            if key not in seen_ids:
+                merged.append(
+                    {
+                        "id": self.model,
+                        "displayName": self.model,
+                        "isDefault": True,
+                        "supportedReasoningEfforts": [],
+                    }
+                )
+            # The named profile is the child runtime's actual startup
+            # selection.  An SDK catalog can advertise its own unrelated
+            # default, but exposing both as defaults makes `/models` select a
+            # different current row from the model used for new threads.
+            normalized_defaults: list[dict[str, Any]] = []
+            for record in merged:
+                snapshot = dict(record)
+                record_id = str(
+                    snapshot.get(
+                        "id",
+                        snapshot.get("model_id", snapshot.get("model", "")),
+                    )
+                    or ""
+                ).strip()
+                snapshot["isDefault"] = record_id.casefold() == key
+                normalized_defaults.append(snapshot)
+            merged = normalized_defaults
+        return merged
 
     @staticmethod
     def _catalog_cursor(value: Any) -> str:
@@ -606,7 +963,12 @@ class CodexRuntime:
             cursor = getattr(value, "next_cursor", getattr(value, "nextCursor", None))
         return str(cursor or "").strip()
 
-    async def list_skills(self, *, refresh: bool = False) -> list[dict[str, Any]]:
+    async def list_skills(
+        self,
+        *,
+        refresh: bool = False,
+        cwd: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return the Codex skill catalog through the supported SDK boundary.
 
         ``openai-codex`` exposes ``SkillInput`` publicly but does not expose a
@@ -617,13 +979,22 @@ class CodexRuntime:
         the channel layer.
         """
 
-        if self._skills_cache is not None and not refresh:
+        selected_cwd = self.cwd if cwd is None else str(cwd)
+        if (
+            self._skills_cache is not None
+            and self._skills_cache_cwd == selected_cwd
+            and not refresh
+        ):
             return [dict(item) for item in self._skills_cache]
         await self.start()
         method = getattr(self._codex, "list_skills", None)
         result: Any = None
         if method is not None:
-            result = await self._call_async(method, refresh=refresh)
+            result = await self._call_async(
+                method,
+                refresh=refresh,
+                cwd=selected_cwd,
+            )
         else:
             ensure_initialized = getattr(self._codex, "_ensure_initialized", None)
             if ensure_initialized is not None:
@@ -632,6 +1003,7 @@ class CodexRuntime:
             request = getattr(client, "request", None)
             if request is None:
                 self._skills_cache = []
+                self._skills_cache_cwd = selected_cwd
                 return []
             try:
                 from openai_codex.generated.v2_all import (
@@ -640,7 +1012,7 @@ class CodexRuntime:
                 )
 
                 params = SkillsListParams(
-                    cwds=[self.cwd],
+                    cwds=[selected_cwd],
                     forceReload=bool(refresh),
                 ).model_dump(by_alias=True, exclude_none=True)
                 result = await self._call_async(
@@ -657,7 +1029,10 @@ class CodexRuntime:
                     result = await self._call_async(
                         request,
                         "skills/list",
-                        {"cwds": [self.cwd], "forceReload": bool(refresh)},
+                        {
+                            "cwds": [selected_cwd],
+                            "forceReload": bool(refresh),
+                        },
                         response_model=dict,
                     )
                 except Exception:
@@ -669,15 +1044,22 @@ class CodexRuntime:
             for skill in iter_skill_descriptors(result)
         ]
         self._skills_cache = [dict(item) for item in skills]
+        self._skills_cache_cwd = selected_cwd
         return [dict(item) for item in skills]
 
-    async def resolve_skill(self, name: str, *, refresh: bool = False) -> dict[str, Any] | None:
+    async def resolve_skill(
+        self,
+        name: str,
+        *,
+        refresh: bool = False,
+        cwd: str | None = None,
+    ) -> dict[str, Any] | None:
         """Resolve one enabled skill by case-insensitive canonical name."""
 
         from src.runtime.skills import find_skill
 
         definition = find_skill(
-            await self.list_skills(refresh=refresh),
+            await self.list_skills(refresh=refresh, cwd=cwd),
             name,
             rehash_local_bundles=True,
         )
@@ -779,12 +1161,24 @@ class CodexRuntime:
                     execution_id=task.execution_id or None,
                     status="failed",
                     error=str(exc) or exc.__class__.__name__,
+                    metadata={
+                        "diagnostics": self._exception_diagnostics(
+                            exc,
+                            task=task,
+                            phase="runtime",
+                        )
+                    },
                 )
 
     async def _run_locked(self, task: AgentTask, emit: EmitCallback) -> AgentResult:
         self._assert_loop()
         if not task.conversation_id:
             raise ValueError("AgentTask.conversation_id is required for Codex execution")
+        # A configured supervisor snapshots the selected execution directory
+        # into task metadata.  Validate that immutable choice before client
+        # initialization or any SDK/network operation.  Legacy tasks without
+        # the field retain the runtime's configured working directory.
+        task_cwd = self._cwd_for_task(task)
         self._require_execute_policy_snapshot(task)
         # Validate and canonicalize the complete role envelope before client
         # initialization, resume, or any other SDK/network operation.
@@ -796,7 +1190,12 @@ class CodexRuntime:
         try:
             await self._await_with_deadline(self.start(), deadline)
             binding = await self._await_with_deadline(
-                self._binding_for(task, session_role=session_role), deadline
+                self._binding_for(
+                    task,
+                    session_role=session_role,
+                    task_cwd=task_cwd,
+                ),
+                deadline,
             )
         except asyncio.TimeoutError:
             return AgentResult(
@@ -804,11 +1203,22 @@ class CodexRuntime:
                 execution_id=task.execution_id or None,
                 status="failed",
                 error="Codex turn timed out",
+                metadata={
+                    "diagnostics": self._base_failure_diagnostics(
+                        task,
+                        phase="startup",
+                    )
+                },
             )
+        failure_diagnostics = self._base_failure_diagnostics(
+            task,
+            binding=binding,
+            phase="turn",
+        )
         kwargs: dict[str, Any] = {
             "approval_mode": approval_for_policy(self._policy_value(task, "approval_policy", "deny_all")),
             "sandbox": sandbox_for_policy(self._policy_value(task, "sandbox_policy", "read-only")),
-            "cwd": self.cwd,
+            "cwd": task_cwd,
         }
         model = task.model or self.model
         if model:
@@ -822,6 +1232,10 @@ class CodexRuntime:
             # hashing the complete bundle and handing its path to the SDK.
             input_value = self._translate_input(task.inputs)
             input_value = self._with_agent_bridge_context(task, input_value)
+            # Thread creation/resume and input translation may take long
+            # enough for a directory to be replaced.  Recheck its canonical
+            # path and inode at the final boundary before the native turn.
+            kwargs["cwd"] = self._cwd_for_task(task)
             turn = await self._await_with_deadline(
                 self._start_turn(binding.thread, input_value, kwargs), deadline
             )
@@ -832,6 +1246,12 @@ class CodexRuntime:
                 status="failed",
                 error="Codex turn timed out",
                 thread_id=binding.thread_id,
+                metadata={
+                    "diagnostics": {
+                        **failure_diagnostics,
+                        "phase": "turn_start",
+                    }
+                },
             )
         task_id = str(task.task_id)
         self._active_turns[task_id] = turn
@@ -946,6 +1366,9 @@ class CodexRuntime:
                     if terminal in {"failed", "error"}:
                         status = "failed"
                         error_text = self._terminal_error(notification)
+                        failure_diagnostics.update(
+                            self._terminal_diagnostics(notification)
+                        )
                     elif terminal in {"interrupted", "cancelled", "canceled"}:
                         status = "interrupted"
                         interrupted = True
@@ -953,6 +1376,7 @@ class CodexRuntime:
         except asyncio.TimeoutError:
             status = "failed"
             error_text = "Codex turn timed out"
+            failure_diagnostics["phase"] = "stream_timeout"
             try:
                 await self.interrupt(task_id)
             except Exception:
@@ -981,6 +1405,14 @@ class CodexRuntime:
                     )
             status = "failed"
             error_text = str(exc) or exc.__class__.__name__
+            failure_diagnostics.update(
+                self._exception_diagnostics(
+                    exc,
+                    task=task,
+                    binding=binding,
+                    phase="stream",
+                )
+            )
         finally:
             interrupt_requested = task_id in self._interrupt_requested
             self._interrupt_requested.discard(task_id)
@@ -1023,6 +1455,7 @@ class CodexRuntime:
         ):
             status = "failed"
             error_text = error_text or "Codex returned an empty response"
+            failure_diagnostics["phase"] = "empty_response"
         return AgentResult(
             task_id=task.task_id,
             execution_id=task.execution_id or None,
@@ -1032,6 +1465,11 @@ class CodexRuntime:
             events=tuple(emitted),
             interrupted=interrupted,
             thread_id=binding.thread_id,
+            metadata=(
+                {"diagnostics": safe_diagnostic_value(failure_diagnostics)}
+                if status != "completed"
+                else {}
+            ),
         )
 
     @staticmethod
@@ -1067,6 +1505,25 @@ class CodexRuntime:
         if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
             return dict(kwargs)
         return {name: value for name, value in kwargs.items() if name in parameters}
+
+    @staticmethod
+    def _require_supported_kwarg(method: Callable[..., Any], name: str) -> None:
+        """Fail closed when an SDK surface would silently drop a safety knob."""
+
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            # Some native callables do not expose a signature.  Preserve the
+            # existing call path so the callable itself remains authoritative.
+            return
+        if name in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            return
+        raise RuntimeError(
+            f"Codex client does not support required thread {name} override"
+        )
 
     async def _iterate_with_deadline(self, stream: Any, deadline: float | None) -> AsyncIterator[Any]:
         """Iterate an async stream while enforcing the per-turn timeout."""
@@ -1156,6 +1613,17 @@ class CodexRuntime:
         """Return the serialization identity for direct runtime execution."""
 
         return (task.conversation_id, task.agent_id or self.agent_id)
+
+    def _cwd_for_task(self, task: AgentTask) -> str:
+        """Return the task workspace, strictly validating snapshots when set."""
+
+        metadata = task.metadata if isinstance(task.metadata, Mapping) else {}
+        if EXECUTION_WORKSPACE_KEY not in metadata:
+            return self.cwd
+        return validate_workspace_snapshot(
+            metadata[EXECUTION_WORKSPACE_KEY],
+            self.cwd,
+        )
 
     def _policy_value(self, task: AgentTask, name: str, default: Any) -> Any:
         metadata = task.metadata if isinstance(task.metadata, Mapping) else {}
@@ -1472,12 +1940,123 @@ class CodexRuntime:
                 pieces.append(str(value))
         return "\n\n".join(pieces)
 
+    async def _read_effective_config(self, cwd: str) -> Any:
+        """Read Codex's effective provider configuration for one workspace.
+
+        Provider credentials remain inside the owning Agent process.  The
+        returned object is consumed immediately by the child-local context
+        resolver and is never logged, persisted, or sent over process IPC.
+        """
+
+        read = getattr(self._codex, "config_read", None)
+        if callable(read):
+            return await self._call_async(
+                read,
+                cwd=str(cwd),
+                include_layers=False,
+            )
+
+        ensure_initialized = getattr(self._codex, "_ensure_initialized", None)
+        if callable(ensure_initialized):
+            await self._call_async(ensure_initialized)
+        client = getattr(self._codex, "_client", None)
+        request = getattr(client, "request", None)
+        if not callable(request):
+            raise ModelContextResolutionError(
+                "effective Codex configuration is unavailable"
+            )
+        try:
+            from openai_codex.generated.v2_all import (
+                ConfigReadParams,
+                ConfigReadResponse,
+            )
+        except ImportError as exc:  # pragma: no cover - pinned SDK has these.
+            raise ModelContextResolutionError(
+                "effective Codex configuration is unavailable"
+            ) from exc
+        params = ConfigReadParams(
+            cwd=str(cwd),
+            includeLayers=False,
+        ).model_dump(mode="json", by_alias=True, exclude_none=True)
+        return await self._call_async(
+            request,
+            "config/read",
+            params,
+            response_model=ConfigReadResponse,
+        )
+
+    def _context_resolver_for_cwd(self, cwd: str) -> Any:
+        if self._model_context_resolver is not None:
+            return self._model_context_resolver
+        selected_cwd = str(cwd)
+        resolver = self._model_context_resolvers_by_cwd.get(selected_cwd)
+        if resolver is None:
+            async def read_config() -> Any:
+                if self._loaded_config_profile is not None:
+                    return dict(self._loaded_config_profile.effective_config)
+                return await self._read_effective_config(selected_cwd)
+
+            resolver = ProviderModelContextResolver(read_config)
+            self._model_context_resolvers_by_cwd[selected_cwd] = resolver
+        return resolver
+
+    async def _model_context_settings(
+        self,
+        task: AgentTask,
+        *,
+        task_cwd: str,
+    ) -> ModelContextSettings | None:
+        """Resolve exact model limits without making discovery task-fatal."""
+
+        resolver = self._context_resolver_for_cwd(task_cwd)
+        resolve = getattr(resolver, "resolve", None) or resolver
+        requested_model = str(task.model or self.model or "").strip() or None
+        try:
+            settings = await self._call_async(resolve, requested_model)
+        except ModelContextResolutionError:
+            # OpenAI-compatible catalogs are allowed to omit context metadata.
+            # In that case Codex keeps its native catalog/config behavior; no
+            # undocumented limit is invented or reported as provider-derived.
+            logger.debug(
+                "model context metadata unavailable; using native Codex settings"
+            )
+            return None
+        if not isinstance(settings, ModelContextSettings):
+            raise RuntimeError("model context resolver returned invalid settings")
+        if requested_model is not None and settings.model_id != requested_model:
+            raise RuntimeError("model context resolver identity conflicts")
+        return settings
+
+    @staticmethod
+    def _context_config_fingerprint(
+        settings: ModelContextSettings | None,
+        config_profile: LoadedCodexConfigProfile | None = None,
+    ) -> str:
+        if settings is None and config_profile is None:
+            return ""
+        overrides = settings.as_config_overrides() if settings is not None else {}
+        material = "\0".join(
+            (
+                settings.provider_id if settings is not None else "",
+                settings.model_id if settings is not None else "",
+                str(overrides.get("model_context_window", "")),
+                str(overrides.get("model_auto_compact_token_limit", "")),
+                str(overrides.get("model_auto_compact_token_limit_scope", "")),
+                config_profile.name if config_profile is not None else "",
+                config_profile.fingerprint if config_profile is not None else "",
+            )
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
     async def _binding_for(
         self,
         task: AgentTask,
         *,
         session_role: Mapping[str, Any] | None = None,
+        task_cwd: str | None = None,
     ) -> ThreadBinding:
+        if task_cwd is None:
+            task_cwd = self._cwd_for_task(task)
         canonical_role = (
             validate_role_snapshot(session_role)
             if session_role is not None
@@ -1490,58 +2069,113 @@ class CodexRuntime:
                 raise RuntimeError(
                     "persisted Codex thread conflicts with the active binding"
                 )
-            return existing
-        thread = None
-        # A persisted thread is valid only for this exact policy key.  The task
-        # snapshot carries the key, so resuming it is safe.
-        if task.thread_id:
+        context_settings = await self._model_context_settings(
+            task,
+            task_cwd=task_cwd,
+        )
+        model_id = str(
+            context_settings.model_id
+            if context_settings is not None
+            else (task.model or self.model or "")
+        ).strip()
+        provider_id = (
+            str(context_settings.provider_id).strip()
+            if context_settings is not None
+            else (
+                self._loaded_config_profile.model_provider
+                if self._loaded_config_profile is not None
+                else ""
+            )
+        )
+        context_fingerprint = self._context_config_fingerprint(
+            context_settings,
+            self._loaded_config_profile,
+        )
+        kwargs: dict[str, Any] = {
+            "approval_mode": approval_for_policy(
+                self._policy_value(task, "approval_policy", "deny_all")
+            ),
+            "sandbox": sandbox_for_policy(
+                self._policy_value(task, "sandbox_policy", "read-only")
+            ),
+            "cwd": task_cwd,
+        }
+        instructions = self._developer_instructions(
+            task,
+            session_role=canonical_role,
+        )
+        if instructions:
+            kwargs["developer_instructions"] = instructions
+        if model_id:
+            kwargs["model"] = model_id
+        kwargs["config"] = _thread_config_overrides(
+            context_settings,
+            self._loaded_config_profile,
+        )
+        if provider_id:
+            kwargs["model_provider"] = provider_id
+
+        async def resume_exact(thread_id: str) -> Any:
             resume = getattr(self._codex, "thread_resume", None)
             if resume is None:
                 raise RuntimeError(
                     "Codex client cannot resume the persisted thread"
                 )
-            kwargs = {
-                "approval_mode": approval_for_policy(self._policy_value(task, "approval_policy", "deny_all")),
-                "sandbox": sandbox_for_policy(self._policy_value(task, "sandbox_policy", "read-only")),
-                "cwd": self.cwd,
-            }
-            instructions = self._developer_instructions(
-                task, session_role=canonical_role
-            )
-            if instructions:
-                kwargs["developer_instructions"] = instructions
-            model = task.model or self.model
-            if model:
-                kwargs["model"] = model
-            thread = await self._call_async(resume, task.thread_id, **kwargs)
+            self._require_supported_kwarg(resume, "config")
+            resumed = await self._call_async(resume, thread_id, **kwargs)
             resumed_thread_id = (
-                thread.get("id")
-                if isinstance(thread, Mapping)
-                else getattr(thread, "id", None)
+                resumed.get("id")
+                if isinstance(resumed, Mapping)
+                else getattr(resumed, "id", None)
             )
             if not resumed_thread_id:
                 raise RuntimeError("resumed Codex thread has no identity")
-            if str(resumed_thread_id) != str(task.thread_id):
+            if str(resumed_thread_id) != str(thread_id):
                 raise RuntimeError(
                     "resumed Codex thread identity conflicts with persistence"
                 )
+            return resumed
+
+        thread = None
+        if existing is not None:
+            if (
+                existing.provider_id
+                and provider_id
+                and existing.provider_id != provider_id
+            ):
+                raise RuntimeError(
+                    "Codex thread model provider conflicts with current configuration; "
+                    "clear the conversation before changing providers"
+                )
+            model_changed = existing.model_id != model_id
+            if (
+                model_changed
+                and existing.context_config_fingerprint
+                and context_settings is None
+            ):
+                raise RuntimeError(
+                    "model-specific context metadata is unavailable for the new model"
+                )
+            context_changed = bool(
+                existing.provider_id != provider_id
+                or existing.context_config_fingerprint != context_fingerprint
+            )
+            if not model_changed and not context_changed:
+                return existing
+            # Re-resume the same durable thread so a model change or refreshed
+            # provider limit updates native thread configuration without
+            # fragmenting conversation history or its SQLite binding key.
+            thread = await resume_exact(existing.thread_id)
+
+        # A persisted thread is valid only for this exact policy key.  The task
+        # snapshot carries the key, so resuming it is safe.
+        if thread is None and task.thread_id:
+            thread = await resume_exact(str(task.thread_id))
         if thread is None:
             start = getattr(self._codex, "thread_start", None)
             if start is None:
                 raise RuntimeError("Codex client does not expose thread_start()")
-            kwargs = {
-                "approval_mode": approval_for_policy(self._policy_value(task, "approval_policy", "deny_all")),
-                "sandbox": sandbox_for_policy(self._policy_value(task, "sandbox_policy", "read-only")),
-                "cwd": self.cwd,
-            }
-            instructions = self._developer_instructions(
-                task, session_role=canonical_role
-            )
-            if instructions:
-                kwargs["developer_instructions"] = instructions
-            model = task.model or self.model
-            if model:
-                kwargs["model"] = model
+            self._require_supported_kwarg(start, "config")
             thread = await self._call_async(start, **kwargs)
         thread_id_value = (
             thread.get("id")
@@ -1559,12 +2193,32 @@ class CodexRuntime:
             persona_composition_version=str(
                 canonical_role["persona_composition_version"]
             ),
+            provider_id=provider_id,
+            model_id=model_id,
+            context_config_fingerprint=context_fingerprint,
             thread_id=thread_id,
             thread=thread,
         )
         self._bindings[key] = binding
         self._threads_by_id[thread_id] = thread
         return binding
+
+    def _require_thread_identity(self, binding: ThreadBinding) -> None:
+        """Fail closed if an SDK/fake thread changes its persisted identity."""
+
+        thread = binding.thread
+        actual = (
+            thread.get("id")
+            if isinstance(thread, Mapping)
+            else getattr(thread, "id", None)
+        )
+        if actual is None or str(actual) != binding.thread_id:
+            # Never leave a known-inconsistent handle eligible for the next
+            # turn.  Durable persistence remains authoritative and a later
+            # control operation may explicitly resume its recorded identity.
+            self._bindings.pop(binding.key, None)
+            self._threads_by_id.pop(binding.thread_id, None)
+            raise RuntimeError("Codex thread identity conflicts with persistence")
 
     async def _call_async(self, method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         result = method(*args, **self._supported_kwargs(method, kwargs))
@@ -2059,6 +2713,113 @@ class CodexRuntime:
         if isinstance(error, Mapping):
             error = error.get("message", error)
         return str(getattr(error, "message", None) or error or "Codex turn failed")
+
+    @staticmethod
+    def _base_failure_diagnostics(
+        task: AgentTask,
+        *,
+        binding: ThreadBinding | None = None,
+        phase: str,
+    ) -> dict[str, Any]:
+        """Return non-content execution coordinates safe for parent logging."""
+
+        return {
+            "phase": sanitize_diagnostic_text(phase, maximum=64),
+            "provider_id": sanitize_diagnostic_text(
+                binding.provider_id if binding is not None else "",
+                maximum=256,
+            ),
+            "model_id": sanitize_diagnostic_text(
+                (
+                    binding.model_id
+                    if binding is not None and binding.model_id
+                    else (task.model or "")
+                ),
+                maximum=512,
+            ),
+            "reasoning_effort": sanitize_diagnostic_text(
+                task.reasoning_effort,
+                maximum=128,
+            ),
+        }
+
+    @classmethod
+    def _terminal_diagnostics(cls, notification: Any) -> dict[str, Any]:
+        """Extract Codex's typed error category without retaining turn items."""
+
+        payload = cls._payload(notification)
+        turn = (
+            payload.get("turn", payload)
+            if isinstance(payload, Mapping)
+            else getattr(payload, "turn", payload)
+        )
+        error = (
+            turn.get("error")
+            if isinstance(turn, Mapping)
+            else getattr(turn, "error", None)
+        )
+        turn_id = (
+            turn.get("id", "")
+            if isinstance(turn, Mapping)
+            else getattr(turn, "id", "")
+        )
+        duration_ms = (
+            turn.get("durationMs", turn.get("duration_ms"))
+            if isinstance(turn, Mapping)
+            else getattr(turn, "duration_ms", getattr(turn, "durationMs", None))
+        )
+        details: dict[str, Any] = {
+            "phase": "terminal",
+            "provider_turn_id": sanitize_diagnostic_text(turn_id, maximum=256),
+        }
+        if isinstance(duration_ms, int) and duration_ms >= 0:
+            details["provider_duration_ms"] = duration_ms
+        if error is not None:
+            # TurnError contains only message, additionalDetails, and the
+            # typed Codex error category/status.  The bounded sanitizer still
+            # redacts future secret-bearing keys and URL queries defensively.
+            details["codex_error"] = safe_diagnostic_value(error)
+        return details
+
+    @classmethod
+    def _exception_diagnostics(
+        cls,
+        exc: BaseException,
+        *,
+        task: AgentTask,
+        phase: str,
+        binding: ThreadBinding | None = None,
+    ) -> dict[str, Any]:
+        """Describe an SDK exception without serializing request/response bodies."""
+
+        details = cls._base_failure_diagnostics(
+            task,
+            binding=binding,
+            phase=phase,
+        )
+        details.update(
+            {
+                "exception_type": sanitize_diagnostic_text(
+                    exc.__class__.__name__, maximum=256
+                ),
+                "exception_module": sanitize_diagnostic_text(
+                    exc.__class__.__module__, maximum=256
+                ),
+            }
+        )
+        for name in (
+            "status_code",
+            "http_status_code",
+            "code",
+            "request_id",
+        ):
+            try:
+                value = getattr(exc, name, None)
+            except Exception:
+                continue
+            if value not in (None, ""):
+                details[name] = safe_diagnostic_value(value)
+        return details
 
     @classmethod
     def _completed_image_output(cls, notification: Any) -> dict[str, Any] | None:

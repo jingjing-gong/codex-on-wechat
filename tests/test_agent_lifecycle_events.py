@@ -402,7 +402,7 @@ def test_v25_migration_reconciles_compatibility_drift_and_replays_exactly(
             )
             connection.execute("DROP TABLE agent_lifecycle_events")
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32)"
+                "DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32, 33,34,35)"
             )
             # Simulate Profile publication after v24 that never updated its
             # lifecycle projection.
@@ -524,7 +524,7 @@ def test_v25_migration_reconciles_compatibility_drift_and_replays_exactly(
         # must replay without relabeling v25-created incarnations or events.
         with sqlite3.connect(path) as connection:
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32)"
+                "DELETE FROM schema_migrations WHERE version IN (25, 26, 27, 28, 29, 30, 31, 32, 33,34,35)"
             )
             connection.commit()
         replayed = SQLiteStore(path)
@@ -546,7 +546,7 @@ def test_v25_migration_reconciles_compatibility_drift_and_replays_exactly(
         with sqlite3.connect(path) as connection:
             assert connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone() == (32,)
+            ).fetchone() == (35,)
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
     asyncio.run(scenario())

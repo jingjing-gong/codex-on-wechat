@@ -16,12 +16,14 @@ from src.agents.base import (
     AgentEvent,
     AgentResult,
     AgentTask,
+    EventPriority,
     EventVisibility,
     ReplyTarget,
     emit_if_awaitable,
 )
 
 from .dispatcher import SQLiteDispatcher, _call_compatible
+from .diagnostics import log_task_started, log_task_terminal
 from .identity import mailbox_conversation_id
 
 logger = logging.getLogger(__name__)
@@ -252,6 +254,14 @@ class TaskWorker:
                                 logger.debug("could not finalize raced cancellation for %s", task_id, exc_info=True)
                         return True
                     return True
+                attempt = _field(raw_task, "attempts", _field(raw_task, "attempt", None))
+                runtime_started_at = time.monotonic()
+                log_task_started(
+                    logger,
+                    task,
+                    worker_id=self.worker_id,
+                    attempt=attempt,
+                )
                 try:
                     runtime = self._runtime_for(task.agent_id)
                 except Exception as exc:
@@ -265,7 +275,18 @@ class TaskWorker:
                         status="failed",
                         error=str(exc) or exc.__class__.__name__,
                     )
+                    result = self._with_failure_notice(task, result)
                     await self._finish(task, result, claim_token)
+                    log_task_terminal(
+                        logger,
+                        task,
+                        result,
+                        worker_id=self.worker_id,
+                        attempt=attempt,
+                        duration_ms=max(
+                            0, int((time.monotonic() - runtime_started_at) * 1000)
+                        ),
+                    )
                     self.failed_count += 1
                     return True
                 events: list[AgentEvent] = []
@@ -382,10 +403,12 @@ class TaskWorker:
                 # merely because the runtime returned after interruption.
                 if task_id in self._lost_task_claims:
                     return True
+                result_identity_valid = True
                 try:
                     result = self._normalize_result(task, result)
                 except (TypeError, ValueError) as exc:
                     logger.error("Agent task %s returned an invalid result: %s", task_id, exc)
+                    result_identity_valid = False
                     result = AgentResult(
                         task_id=task_id,
                         execution_id=execution_id,
@@ -457,7 +480,19 @@ class TaskWorker:
                             usage=getattr(result, "usage", {}),
                             metadata=getattr(result, "metadata", {}),
                         )
+                if result_identity_valid:
+                    result = self._with_failure_notice(task, result)
                 await self._finish(task, result, claim_token)
+                log_task_terminal(
+                    logger,
+                    task,
+                    result,
+                    worker_id=self.worker_id,
+                    attempt=attempt,
+                    duration_ms=max(
+                        0, int((time.monotonic() - runtime_started_at) * 1000)
+                    ),
+                )
                 if self._status_value(result.status) == "completed":
                     self.completed_count += 1
                 else:
@@ -906,6 +941,84 @@ class TaskWorker:
             thread_id=result.thread_id,
             usage=getattr(result, "usage", {}),
             metadata=getattr(result, "metadata", {}),
+        )
+
+    @classmethod
+    def _with_failure_notice(
+        cls,
+        task: AgentTask,
+        result: AgentResult,
+    ) -> AgentResult:
+        """Add one explicit safe terminal reply to an owned failed attempt.
+
+        Raw runtime/provider errors remain internal because they may contain
+        endpoints, credentials, or other implementation details.  A worker
+        calls this helper only after the result identity has been validated;
+        fabricated cross-task results therefore remain delivery-silent.
+        Nothing is retried or cleared automatically because a disconnected
+        turn may already have produced external side effects.  Completed
+        Agent-message items can be useful progress, but they do not prove that
+        the user was told the turn ultimately failed.
+        """
+
+        if cls._status_value(result.status) != "failed":
+            return result
+        events = tuple(result.events or ())
+        task_id = str(task.task_id)
+        # A process-isolated runtime can fail before returning its binding even
+        # though the immutable task was already pinned to a provider thread.
+        # Either identity means retry will resume the same context.
+        if result.thread_id or task.thread_id:
+            notice = (
+                f"task failed: {task_id}\n"
+                "check /tasks before retrying. /retry reuses the same context; "
+                "/clear starts fresh."
+            )
+        else:
+            notice = (
+                f"task failed: {task_id}\n"
+                "check /tasks before retrying or sending a new prompt."
+            )
+        # A provider/runtime event is untrusted even when it labels itself an
+        # error.  Recognize only this worker protocol's exact fixed text; all
+        # arbitrary diagnostics remain internal.
+        for event in events:
+            visibility = getattr(
+                _field(event, "visibility", EventVisibility.USER),
+                "value",
+                _field(event, "visibility", EventVisibility.USER),
+            )
+            event_type = str(_field(event, "event_type", "") or "")
+            if (
+                str(visibility) == EventVisibility.USER.value
+                and not _field(event, "destination_agent_id", None)
+                and event_type == "failure_notice"
+                and str(_field(event, "content", "") or "") == notice
+                and not tuple(_field(event, "attachments", ()) or ())
+            ):
+                return result
+        next_sequence = 0
+        for event in events:
+            try:
+                next_sequence = max(
+                    next_sequence,
+                    int(_field(event, "sequence", -1)) + 1,
+                )
+            except (TypeError, ValueError):
+                continue
+        notice_event = AgentEvent.text_event(
+            task_id,
+            notice,
+            sequence=next_sequence,
+            visibility=EventVisibility.USER,
+            priority=int(EventPriority.NORMAL),
+            execution_id=result.execution_id or task.execution_id or None,
+            event_type="failure_notice",
+        )
+        return replace(
+            result,
+            content=(result.content if str(result.content or "").strip() else notice),
+            events=(*events, notice_event),
         )
 
     @staticmethod

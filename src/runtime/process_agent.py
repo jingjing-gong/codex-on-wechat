@@ -39,6 +39,7 @@ import signal
 import sys
 import threading
 import types
+import unicodedata
 import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable
@@ -49,11 +50,71 @@ _DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 _DEFAULT_MAX_PROCESSES = 16
 _BRIDGE_CAPABILITY_METADATA_KEY = "_process_agent_bridge_capability"
 _AGENT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_CONFIG_PROFILE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _FACTORY_PATTERN = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_.]*$"
 )
+_MAX_IPC_ERROR_TEXT = 4_096
+_ANSI_ESCAPE_PATTERN = re.compile(
+    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\)|"
+    r"\x1b\[[0-?]*[ -/]*[@-~]|"
+    r"\x9b[0-?]*[ -/]*[@-~]|"
+    r"\x1b[@-Z\\-_])"
+)
+_IPC_ERROR_URL_PATTERN = re.compile(
+    r"(?i)\b[a-z][a-z0-9+.-]*://[^\s,)\]}>\"']+"
+)
+_IPC_ERROR_AUTH_SCHEME_PATTERN = re.compile(
+    r'''(?i)(?<![\w-])(?:"(?:bearer|basic)"|'(?:bearer|basic)'|'''
+    r'''(?:bearer|basic))(?:\s*[:=]\s*|\s+)'''
+    r'''(?:"[^\"]*"|'[^']*'|\[[^\]]*\]|<[^>]*>|\([^)]*\)|'''
+    r'''\{[^}]*\}|[^\s,;)\]}>]+)'''
+)
+_IPC_ERROR_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(?<![\w-])[\"']?"
+    r"((?:[a-z0-9][a-z0-9_-]{0,63})?(?:"
+    r"api[_-]?key|authorization|credential|password|secret|token))"
+    r"[\"']?\s*[:=]\s*"
+    r'''(?:"[^\"]*"|'[^']*'|\[[^\]]*\]|<[^>]*>|\([^)]*\)|'''
+    r'''\{[^}]*\}|[^\s,;)\]}>]+)'''
+)
+_IPC_ERROR_HOST_PATTERN = re.compile(
+    r"(?i)(?<![\w@/.-])(?:"
+    r"\[(?=[0-9a-f:.%]*:)[0-9a-f:.]+(?:%[a-z0-9_.-]+)?\]|"
+    r"localhost|"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+[a-z]{2,63}|"
+    r"(?:\d{1,3}\.){3}\d{1,3}"
+    r")(?::\d{1,5})?(?:/[^\s,)\]}>\"']*)?"
+)
 _PR_SET_PDEATHSIG = 1
 _SPAWN_MAIN_LOCK = threading.Lock()
+
+
+def _sanitized_ipc_error(value: Any, *, fallback: str = "operation failed") -> str:
+    """Bound and redact exception text before it crosses an Agent pipe."""
+
+    without_escapes = _ANSI_ESCAPE_PATTERN.sub("", str(value or ""))
+    cleaned = "".join(
+        " "
+        if character.isspace()
+        else ""
+        if unicodedata.category(character).startswith("C")
+        else character
+        for character in without_escapes
+    )
+    normalized = " ".join(cleaned.split()).replace("`", "'")
+    normalized = _IPC_ERROR_URL_PATTERN.sub("<redacted-url>", normalized)
+    normalized = _IPC_ERROR_AUTH_SCHEME_PATTERN.sub(
+        "<redacted-authorization>", normalized
+    )
+    normalized = _IPC_ERROR_ASSIGNMENT_PATTERN.sub(
+        lambda match: f"{match.group(1)}=<redacted>", normalized
+    )
+    normalized = _IPC_ERROR_HOST_PATTERN.sub("<redacted-host>", normalized)
+    normalized = normalized or fallback
+    if len(normalized) <= _MAX_IPC_ERROR_TEXT:
+        return normalized
+    return normalized[: _MAX_IPC_ERROR_TEXT - 3].rstrip() + "..."
 
 
 class ProcessAgentError(RuntimeError):
@@ -239,6 +300,109 @@ def _wire_value(value: Any, *, depth: int = 0) -> Any:
     )
 
 
+def _ipc_secret_key(value: Any) -> bool:
+    normalized = re.sub(
+        r"[^a-z0-9]",
+        "",
+        _ANSI_ESCAPE_PATTERN.sub("", str(value or "")).lower(),
+    )
+    return any(
+        marker in normalized
+        for marker in (
+            "apikey",
+            "authorization",
+            "credential",
+            "password",
+            "secret",
+            "token",
+        )
+    )
+
+
+def _sanitized_ipc_diagnostic(value: Any, *, depth: int = 0) -> Any:
+    """Redact nested diagnostic metadata without changing ordinary wire data."""
+
+    if depth >= 16:
+        return "<redacted-depth>"
+    if isinstance(value, str):
+        return _sanitized_ipc_error(value)
+    if value is None or type(value) in {bool, int, float}:
+        return value
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            result[name] = (
+                "<redacted>"
+                if _ipc_secret_key(name)
+                else _sanitized_ipc_diagnostic(item, depth=depth + 1)
+            )
+        return result
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray, memoryview)
+    ):
+        return [
+            _sanitized_ipc_diagnostic(item, depth=depth + 1) for item in value
+        ]
+    return _sanitized_ipc_error(value)
+
+
+def _error_event_payload(value: Any) -> Any:
+    if not isinstance(value, Mapping) and dataclasses.is_dataclass(value):
+        value = dataclasses.asdict(value)
+    if not isinstance(value, Mapping):
+        for method_name in ("as_dict", "to_dict", "model_dump"):
+            method = getattr(value, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                projected = method()
+            except TypeError:
+                continue
+            if isinstance(projected, Mapping):
+                value = projected
+                break
+    if not isinstance(value, Mapping):
+        return value
+    event = dict(value)
+    event_type = re.sub(
+        r"[^a-z0-9]",
+        "",
+        _ANSI_ESCAPE_PATTERN.sub("", str(event.get("event_type") or "")).lower(),
+    )
+    if any(
+        marker in event_type
+        for marker in ("error", "fail", "exception", "warning", "diagnostic")
+    ):
+        event["content"] = _sanitized_ipc_error(event.get("content"))
+    metadata = event.get("metadata")
+    if isinstance(metadata, Mapping):
+        event["metadata"] = _sanitized_ipc_diagnostic(metadata)
+    return event
+
+
+def _result_payload_for_ipc(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(value)
+    error = result.get("error")
+    if error not in (None, ""):
+        result["error"] = _sanitized_ipc_error(error)
+    status = str(result.get("status") or "").strip().lower()
+    if error not in (None, "") or status in {"error", "failed", "failure"}:
+        for field in ("content", "output"):
+            if result.get(field):
+                result[field] = _sanitized_ipc_error(result[field])
+    events = result.get("events")
+    if isinstance(events, Sequence) and not isinstance(
+        events, (str, bytes, bytearray, memoryview)
+    ):
+        result["events"] = [_error_event_payload(event) for event in events]
+    for field in ("metadata", "diagnostics"):
+        metadata = result.get(field)
+        if isinstance(metadata, Mapping):
+            result[field] = _sanitized_ipc_diagnostic(metadata)
+    return result
+
+
 def _encode_message(message: Mapping[str, Any], max_bytes: int) -> bytes:
     try:
         encoded = json.dumps(
@@ -375,7 +539,7 @@ def _runtime_types() -> tuple[Any, Any, Any]:
 
 def _event_from_payload(payload: Mapping[str, Any]) -> Any:
     _AgentTask, AgentEvent, _AgentResult = _runtime_types()
-    values = dict(payload)
+    values = dict(_error_event_payload(payload))
     values["created_at"] = _parse_datetime(values.get("created_at"))
     values["attachments"] = tuple(values.get("attachments") or ())
     return AgentEvent(**values)
@@ -383,7 +547,7 @@ def _event_from_payload(payload: Mapping[str, Any]) -> Any:
 
 def _result_from_payload(payload: Mapping[str, Any]) -> Any:
     _AgentTask, _AgentEvent, AgentResult = _runtime_types()
-    values = dict(payload)
+    values = _result_payload_for_ipc(payload)
     values["events"] = tuple(
         _event_from_payload(item) for item in values.get("events") or ()
     )
@@ -548,6 +712,9 @@ async def _construct_child_runtime(
     constructor_values = {
         "agent_id": agent_id,
         "model": str(config.get("model", "") or ""),
+        "codex_config_profile": str(
+            config.get("codex_config_profile", "") or ""
+        ),
         "cwd": config.get("cwd"),
         "turn_timeout": config.get("turn_timeout"),
         "managed_root": config.get("managed_root"),
@@ -561,7 +728,15 @@ async def _construct_child_runtime(
     factory_path = config.get("backend_factory")
     if factory_path:
         factory = _resolve_import(str(factory_path))
-        created = factory(**_supported_kwargs(factory, constructor_values))
+        factory_values = _supported_kwargs(factory, constructor_values)
+        if (
+            constructor_values["codex_config_profile"]
+            and "codex_config_profile" not in factory_values
+        ):
+            raise RuntimeError(
+                "Agent backend does not support Codex config profiles"
+            )
+        created = factory(**factory_values)
     else:
         from src.agents.codex_runtime import CodexRuntime
 
@@ -590,7 +765,13 @@ class _ChildSession:
     """One child generation's asynchronous private-pipe state machine."""
 
     _CONTROL_METHODS = frozenset(
-        {"list_models", "list_skills", "resolve_skill", "reset_session"}
+        {
+            "compact_session",
+            "list_models",
+            "list_skills",
+            "resolve_skill",
+            "reset_session",
+        }
     )
 
     def __init__(self, connection: Any, config: Mapping[str, Any]) -> None:
@@ -816,7 +997,10 @@ class _ChildSession:
                     )
                     await self.request_parent(
                         "event",
-                        {"run_id": request_id, "event": _wire_value(event_values)},
+                        {
+                            "run_id": request_id,
+                            "event": _wire_value(_error_event_payload(event_values)),
+                        },
                     )
 
                 result = runtime.run(task, emit)
@@ -855,47 +1039,59 @@ class _ChildSession:
                 task_id=task_id,
                 execution_id=execution_id,
                 status="failed",
-                error=str(exc) or exc.__class__.__name__,
+                error=_sanitized_ipc_error(
+                    str(exc), fallback=exc.__class__.__name__
+                ),
             )
         finally:
             if self._active_task_id is not None:
                 self._interrupt_latch.discard(self._active_task_id)
             self._active_run_id = None
             self._active_task_id = None
+        result_payload = _result_payload_for_ipc(dict(result.as_dict()))
         await self.send(
             "result",
-            {"ok": True, "result": _wire_value(result.as_dict())},
+            {"ok": True, "result": _wire_value(result_payload)},
             reply_to=request_id,
         )
 
     async def _handle_interrupt(self, incoming: Mapping[str, Any]) -> None:
-        task_id = str(incoming["payload"].get("task_id", "") or "")
-        accepted = False
-        if task_id and task_id == self._active_task_id:
-            self._interrupt_latch.add(task_id)
-            runtime = self.runtime
-            interrupt = getattr(runtime, "interrupt", None)
-            if callable(interrupt):
-                outcome = interrupt(task_id)
-                accepted = bool(
-                    await outcome if inspect.isawaitable(outcome) else outcome
-                )
-            if (
-                not accepted
-                and self._active_execution is not None
-                and self._execution_started.is_set()
-            ):
-                # Covers the short post-grant/pre-SDK-registration race.
-                self._active_execution.cancel()
-                accepted = True
-            elif not accepted:
-                # The accepted task has not entered its coroutine body yet.
-                # Its latch is checked before backend.run(), so cancellation
-                # here would only suppress the required terminal RESULT.
-                accepted = True
+        try:
+            task_id = str(incoming["payload"].get("task_id", "") or "")
+            accepted = False
+            if task_id and task_id == self._active_task_id:
+                self._interrupt_latch.add(task_id)
+                runtime = self.runtime
+                interrupt = getattr(runtime, "interrupt", None)
+                if callable(interrupt):
+                    outcome = interrupt(task_id)
+                    accepted = bool(
+                        await outcome if inspect.isawaitable(outcome) else outcome
+                    )
+                if (
+                    not accepted
+                    and self._active_execution is not None
+                    and self._execution_started.is_set()
+                ):
+                    # Covers the short post-grant/pre-SDK-registration race.
+                    self._active_execution.cancel()
+                    accepted = True
+                elif not accepted:
+                    # The accepted task has not entered its coroutine body yet.
+                    # Its latch is checked before backend.run(), so cancellation
+                    # here would only suppress the required terminal RESULT.
+                    accepted = True
+            payload = {"ok": True, "value": accepted}
+        except BaseException as exc:
+            payload = {
+                "ok": False,
+                "error": _sanitized_ipc_error(
+                    str(exc), fallback=exc.__class__.__name__
+                ),
+            }
         await self.send(
             "interrupt_ack",
-            {"ok": True, "value": accepted},
+            payload,
             reply_to=str(incoming["id"]),
         )
 
@@ -921,7 +1117,12 @@ class _ChildSession:
                 value = await value
             payload = {"ok": True, "value": _wire_value(value)}
         except BaseException as exc:
-            payload = {"ok": False, "error": str(exc) or exc.__class__.__name__}
+            payload = {
+                "ok": False,
+                "error": _sanitized_ipc_error(
+                    str(exc), fallback=exc.__class__.__name__
+                ),
+            }
         await self.send(
             "response", payload, reply_to=str(incoming["id"])
         )
@@ -954,7 +1155,9 @@ class _ChildSession:
                     await stopped
             self.runtime = None
         except BaseException as exc:
-            error = str(exc) or exc.__class__.__name__
+            error = _sanitized_ipc_error(
+                str(exc), fallback=exc.__class__.__name__
+            )
         await self.send(
             "stopped",
             {"ok": error is None, "error": error},
@@ -965,7 +1168,7 @@ class _ChildSession:
     async def _send_error(self, incoming: Mapping[str, Any], error: str) -> None:
         await self.send(
             "error",
-            {"ok": False, "error": error},
+            {"ok": False, "error": _sanitized_ipc_error(error)},
             reply_to=str(incoming["id"]),
         )
 
@@ -993,7 +1196,12 @@ async def _run_child(connection: Any, config: Mapping[str, Any]) -> int:
         with contextlib.suppress(BaseException):
             await session.send(
                 "fatal",
-                {"ok": False, "error": str(exc) or exc.__class__.__name__},
+                {
+                    "ok": False,
+                    "error": _sanitized_ipc_error(
+                        str(exc), fallback=exc.__class__.__name__
+                    ),
+                },
             )
         return 70
     finally:
@@ -1021,6 +1229,7 @@ class ProcessAgentRuntime:
         agent_id: str,
         *,
         model: str = "",
+        codex_config_profile: str = "",
         cwd: str | os.PathLike[str] | None = None,
         turn_timeout: float | None = 60,
         managed_root: str | os.PathLike[str] | None = None,
@@ -1042,6 +1251,19 @@ class ProcessAgentRuntime:
             raise ProcessAgentConfigurationError(
                 "agent_id must be lowercase ASCII and start with a letter"
             )
+        if codex_config_profile is not None and not isinstance(
+            codex_config_profile, str
+        ):
+            raise ProcessAgentConfigurationError(
+                "codex_config_profile must be a safe profile name"
+            )
+        canonical_config_profile = str(codex_config_profile or "").strip()
+        if canonical_config_profile and not _CONFIG_PROFILE_PATTERN.fullmatch(
+            canonical_config_profile
+        ):
+            raise ProcessAgentConfigurationError(
+                "codex_config_profile must be a safe profile name"
+            )
         if turn_timeout is not None:
             turn_timeout = _positive_timeout(turn_timeout, "turn_timeout")
         if type(max_message_bytes) is not int or not (
@@ -1062,6 +1284,7 @@ class ProcessAgentRuntime:
 
         self.agent_id = canonical_agent_id
         self.model = str(model or "")
+        self.codex_config_profile = canonical_config_profile
         self.cwd = (
             str(Path(cwd).expanduser().resolve()) if cwd is not None else None
         )
@@ -1142,12 +1365,22 @@ class ProcessAgentRuntime:
 
         return cls(agent_id, **kwargs)
 
-    def for_agent(self, agent_id: str) -> "ProcessAgentRuntime":
+    def for_agent(
+        self,
+        agent_id: str,
+        *,
+        codex_config_profile: str | None = None,
+    ) -> "ProcessAgentRuntime":
         """Return a new unstarted proxy with this template's exact config."""
 
         return type(self)(
             agent_id,
             model=self.model,
+            codex_config_profile=(
+                self.codex_config_profile
+                if codex_config_profile is None
+                else codex_config_profile
+            ),
             cwd=self.cwd,
             turn_timeout=self.turn_timeout,
             managed_root=self.managed_root,
@@ -1316,6 +1549,7 @@ class ProcessAgentRuntime:
             "agent_id": self.agent_id,
             "generation": generation,
             "model": self.model,
+            "codex_config_profile": self.codex_config_profile,
             "cwd": self.cwd,
             "turn_timeout": self.turn_timeout,
             "managed_root": self.managed_root,
@@ -1421,23 +1655,55 @@ class ProcessAgentRuntime:
         )
         return [dict(item) for item in value or ()]
 
-    async def list_skills(self, *, refresh: bool = False) -> list[dict[str, Any]]:
+    async def list_skills(
+        self,
+        *,
+        refresh: bool = False,
+        cwd: str | None = None,
+    ) -> list[dict[str, Any]]:
         value = await self._control_call(
-            "list_skills", kwargs={"refresh": bool(refresh)}
+            "list_skills",
+            kwargs={"refresh": bool(refresh), "cwd": cwd},
         )
         return [dict(item) for item in value or ()]
 
     async def resolve_skill(
-        self, name: str, *, refresh: bool = False
+        self,
+        name: str,
+        *,
+        refresh: bool = False,
+        cwd: str | None = None,
     ) -> dict[str, Any] | None:
         value = await self._control_call(
-            "resolve_skill", args=[str(name)], kwargs={"refresh": bool(refresh)}
+            "resolve_skill",
+            args=[str(name)],
+            kwargs={"refresh": bool(refresh), "cwd": cwd},
         )
         return dict(value) if isinstance(value, Mapping) else None
 
     async def reset_session(self, conversation_id: str) -> str:
         value = await self._control_call("reset_session", args=[str(conversation_id)])
         return str(value or "")
+
+    async def compact_session(
+        self,
+        conversation_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Run native context compaction inside this Agent's child process."""
+
+        value = await self._control_call(
+            "compact_session",
+            args=[str(conversation_id)],
+            kwargs=kwargs,
+        )
+        if not isinstance(value, Mapping):
+            raise ProcessAgentProtocolError(
+                "child context-compaction result is invalid"
+            )
+        return dict(value)
+
+    compact_conversation = compact_session
 
     async def _control_call(
         self,
@@ -1680,7 +1946,9 @@ class ProcessAgentRuntime:
                     await emitted
             ok = True
         except BaseException as exc:
-            error = str(exc) or exc.__class__.__name__
+            error = _sanitized_ipc_error(
+                str(exc), fallback=exc.__class__.__name__
+            )
         await self._send(
             "event_ack",
             {"ok": ok, "error": error},
@@ -1733,7 +2001,9 @@ class ProcessAgentRuntime:
             value = _wire_value(published)
             ok = True
         except BaseException as exc:
-            error = str(exc) or exc.__class__.__name__
+            error = _sanitized_ipc_error(
+                str(exc), fallback=exc.__class__.__name__
+            )
         await self._send(
             "artifact_ack",
             {"ok": ok, "error": error, "value": value},

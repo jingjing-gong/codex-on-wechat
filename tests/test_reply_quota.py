@@ -94,7 +94,7 @@ def test_v19_reply_scope_is_created_replayed_and_backfilled(tmp_path):
         with sqlite3.connect(path) as connection:
             assert connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone() == (32,)
+            ).fetchone() == (35,)
             # Model interruption after the v19 DDL landed but before its
             # scope backfill and migration marker committed.  Initialization
             # must be idempotent and recreate the missing legacy scope.
@@ -1084,6 +1084,13 @@ def test_retry_execution_projects_to_fresh_retry_reply_scope(tmp_path):
                     "source_item_ordinal": 1,
                 },
                 claim_token=second_claim.claim_token,
+            )
+            await store.complete_task(
+                task.task_id,
+                status="completed",
+                events=[event],
+                claim_token=second_claim.claim_token,
+                execution_id=second_claim.execution_id,
             )
             projected = next(
                 item

@@ -7,6 +7,7 @@
 #   ./cow run      # run the bot
 #   ./cow login    # log in to WeChat and save credentials
 #   ./cow logout   # delete saved WeChat credentials
+#   ./cow logs 300 # dump the newest 300 persistent log lines
 #
 set -euo pipefail
 
@@ -40,12 +41,25 @@ case "$command" in
         uv sync --extra test
         exec uv run src/codex_wechat_bot.py --logout "$@"
         ;;
+    logs)
+        lines="${1:-200}"
+        if [[ "$lines" == *[!0-9]* || "$lines" == "0" ]]; then
+            echo "usage: ./cow logs [positive-line-count]" >&2
+            exit 2
+        fi
+        log_file="${CODEX_WECHAT_LOG:-${HOME}/.codex-wechat-bot/logs/codex-wechat.log}"
+        if [[ ! -f "$log_file" ]]; then
+            echo "runtime log not found: $log_file" >&2
+            exit 1
+        fi
+        exec tail -n "$lines" -- "$log_file"
+        ;;
     -h|--help|help)
-        sed -n '3,10p' "$0"
+        sed -n '3,11p' "$0"
         ;;
     *)
         echo "unknown command: $command" >&2
-        echo "usage: ./cow [run|login|logout]" >&2
+        echo "usage: ./cow [run|login|logout|logs [lines]]" >&2
         exit 2
         ;;
 esac

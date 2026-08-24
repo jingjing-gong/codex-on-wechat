@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import subprocess
 from pathlib import Path
 
@@ -24,6 +25,10 @@ from src.channels.wechat import (
 from src.runtime.manager import TaskManager
 from src.runtime.registry import AgentRegistry, codex_profile
 from src.runtime.sqlite_store import SQLiteStore
+from src.runtime.store import (
+    WORKING_DIRECTORY_RESPONSE_MAX_CHARS,
+    format_working_directory_response,
+)
 
 
 def _envelope(
@@ -65,7 +70,9 @@ def test_help_is_deterministic_markdown_with_one_command_per_line():
         "agents",
         "ask",
         "cancel",
+        "cd",
         "clear",
+        "compact",
         "delagent",
         "help",
         "inbox",
@@ -93,7 +100,9 @@ def test_help_is_deterministic_markdown_with_one_command_per_line():
     assert "`/model [<model-id> <effort|default>|effort <effort|default>]`" in COMMAND_HELP
     assert "`/retry <task-id>`" in COMMAND_HELP
     assert "`/cancel [task-id]`" in COMMAND_HELP
-    assert "`/agent [agent-id]`" in COMMAND_HELP
+    assert "`/compact`" in COMMAND_HELP
+    assert "`/cd [path]`" in COMMAND_HELP
+    assert "`/agent [agent-id] [profile]`" in COMMAND_HELP
     assert "`/delagent <agent-id>`" in COMMAND_HELP
     assert "`/ask <agent-id> <prompt>`" in COMMAND_HELP
     assert "`/inbox [agent-id|all]`" in COMMAND_HELP
@@ -234,6 +243,211 @@ def test_delagent_command_validates_arity_and_delegates():
     asyncio.run(scenario())
 
 
+def test_cd_queries_and_sets_quoted_working_directory():
+    reads: list[dict[str, object]] = []
+    writes: list[tuple[str, dict[str, object]]] = []
+
+    class Manager:
+        async def get_active_agent(self, **_kwargs) -> str:
+            return "codex"
+
+        async def get_working_directory(self, **kwargs):
+            reads.append(kwargs)
+            return {"path": "/workspace/codex"}
+
+        async def set_working_directory(self, path: str, **kwargs):
+            writes.append((path, kwargs))
+            return {
+                "path": "/workspace/My Project",
+                "command_response": "working directory: /workspace/My Project",
+            }
+
+    async def scenario() -> None:
+        router = MVPCommandRouter(Manager())
+        assert await router.handle_command(
+            parse_command("/cd"), _envelope("/cd")
+        ) == "working directory: /workspace/codex"
+        assert await router.handle_command(
+            parse_command('/cd "/workspace/My Project"'),
+            _envelope('/cd "/workspace/My Project"'),
+            command_id="command-cd-1",
+        ) == "working directory: /workspace/My Project"
+
+    asyncio.run(scenario())
+    assert reads and reads[0]["agent_id"] == "codex"
+    assert writes == [
+        (
+            "/workspace/My Project",
+            {
+                "channel": "wechat",
+                "bot_id": "bot",
+                "external_user_id": "user",
+                "user_id": "user",
+                "session_id": "default",
+                "conversation_id": "wechat:bot:user:default:codex",
+                "agent_id": "codex",
+                "actor": "user",
+                "command_id": "command-cd-1",
+            },
+        )
+    ]
+
+
+def test_cd_router_uses_only_the_canonical_safe_bounded_acknowledgement():
+    path = "/workspace/line\n\t`tick`/" + ("segment" * 90)
+    expected = format_working_directory_response(path)
+
+    class Manager:
+        def __init__(self, *, canonical: bool = True) -> None:
+            self.canonical = canonical
+
+        async def get_active_agent(self, **_kwargs) -> str:
+            return "codex"
+
+        async def get_working_directory(self, **_kwargs):
+            return {"path": path}
+
+        async def set_working_directory(self, _path: str, **_kwargs):
+            return {
+                "path": path,
+                "command_response": (
+                    expected
+                    if self.canonical
+                    else f"working directory: {path}"
+                ),
+            }
+
+    async def scenario() -> None:
+        command_text = f'/cd "{path}"'
+        router = MVPCommandRouter(Manager())
+        assert await router.handle_command(
+            parse_command("/cd"), _envelope("/cd")
+        ) == expected
+        assert await router.handle_command(
+            parse_command(command_text), _envelope(command_text)
+        ) == expected
+        assert len(expected) == WORKING_DIRECTORY_RESPONSE_MAX_CHARS
+        assert "line 'tick'" in expected
+        assert "`" not in expected
+        assert not any(character in expected for character in "\n\r\t\v\f")
+
+        rejected = await MVPCommandRouter(
+            Manager(canonical=False)
+        ).handle_command(parse_command(command_text), _envelope(command_text))
+        assert rejected == (
+            "cannot set working directory: "
+            "invalid working directory persistence response"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_cd_rejects_invalid_shell_like_path_arity_without_mutation():
+    class Manager:
+        async def get_active_agent(self, **_kwargs) -> str:
+            return "codex"
+
+        async def set_working_directory(self, _path: str, **_kwargs):
+            raise AssertionError("invalid /cd syntax must not mutate state")
+
+    async def scenario() -> None:
+        router = MVPCommandRouter(Manager())
+        for text in ('/cd one two', '/cd "unterminated', '/cd ""'):
+            assert await router.handle_command(
+                parse_command(text), _envelope(text)
+            ) == "usage: /cd [path]"
+
+    asyncio.run(scenario())
+
+
+def test_cd_uses_the_captured_agent_scope_without_cross_agent_leakage():
+    directories = {
+        "codex": "/workspace/codex",
+        "writer": "/workspace/writer",
+    }
+
+    class Manager:
+        async def get_active_agent(self, **_kwargs) -> str:
+            return "codex"
+
+        async def get_working_directory(self, *, agent_id: str, **_kwargs):
+            return {"path": directories[agent_id]}
+
+        async def set_working_directory(
+            self, path: str, *, agent_id: str, **_kwargs
+        ):
+            directories[agent_id] = path
+            return {"path": path}
+
+    writer_snapshot = {
+        "agent_id": "writer",
+        "conversation_id": "wechat:bot:user:default:writer",
+    }
+
+    async def scenario() -> None:
+        router = MVPCommandRouter(Manager())
+        writer_query = replace(
+            _envelope("/cd"),
+            agent_id="writer",
+            conversation_id="wechat:bot:user:default:writer",
+            raw={"__command_snapshot": writer_snapshot},
+        )
+        assert await router.handle_command(
+            parse_command("/cd"), writer_query
+        ) == "working directory: /workspace/writer"
+
+        writer_set = replace(
+            _envelope("/cd /workspace/writer-next"),
+            agent_id="writer",
+            conversation_id="wechat:bot:user:default:writer",
+            raw={"__command_snapshot": writer_snapshot},
+        )
+        assert await router.handle_command(
+            parse_command("/cd /workspace/writer-next"), writer_set
+        ) == "working directory: /workspace/writer-next"
+
+        assert await router.handle_command(
+            parse_command("/cd"), _envelope("/cd")
+        ) == "working directory: /workspace/codex"
+
+    asyncio.run(scenario())
+    assert directories == {
+        "codex": "/workspace/codex",
+        "writer": "/workspace/writer-next",
+    }
+
+
+def test_cd_bounds_manager_errors():
+    unsafe_detail = ("private\n`path` " * 100) + "tail"
+
+    class Manager:
+        async def get_active_agent(self, **_kwargs) -> str:
+            return "codex"
+
+        async def get_working_directory(self, **_kwargs):
+            raise RuntimeError(unsafe_detail)
+
+        async def set_working_directory(self, _path: str, **_kwargs):
+            raise RuntimeError(unsafe_detail)
+
+    async def scenario() -> None:
+        router = MVPCommandRouter(Manager())
+        responses = (
+            await router.handle_command(parse_command("/cd"), _envelope("/cd")),
+            await router.handle_command(
+                parse_command("/cd /workspace"), _envelope("/cd /workspace")
+            ),
+        )
+        for response in responses:
+            assert "private 'path'" in response
+            assert "\n" not in response
+            assert "`" not in response
+            assert response.endswith("...")
+            assert len(response) < 550
+
+    asyncio.run(scenario())
+
+
 def test_durable_router_keeps_bounded_shell_command():
     calls: list[tuple[str, Path | None]] = []
 
@@ -258,6 +472,60 @@ def test_durable_router_keeps_bounded_shell_command():
 
     asyncio.run(scenario())
     assert calls == [("printf hello", Path("/workspace"))]
+
+
+def test_shell_uses_captured_execution_workspace_for_agent_cwd():
+    directory_reads: list[dict[str, object]] = []
+    shell_calls: list[tuple[str, str | Path | None]] = []
+    workspace_snapshot = {
+        "path": "/accepted/writer-project",
+        "workspace_version": 4,
+    }
+
+    class Manager:
+        async def get_working_directory(self, **kwargs):
+            directory_reads.append(kwargs)
+            snapshot = kwargs["workspace_snapshot"]
+            return {"path": snapshot["path"]}
+
+    def runner(command: str, *, cwd: str | Path | None = None) -> str:
+        shell_calls.append((command, cwd))
+        return "exit code: 0\n/accepted/writer-project"
+
+    command_snapshot = {
+        "agent_id": "writer",
+        "conversation_id": "wechat:bot:user:default:writer",
+        "execution_workspace": workspace_snapshot,
+    }
+    envelope = replace(
+        _envelope("/sh pwd"),
+        agent_id="writer",
+        conversation_id="wechat:bot:user:default:writer",
+        raw={"__command_snapshot": command_snapshot},
+    )
+
+    async def scenario() -> None:
+        result = await MVPCommandRouter(
+            Manager(),
+            shell_cwd=Path("/fallback"),
+            shell_runner=runner,
+        ).handle_command(parse_command("/sh pwd"), envelope)
+        assert "## Shell Result" in result
+
+    asyncio.run(scenario())
+    assert directory_reads == [
+        {
+            "channel": "wechat",
+            "bot_id": "bot",
+            "external_user_id": "user",
+            "user_id": "user",
+            "session_id": "default",
+            "conversation_id": "wechat:bot:user:default:writer",
+            "agent_id": "writer",
+            "workspace_snapshot": workspace_snapshot,
+        }
+    ]
+    assert shell_calls == [("pwd", "/accepted/writer-project")]
 
 
 def test_durable_router_reports_shell_timeout_without_retrying():
@@ -713,20 +981,24 @@ def test_model_effort_default_does_not_require_live_catalog():
     asyncio.run(scenario())
 
 
-def test_model_commands_terminalize_sdk_service_failures_deterministically():
+def test_model_commands_terminalize_sdk_service_failures_deterministically(caplog):
+    log_secret = "SYNTHETIC-MODEL-LOG-SECRET"
+
     class CatalogFailure(_ModelCommandManager):
         async def list_models(self, **_kwargs):
-            raise TransportClosedError("connection detail must not leak")
+            raise TransportClosedError(
+                "https://provider.invalid/v1?token=" + log_secret
+            )
 
     class SelectionFailure(_ModelCommandManager):
         async def set_model(self, *_args, **_kwargs):
             raise CodexRpcError(
                 -32000,
-                "provider detail must not leak",
+                "api_key=" + log_secret,
             )
 
         async def set_reasoning_effort(self, *_args, **_kwargs):
-            raise TransportClosedError("connection detail must not leak")
+            raise TransportClosedError("Bearer " + log_secret)
 
     class DecodeFailure(_ModelCommandManager):
         async def list_models(self, **_kwargs):
@@ -761,6 +1033,9 @@ def test_model_commands_terminalize_sdk_service_failures_deterministically():
         ) == "cannot set model: model service is unavailable"
 
     asyncio.run(scenario())
+
+    assert log_secret not in caplog.text
+    assert "https://provider.invalid" not in caplog.text
 
 
 def test_model_capability_errors_are_bounded_and_markdown_safe():
@@ -815,6 +1090,99 @@ def test_model_read_response_bounds_and_sanitizes_live_catalog_fields():
         assert "\n## injected" not in result
         assert "'" in result
         assert "..." in result
+
+    asyncio.run(scenario())
+
+
+def test_model_read_redacts_credential_urls_without_losing_current_identity():
+    sensitive_model = (
+        "https://synthetic-provider.invalid/v1/models?"
+        "api_key=SYNTHETIC-MODEL-MARKER"
+    )
+    sensitive_display = "password=SYNTHETIC-DISPLAY-MARKER"
+    sensitive_effort = "Bearer SYNTHETIC-EFFORT-MARKER"
+
+    class Manager(_ModelCommandManager):
+        async def list_models(self, **_kwargs):
+            return [
+                {
+                    "id": sensitive_model,
+                    "displayName": sensitive_display,
+                    "isDefault": True,
+                    "supportedReasoningEfforts": [sensitive_effort],
+                    "defaultReasoningEffort": sensitive_effort,
+                },
+                {"id": "safe-model", "isDefault": False},
+            ]
+
+        async def get_model_selection(self, **_kwargs) -> dict[str, str]:
+            # Selection must continue to use the exact internal model ID.  It
+            # is only the public rendering that is redacted.
+            return {
+                "model_id": sensitive_model,
+                "reasoning_effort": sensitive_effort,
+            }
+
+    async def scenario() -> None:
+        router = MVPCommandRouter(Manager())
+        catalog = str(
+            await router.handle_command(
+                parse_command("/models"), _envelope("/models")
+            )
+        )
+        selection = str(
+            await router.handle_command(
+                parse_command("/model"), _envelope("/model")
+            )
+        )
+
+        # The raw identity still matched the current catalog record before
+        # presentation, so redaction must not create an unavailable/default
+        # selection or move the current marker to another model.
+        assert catalog.count("**(current)**") == 1
+        assert "**(unavailable)**" not in catalog
+        for rendered in (catalog, selection):
+            assert "https://" not in rendered
+            assert "synthetic-provider.invalid" not in rendered
+            assert "SYNTHETIC-MODEL-MARKER" not in rendered
+            assert "SYNTHETIC-DISPLAY-MARKER" not in rendered
+            assert "SYNTHETIC-EFFORT-MARKER" not in rendered
+            assert "<redacted" in rendered
+
+    asyncio.run(scenario())
+
+
+def test_models_redacts_credential_url_in_stale_durable_selection():
+    sensitive_model = (
+        "https://stale-provider.invalid/v1/models?"
+        "token=SYNTHETIC-STALE-MODEL-MARKER"
+    )
+    sensitive_effort = "Bearer SYNTHETIC-STALE-EFFORT-MARKER"
+
+    class Manager(_ModelCommandManager):
+        async def list_models(self, **_kwargs):
+            return [{"id": "safe-model", "isDefault": True}]
+
+        async def get_model_selection(self, **_kwargs) -> dict[str, str]:
+            return {
+                "model_id": sensitive_model,
+                "reasoning_effort": sensitive_effort,
+            }
+
+    async def scenario() -> None:
+        rendered = str(
+            await MVPCommandRouter(Manager()).handle_command(
+                parse_command("/models"), _envelope("/models")
+            )
+        )
+
+        assert rendered.count("**(current)**") == 1
+        assert "**(unavailable)**" in rendered
+        assert "https://" not in rendered
+        assert "stale-provider.invalid" not in rendered
+        assert "SYNTHETIC-STALE-MODEL-MARKER" not in rendered
+        assert "SYNTHETIC-STALE-EFFORT-MARKER" not in rendered
+        assert "<redacted" in rendered
 
     asyncio.run(scenario())
 
@@ -1171,6 +1539,272 @@ def test_clear_resets_runtime_and_forgets_durable_thread_binding(tmp_path):
             ) is None
         finally:
             await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_compact_uses_current_agent_scope_and_reports_expected_errors():
+    class Manager:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def get_active_agent(self, **_kwargs) -> str:
+            return "codex"
+
+        async def compact_session(self, **kwargs) -> str:
+            self.calls.append(kwargs)
+            return "provider-thread-id"
+
+    async def scenario() -> None:
+        manager = Manager()
+        router = MVPCommandRouter(manager)
+        envelope = _envelope("/compact", session_id="session-a")
+
+        assert await router.handle_command(
+            parse_command("/compact"), envelope
+        ) == "context compacted"
+        assert manager.calls == [
+            {
+                "channel": "wechat",
+                "bot_id": "bot",
+                "external_user_id": "user",
+                "user_id": "user",
+                "session_id": "session-a",
+                "conversation_id": "wechat:bot:user:session-a:codex",
+                "agent_id": "codex",
+                "actor": "user",
+            }
+        ]
+        assert await router.handle_command(
+            parse_command("/compact now"), _envelope("/compact now")
+        ) == "usage: /compact"
+        assert len(manager.calls) == 1
+
+        class BrokenManager(Manager):
+            async def compact_session(self, **_kwargs) -> str:
+                raise RuntimeError("cannot compact while a task is running")
+
+        assert await MVPCommandRouter(BrokenManager()).handle_command(
+            parse_command("/compact"), _envelope("/compact")
+        ) == (
+            "cannot compact conversation: "
+            "cannot compact while a task is running"
+        )
+
+        class UnconfirmedManager(Manager):
+            async def compact_session(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "thread_id": "provider-thread-id",
+                    "completion_confirmed": False,
+                }
+
+        assert await MVPCommandRouter(UnconfirmedManager()).handle_command(
+            parse_command("/compact"), _envelope("/compact")
+        ) == "context compaction started"
+
+        class UnsupportedManager:
+            async def get_active_agent(self, **_kwargs) -> str:
+                return "codex"
+
+        assert await MVPCommandRouter(UnsupportedManager()).handle_command(
+            parse_command("/compact"), _envelope("/compact")
+        ) == "cannot compact conversation: context compaction is unavailable"
+
+    asyncio.run(scenario())
+
+
+def test_clear_and_compact_redact_provider_transport_details():
+    unsafe = (
+        "stream disconnected before completion: error sending request for url "
+        "(http://provider-secret.example:8317/v1/responses?api_key=TOPSECRET) "
+        "Authorization: Bearer private-token"
+    )
+
+    class Manager:
+        async def get_active_agent(self, **_kwargs) -> str:
+            return "codex"
+
+        async def clear_session(self, **_kwargs):
+            raise RuntimeError(unsafe)
+
+        async def compact_session(self, **_kwargs):
+            raise RuntimeError(unsafe)
+
+    async def scenario() -> None:
+        router = MVPCommandRouter(Manager())
+        responses = (
+            await router.handle_command(
+                parse_command("/clear"), _envelope("/clear")
+            ),
+            await router.handle_command(
+                parse_command("/compact"), _envelope("/compact")
+            ),
+        )
+
+        for response in responses:
+            assert "<redacted-url>" in response
+            assert "<redacted>" in response
+            assert "provider-secret" not in response
+            assert "/v1/responses" not in response
+            assert "TOPSECRET" not in response
+            assert "private-token" not in response
+
+    asyncio.run(scenario())
+
+
+def test_public_errors_redact_vendor_api_headers_and_ipv6_endpoints():
+    unsafe = (
+        "connection to [2001:db8::5]:8317/private/path failed; "
+        "X-API-Key: TOPSECRET"
+    )
+
+    class Manager:
+        async def get_active_agent(self, **_kwargs):
+            return "codex"
+
+        async def clear_session(self, **_kwargs):
+            raise RuntimeError(unsafe)
+
+    async def scenario() -> None:
+        response = await MVPCommandRouter(Manager()).handle_command(
+            parse_command("/clear"), _envelope("/clear")
+        )
+        assert "<redacted-host>" in response
+        assert "<redacted>" in response
+        assert "2001:db8" not in response
+        assert "/private/path" not in response
+        assert "TOPSECRET" not in response
+
+    asyncio.run(scenario())
+
+
+def test_all_detailed_control_errors_redact_transport_hosts_and_credentials():
+    unsafe = (
+        "provider call https://rpc-secret.example:8317/v1/responses?api_key=TOPSECRET "
+        "Authorization: Bearer private-token; fallback "
+        "provider-secret.example:9443/internal/path; mirror "
+        "192.0.2.44:443/private; "
+        '"credential": "json-secret", password=plain-secret'
+    )
+
+    class Manager:
+        async def get_active_agent(self, **_kwargs):
+            return "codex"
+
+        async def clear_session(self, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def compact_session(self, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def get_system_role(self, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def set_system_role(self, *_args, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def get_mode(self, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def set_mode(self, *_args, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def list_modes(self, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def list_models(self, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def set_reasoning_effort(self, *_args, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def get_working_directory(self, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def set_working_directory(self, *_args, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def ensure_agent(self, *_args, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def delete_agent(self, *_args, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def set_active_agent(self, *_args, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def set_notify(self, *_args, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def drain_deferred_replies(self, **_kwargs):
+            raise ValueError(unsafe)
+
+        async def status(self, **_kwargs):
+            return [
+                {
+                    "task_id": "unsafe-status-task",
+                    "state": "running",
+                    "last_error": unsafe,
+                }
+            ]
+
+        async def list_tasks(self, **_kwargs):
+            return [
+                {
+                    "task_id": "unsafe-history-task",
+                    "state": "failed",
+                    "last_error": unsafe,
+                }
+            ]
+
+    async def scenario() -> None:
+        router = MVPCommandRouter(Manager())
+        commands = (
+            "/clear",
+            "/compact",
+            "/system",
+            "/system planner",
+            "/mode",
+            "/mode chat",
+            "/modes",
+            "/models",
+            "/model effort default",
+            "/cd",
+            "/cd /workspace",
+            "/sh pwd",
+            "/ask writer investigate",
+            "/delagent writer",
+            "/agent writer",
+            "/notify on",
+            "/recv",
+            "/status",
+            "/tasks",
+        )
+        responses = [
+            await router.handle_command(parse_command(text), _envelope(text))
+            for text in commands
+        ]
+
+        forbidden = (
+            "rpc-secret",
+            "provider-secret",
+            "192.0.2.44",
+            "/v1/responses",
+            "/internal/path",
+            "TOPSECRET",
+            "private-token",
+            "json-secret",
+            "plain-secret",
+        )
+        for response in responses:
+            assert response
+            assert not any(value in response for value in forbidden), response
+            assert "<redacted" in response
+            assert "\n" not in response or response.startswith(
+                ("## Shell Error", "active tasks:", "tasks:")
+            )
+            assert len(response) < 700
 
     asyncio.run(scenario())
 

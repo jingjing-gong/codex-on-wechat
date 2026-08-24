@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import sqlite3
 import threading
 import uuid
@@ -34,7 +35,14 @@ from .maintenance_authority import (
     canonical_mailbox_review_authorization_digest,
     canonical_mailbox_review_payload_hash,
 )
-from .store import InvalidTransition, NotFoundError, QueueFullError, StoreError
+from .store import (
+    InvalidTransition,
+    NotFoundError,
+    QueueFullError,
+    StoreError,
+    WORKING_DIRECTORY_RESPONSE_PREFIX,
+    format_working_directory_response,
+)
 from .models import (
     AgentEvent,
     AgentAdmissionCounterRecord,
@@ -76,6 +84,10 @@ from .models import (
     OutboxState,
     PresentationState,
     RecoveryReport,
+    ReplyAggregateMemberRecord,
+    ReplyAggregateRecord,
+    ReplyAggregateState,
+    ReplyAggregationResult,
     ReplyCandidateRecord,
     ReplyFragmentRecord,
     ReplyFragmentState,
@@ -170,6 +182,11 @@ DEFAULT_TRANSCRIPTION_TTL_SECONDS = 300.0
 # turn disappears.  The absolute expiry is persisted on both the mailbox
 # aggregate and every one of its invocation attempts.
 DEFAULT_MAILBOX_TTL_SECONDS = 86_400.0
+
+# An open compatible text group is a durable buffer, not an indefinite inbox.
+# The deadline is stored with the group so restart and scheduled reconciliation
+# observe the same first-member cutoff.
+DEFAULT_REPLY_AGGREGATION_MAX_AGE_SECONDS = 120.0
 
 # Admission is enforced at the durable invocation boundary.  These defaults
 # match the deployment contract in ``plan.md``; callers may lower them for a
@@ -279,6 +296,7 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     max_children_per_task INTEGER NOT NULL DEFAULT 0 CHECK (max_children_per_task >= 0),
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     default_mode_id TEXT NOT NULL DEFAULT 'chat',
+    codex_config_profile TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     PRIMARY KEY (agent_id, profile_version)
 );
@@ -878,8 +896,10 @@ WHERE policy_version=1
 # One exact inbound envelope owns one immutable ten-SendMsg reply allowance.
 # Candidates and fragments retain completed-item boundaries even when the
 # allowance is exhausted; `/recv` moves only those retained fragments into a
-# fresh inbound scope.  `reply_slots` is the single authority for logical
-# sends across text and media projections.
+# fresh inbound scope.  `reply_slots` is the authority for ordinary logical
+# sends across text and media projections.  The only slotless candidate-owned
+# exception is a schema-validated contextless failure notice after all ten
+# ordinary slots are already consumed.
 _MIGRATION_19 = """
 CREATE TABLE IF NOT EXISTS reply_scopes (
     reply_scope_id TEXT PRIMARY KEY,
@@ -2972,6 +2992,471 @@ CREATE INDEX IF NOT EXISTS idx_reply_candidates_inbox_presentation
 """
 
 
+_MIGRATION_33_SESSION_AGENT_WORKING_DIRECTORIES = """
+CREATE TABLE IF NOT EXISTS session_agent_working_directories (
+    channel TEXT NOT NULL CHECK (length(trim(channel)) > 0),
+    bot_id TEXT NOT NULL CHECK (length(trim(bot_id)) > 0),
+    external_user_id TEXT NOT NULL CHECK (length(trim(external_user_id)) > 0),
+    session_id TEXT NOT NULL CHECK (length(trim(session_id)) > 0),
+    agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+    relative_path TEXT NOT NULL CHECK (
+        length(relative_path) > 0 AND instr(relative_path, char(0)) = 0
+    ),
+    directory_device INTEGER NOT NULL CHECK (
+        typeof(directory_device) = 'integer' AND directory_device >= 0
+    ),
+    directory_inode INTEGER NOT NULL CHECK (
+        typeof(directory_inode) = 'integer' AND directory_inode >= 0
+    ),
+    updated_by TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (
+        channel, bot_id, external_user_id, session_id, agent_id
+    )
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_session_agent_working_directories_agent
+    ON session_agent_working_directories(agent_id);
+"""
+
+
+_MIGRATION_34_REPLY_AGGREGATION = """
+CREATE TABLE IF NOT EXISTS reply_aggregates (
+    reply_aggregate_id TEXT PRIMARY KEY CHECK (
+        length(trim(reply_aggregate_id)) > 0
+    ),
+    aggregation_key_hash TEXT NOT NULL CHECK (
+        length(aggregation_key_hash) = 64
+        AND aggregation_key_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    aggregation_key_json TEXT NOT NULL CHECK (
+        json_valid(aggregation_key_json) = 1
+        AND json_type(aggregation_key_json) = 'object'
+    ),
+    origin_reply_scope_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    external_user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT 'default',
+    reply_target_json TEXT NOT NULL CHECK (
+        json_valid(reply_target_json) = 1
+        AND json_type(reply_target_json) = 'object'
+    ),
+    provenance_kind TEXT NOT NULL CHECK (
+        provenance_kind IN ('live','command','migration')
+    ),
+    provenance_id TEXT NOT NULL CHECK (length(trim(provenance_id)) > 0),
+    task_id TEXT,
+    execution_id TEXT,
+    command_id TEXT,
+    agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+    sender_format TEXT NOT NULL CHECK (length(trim(sender_format)) > 0),
+    sender_prefix TEXT NOT NULL DEFAULT '',
+    notify_enabled INTEGER NOT NULL CHECK (notify_enabled IN (0, 1)),
+    foreground INTEGER NOT NULL CHECK (foreground IN (0, 1)),
+    priority INTEGER NOT NULL CHECK (priority BETWEEN 0 AND 3),
+    delivery_mode TEXT NOT NULL CHECK (
+        delivery_mode IN ('inbox_only','push_eligible','requires_attention')
+    ),
+    presentation_class TEXT NOT NULL CHECK (
+        length(trim(presentation_class)) > 0
+    ),
+    renderer_version TEXT NOT NULL CHECK (length(trim(renderer_version)) > 0),
+    wire_kind TEXT NOT NULL CHECK (wire_kind IN ('text','media','bundle')),
+    state TEXT NOT NULL CHECK (state IN ('open','sealed')),
+    content TEXT NOT NULL DEFAULT '',
+    attachments_json TEXT NOT NULL DEFAULT '[]' CHECK (
+        json_valid(attachments_json) = 1
+        AND json_type(attachments_json) = 'array'
+    ),
+    content_hash TEXT NOT NULL CHECK (
+        length(content_hash) = 64
+        AND content_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    payload_hash TEXT NOT NULL CHECK (
+        length(payload_hash) = 64
+        AND payload_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    character_count INTEGER NOT NULL CHECK (
+        typeof(character_count) = 'integer'
+        AND character_count BETWEEN 0 AND 3000
+        AND character_count = length(content)
+    ),
+    first_source_sequence INTEGER NOT NULL CHECK (
+        typeof(first_source_sequence) = 'integer' AND first_source_sequence >= 0
+    ),
+    last_source_sequence INTEGER NOT NULL CHECK (
+        typeof(last_source_sequence) = 'integer'
+        AND last_source_sequence >= first_source_sequence
+    ),
+    next_member_ordinal INTEGER NOT NULL DEFAULT 1 CHECK (
+        typeof(next_member_ordinal) = 'integer' AND next_member_ordinal > 0
+    ),
+    representative_reply_candidate_id TEXT NOT NULL,
+    flush_due_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    sealed_at TEXT,
+    seal_reason TEXT,
+    wire_reply_fragment_id TEXT UNIQUE,
+    FOREIGN KEY (origin_reply_scope_id) REFERENCES reply_scopes(reply_scope_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE SET NULL,
+    FOREIGN KEY (execution_id) REFERENCES task_executions(execution_id)
+        ON DELETE SET NULL,
+    FOREIGN KEY (command_id) REFERENCES command_receipts(command_id)
+        ON DELETE SET NULL,
+    FOREIGN KEY (representative_reply_candidate_id)
+        REFERENCES reply_candidates(reply_candidate_id) ON DELETE RESTRICT,
+    CHECK (
+        (state = 'open'
+         AND (provenance_kind = 'migration'
+              OR (wire_kind = 'text' AND character_count > 0))
+         AND flush_due_at IS NOT NULL AND sealed_at IS NULL
+         AND seal_reason IS NULL AND wire_reply_fragment_id IS NULL)
+        OR
+        (state = 'sealed' AND sealed_at IS NOT NULL
+         AND length(trim(seal_reason)) > 0 AND flush_due_at IS NULL)
+    ),
+    CHECK (
+        (provenance_kind = 'live' AND task_id IS NOT NULL
+         AND execution_id IS NOT NULL AND command_id IS NULL)
+        OR
+        (provenance_kind = 'command' AND command_id IS NOT NULL)
+        OR
+        (provenance_kind = 'migration')
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reply_aggregates_one_open_key
+    ON reply_aggregates(aggregation_key_hash) WHERE state = 'open';
+CREATE INDEX IF NOT EXISTS idx_reply_aggregates_due
+    ON reply_aggregates(state, flush_due_at, reply_aggregate_id);
+CREATE INDEX IF NOT EXISTS idx_reply_aggregates_task_execution
+    ON reply_aggregates(task_id, execution_id, state, created_at);
+CREATE INDEX IF NOT EXISTS idx_reply_aggregates_recipient
+    ON reply_aggregates(
+        channel, bot_id, external_user_id, session_id, state, created_at
+    );
+
+CREATE TABLE IF NOT EXISTS reply_aggregate_members (
+    reply_aggregate_member_id TEXT PRIMARY KEY CHECK (
+        length(trim(reply_aggregate_member_id)) > 0
+    ),
+    reply_aggregate_id TEXT NOT NULL,
+    member_ordinal INTEGER NOT NULL CHECK (
+        typeof(member_ordinal) = 'integer' AND member_ordinal > 0
+    ),
+    reply_candidate_id TEXT NOT NULL,
+    source_fragment_ordinal INTEGER NOT NULL CHECK (
+        typeof(source_fragment_ordinal) = 'integer'
+        AND source_fragment_ordinal > 0
+    ),
+    source_reply_fragment_id TEXT,
+    source_sequence INTEGER NOT NULL CHECK (
+        typeof(source_sequence) = 'integer' AND source_sequence >= 0
+    ),
+    source_character_start INTEGER NOT NULL CHECK (
+        typeof(source_character_start) = 'integer'
+        AND source_character_start >= 0
+    ),
+    source_character_count INTEGER NOT NULL CHECK (
+        typeof(source_character_count) = 'integer'
+        AND source_character_count >= 0
+    ),
+    prefix_before TEXT NOT NULL DEFAULT '',
+    separator_before TEXT NOT NULL CHECK (separator_before IN ('', char(10)||char(10))),
+    rendered_content TEXT NOT NULL,
+    rendered_content_hash TEXT NOT NULL CHECK (
+        length(rendered_content_hash) = 64
+        AND rendered_content_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_rendered_content_hash TEXT NOT NULL CHECK (
+        length(source_rendered_content_hash) = 64
+        AND source_rendered_content_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_rendered_character_count INTEGER NOT NULL CHECK (
+        typeof(source_rendered_character_count) = 'integer'
+        AND source_rendered_character_count >= 0
+    ),
+    aggregate_character_start INTEGER NOT NULL CHECK (
+        typeof(aggregate_character_start) = 'integer'
+        AND aggregate_character_start >= 0
+    ),
+    created_at TEXT NOT NULL,
+    UNIQUE (reply_aggregate_id, member_ordinal),
+    UNIQUE (reply_candidate_id, source_fragment_ordinal),
+    UNIQUE (source_reply_fragment_id),
+    FOREIGN KEY (reply_aggregate_id)
+        REFERENCES reply_aggregates(reply_aggregate_id) ON DELETE RESTRICT,
+    FOREIGN KEY (reply_candidate_id)
+        REFERENCES reply_candidates(reply_candidate_id) ON DELETE RESTRICT,
+    FOREIGN KEY (source_reply_fragment_id)
+        REFERENCES reply_fragments(reply_fragment_id) ON DELETE RESTRICT,
+    CHECK (
+        source_character_start + source_character_count
+        <= source_rendered_character_count
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_reply_aggregate_members_candidate
+    ON reply_aggregate_members(
+        reply_candidate_id, source_fragment_ordinal, reply_aggregate_id
+    );
+
+CREATE TRIGGER IF NOT EXISTS trg_reply_aggregates_sealed_immutable
+BEFORE UPDATE ON reply_aggregates
+WHEN OLD.state = 'sealed' AND (
+    NEW.reply_aggregate_id IS NOT OLD.reply_aggregate_id
+    OR NEW.aggregation_key_hash IS NOT OLD.aggregation_key_hash
+    OR NEW.aggregation_key_json IS NOT OLD.aggregation_key_json
+    OR NEW.origin_reply_scope_id IS NOT OLD.origin_reply_scope_id
+    OR NEW.channel IS NOT OLD.channel
+    OR NEW.bot_id IS NOT OLD.bot_id
+    OR NEW.external_user_id IS NOT OLD.external_user_id
+    OR NEW.session_id IS NOT OLD.session_id
+    OR NEW.reply_target_json IS NOT OLD.reply_target_json
+    OR NEW.provenance_kind IS NOT OLD.provenance_kind
+    OR NEW.provenance_id IS NOT OLD.provenance_id
+    OR NEW.task_id IS NOT OLD.task_id
+    OR NEW.execution_id IS NOT OLD.execution_id
+    OR NEW.command_id IS NOT OLD.command_id
+    OR NEW.agent_id IS NOT OLD.agent_id
+    OR NEW.sender_format IS NOT OLD.sender_format
+    OR NEW.sender_prefix IS NOT OLD.sender_prefix
+    OR NEW.notify_enabled IS NOT OLD.notify_enabled
+    OR NEW.foreground IS NOT OLD.foreground
+    OR NEW.priority IS NOT OLD.priority
+    OR NEW.delivery_mode IS NOT OLD.delivery_mode
+    OR NEW.presentation_class IS NOT OLD.presentation_class
+    OR NEW.renderer_version IS NOT OLD.renderer_version
+    OR NEW.wire_kind IS NOT OLD.wire_kind
+    OR NEW.state IS NOT OLD.state
+    OR NEW.content IS NOT OLD.content
+    OR NEW.attachments_json IS NOT OLD.attachments_json
+    OR NEW.content_hash IS NOT OLD.content_hash
+    OR NEW.payload_hash IS NOT OLD.payload_hash
+    OR NEW.character_count IS NOT OLD.character_count
+    OR NEW.first_source_sequence IS NOT OLD.first_source_sequence
+    OR NEW.last_source_sequence IS NOT OLD.last_source_sequence
+    OR NEW.next_member_ordinal IS NOT OLD.next_member_ordinal
+    OR NEW.representative_reply_candidate_id
+       IS NOT OLD.representative_reply_candidate_id
+    OR NEW.flush_due_at IS NOT OLD.flush_due_at
+    OR NEW.created_at IS NOT OLD.created_at
+    OR NEW.updated_at IS NOT OLD.updated_at
+    OR NEW.sealed_at IS NOT OLD.sealed_at
+    OR NEW.seal_reason IS NOT OLD.seal_reason
+    OR (OLD.wire_reply_fragment_id IS NOT NULL
+        AND NEW.wire_reply_fragment_id IS NOT OLD.wire_reply_fragment_id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sealed reply aggregate is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reply_aggregates_no_delete
+BEFORE DELETE ON reply_aggregates
+BEGIN
+    SELECT RAISE(ABORT, 'reply aggregates are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reply_aggregate_members_open_insert
+BEFORE INSERT ON reply_aggregate_members
+WHEN NOT EXISTS (
+    SELECT 1 FROM reply_aggregates
+     WHERE reply_aggregate_id = NEW.reply_aggregate_id AND state = 'open'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sealed reply aggregate membership is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reply_aggregate_members_no_update
+BEFORE UPDATE ON reply_aggregate_members
+BEGIN
+    SELECT RAISE(ABORT, 'reply aggregate membership is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reply_aggregate_members_no_delete
+BEFORE DELETE ON reply_aggregate_members
+BEGIN
+    SELECT RAISE(ABORT, 'reply aggregate membership is append-only');
+END;
+"""
+
+
+_MIGRATION_34_REPLY_AGGREGATE_ALLOCATION_TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS trg_reply_slots_aggregate_sealed_insert
+BEFORE INSERT ON reply_slots
+WHEN NEW.reply_aggregate_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM reply_aggregates
+     WHERE reply_aggregate_id = NEW.reply_aggregate_id AND state = 'sealed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'reply slot requires a sealed aggregate');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reply_slots_aggregate_sealed_update
+BEFORE UPDATE OF reply_aggregate_id ON reply_slots
+WHEN NEW.reply_aggregate_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM reply_aggregates
+     WHERE reply_aggregate_id = NEW.reply_aggregate_id AND state = 'sealed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'reply slot requires a sealed aggregate');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_user_outbox_aggregate_sealed_insert
+BEFORE INSERT ON user_outbox
+WHEN NEW.reply_aggregate_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM reply_aggregates
+     WHERE reply_aggregate_id = NEW.reply_aggregate_id AND state = 'sealed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'reply outbox requires a sealed aggregate');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_user_outbox_aggregate_sealed_update
+BEFORE UPDATE OF reply_aggregate_id ON user_outbox
+WHEN NEW.reply_aggregate_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM reply_aggregates
+     WHERE reply_aggregate_id = NEW.reply_aggregate_id AND state = 'sealed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'reply outbox requires a sealed aggregate');
+END;
+
+-- The sole slotless candidate-owned send is a contextless terminal failure
+-- safety notice after an exact inbound's ten normal reply slots are full.
+-- Enforce the complete durable provenance at the storage boundary so callers
+-- cannot turn a priority flag or a hostile provider event into a quota bypass.
+CREATE TRIGGER IF NOT EXISTS trg_user_outbox_failure_safety_insert
+BEFORE INSERT ON user_outbox
+WHEN NEW.reply_slot_id IS NULL
+ AND NEW.reply_candidate_id IS NOT NULL
+ AND NEW.active_wire_variant = 'contextless'
+ AND NOT (
+    NEW.reply_ordinal = 10
+    AND NEW.reply_scope_id IS NOT NULL
+    AND NEW.reply_fragment_id IS NOT NULL
+    AND NEW.reply_aggregate_id IS NOT NULL
+    AND NEW.contextless_client_id IS NOT NULL
+    AND NEW.contextless_client_id <> NEW.client_id
+    AND NEW.attachments_json = '[]'
+    AND NEW.from_user_id = NEW.bot_id
+    AND EXISTS (
+        SELECT 1
+          FROM task_events AS failure_event
+          JOIN reply_candidates AS failure_candidate
+            ON failure_candidate.reply_candidate_id = NEW.reply_candidate_id
+          JOIN reply_fragments AS failure_fragment
+            ON failure_fragment.reply_fragment_id = NEW.reply_fragment_id
+          JOIN reply_aggregates AS failure_aggregate
+            ON failure_aggregate.reply_aggregate_id = NEW.reply_aggregate_id
+          JOIN reply_scopes AS failure_scope
+            ON failure_scope.reply_scope_id = NEW.reply_scope_id
+         WHERE failure_event.event_id = NEW.event_id
+           AND failure_event.task_id = NEW.task_id
+           AND failure_event.execution_id = failure_candidate.execution_id
+           AND failure_event.event_type = 'failure_notice'
+           AND failure_event.visibility = 'user'
+           AND failure_event.destination_agent_id IS NULL
+           AND failure_event.attachments_json = '[]'
+           AND failure_event.content IN (
+               'task failed: ' || failure_event.task_id || char(10) ||
+               'check /tasks before retrying. /retry reuses the same context; /clear starts fresh.',
+               'task failed: ' || failure_event.task_id || char(10) ||
+               'check /tasks before retrying or sending a new prompt.'
+           )
+           AND failure_candidate.event_id = failure_event.event_id
+           AND failure_candidate.task_id = failure_event.task_id
+           AND failure_candidate.content = failure_event.content
+           AND failure_candidate.attachments_json = '[]'
+           AND failure_candidate.origin_reply_scope_id = NEW.reply_scope_id
+           AND failure_candidate.channel = NEW.channel
+           AND failure_candidate.bot_id = NEW.bot_id
+           AND failure_candidate.external_user_id = NEW.external_user_id
+           AND failure_candidate.session_id = NEW.session_id
+           AND failure_candidate.agent_id = NEW.agent_id
+           AND failure_candidate.priority = NEW.priority
+           AND failure_candidate.delivery_mode = NEW.delivery_mode
+           AND failure_candidate.notify_enabled = NEW.notify_enabled
+           AND failure_candidate.foreground = NEW.foreground
+           AND failure_fragment.reply_candidate_id =
+               failure_candidate.reply_candidate_id
+           AND failure_fragment.origin_reply_scope_id = NEW.reply_scope_id
+           AND failure_fragment.fragment_ordinal = 1
+           AND failure_fragment.fragment_kind = 'text'
+           AND failure_fragment.content = failure_event.content
+           AND failure_fragment.attachments_json = '[]'
+           AND failure_fragment.state = 'allocated'
+           AND failure_fragment.delivery_reply_scope_id = NEW.reply_scope_id
+           AND failure_fragment.reply_slot_id IS NULL
+           AND failure_fragment.deferred_sequence IS NULL
+           AND failure_fragment.reply_aggregate_id =
+               failure_aggregate.reply_aggregate_id
+           AND failure_aggregate.state = 'sealed'
+           AND failure_aggregate.wire_reply_fragment_id =
+               failure_fragment.reply_fragment_id
+           AND failure_aggregate.representative_reply_candidate_id =
+               failure_candidate.reply_candidate_id
+           AND failure_aggregate.origin_reply_scope_id = NEW.reply_scope_id
+           AND failure_aggregate.task_id = failure_event.task_id
+           AND failure_aggregate.execution_id = failure_event.execution_id
+           AND failure_aggregate.content = failure_event.content
+           AND failure_aggregate.attachments_json = '[]'
+           AND failure_aggregate.reply_target_json = NEW.reply_target_json
+           AND failure_scope.used_slots = failure_scope.capacity
+           AND failure_scope.capacity = 10
+           AND NEW.content = failure_event.content
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid terminal failure safety outbox');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_user_outbox_failure_safety_immutable
+BEFORE UPDATE ON user_outbox
+WHEN OLD.reply_slot_id IS NULL
+ AND OLD.reply_candidate_id IS NOT NULL
+ AND OLD.reply_ordinal = 10
+ AND OLD.active_wire_variant = 'contextless'
+ AND (
+    NEW.outbox_id IS NOT OLD.outbox_id
+    OR NEW.event_id IS NOT OLD.event_id
+    OR NEW.task_id IS NOT OLD.task_id
+    OR NEW.channel IS NOT OLD.channel
+    OR NEW.bot_id IS NOT OLD.bot_id
+    OR NEW.external_user_id IS NOT OLD.external_user_id
+    OR NEW.session_id IS NOT OLD.session_id
+    OR NEW.agent_id IS NOT OLD.agent_id
+    OR NEW.source_message_id IS NOT OLD.source_message_id
+    OR NEW.source_sequence IS NOT OLD.source_sequence
+    OR NEW.context_token IS NOT OLD.context_token
+    OR NEW.reply_target_json IS NOT OLD.reply_target_json
+    OR NEW.content IS NOT OLD.content
+    OR NEW.attachments_json IS NOT OLD.attachments_json
+    OR NEW.priority IS NOT OLD.priority
+    OR NEW.delivery_mode IS NOT OLD.delivery_mode
+    OR NEW.notify_enabled IS NOT OLD.notify_enabled
+    OR NEW.foreground IS NOT OLD.foreground
+    OR NEW.client_id IS NOT OLD.client_id
+    OR NEW.created_at IS NOT OLD.created_at
+    OR NEW.reply_scope_id IS NOT OLD.reply_scope_id
+    OR NEW.reply_slot_id IS NOT OLD.reply_slot_id
+    OR NEW.reply_ordinal IS NOT OLD.reply_ordinal
+    OR NEW.reply_candidate_id IS NOT OLD.reply_candidate_id
+    OR NEW.reply_fragment_id IS NOT OLD.reply_fragment_id
+    OR NEW.reply_aggregate_id IS NOT OLD.reply_aggregate_id
+    OR NEW.from_user_id IS NOT OLD.from_user_id
+    OR NEW.contextless_client_id IS NOT OLD.contextless_client_id
+    OR NEW.active_wire_variant IS NOT OLD.active_wire_variant
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'terminal failure safety outbox is immutable');
+END;
+"""
+
+
 _MIGRATION_30_REVIEW_TABLE = """
 CREATE TABLE mailbox_orphan_reviews_v30 (
     mailbox_maintenance_id TEXT PRIMARY KEY CHECK (
@@ -3161,7 +3646,7 @@ END;
 """
 
 
-_LATEST_SCHEMA_VERSION = 32
+_LATEST_SCHEMA_VERSION = 35
 
 
 @contextmanager
@@ -3351,6 +3836,9 @@ class SQLiteStore:
         attachment_root: str | Path | None = None,
         transcription_ttl_seconds: float = DEFAULT_TRANSCRIPTION_TTL_SECONDS,
         mailbox_ttl_seconds: float = DEFAULT_MAILBOX_TTL_SECONDS,
+        reply_aggregation_max_age_seconds: float = (
+            DEFAULT_REPLY_AGGREGATION_MAX_AGE_SECONDS
+        ),
         max_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
         max_global_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
         mailbox_maintenance_authority: MailboxMaintenanceAuthority | None = None,
@@ -3387,6 +3875,17 @@ class SQLiteStore:
                 "mailbox_ttl_seconds must be a finite nonnegative number"
             )
         self.mailbox_ttl_seconds = mailbox_ttl
+        try:
+            aggregation_max_age = float(reply_aggregation_max_age_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "reply_aggregation_max_age_seconds must be a finite positive number"
+            ) from exc
+        if not math.isfinite(aggregation_max_age) or aggregation_max_age <= 0:
+            raise ValueError(
+                "reply_aggregation_max_age_seconds must be a finite positive number"
+            )
+        self.reply_aggregation_max_age_seconds = aggregation_max_age
         try:
             self.max_agent_queue = int(max_agent_queue)
             self.max_global_queue = int(max_global_queue)
@@ -4257,11 +4756,640 @@ class SQLiteStore:
                     "VALUES (?, ?)",
                     (32, _utc_text()),
                 )
+        v32_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=32"
+        ).fetchone()
+        if current < 33 and v32_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v33_working_directories_tx(
+                    conn,
+                    allow_create=True,
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (33, _utc_text()),
+                )
+        v33_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=33"
+        ).fetchone()
+        if v33_applied is not None:
+            # A marker without its state table would silently discard every
+            # Agent cwd after drift/manual recovery.  Revalidate the complete
+            # additive boundary on every open; only the derivable index is
+            # repaired automatically.
+            with _transaction(conn):
+                self._apply_schema_v33_working_directories_tx(
+                    conn,
+                    allow_create=False,
+                )
+        if current < 34 and v33_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v34_reply_aggregation_tx(
+                    conn,
+                    allow_create=True,
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (34, _utc_text()),
+                )
+        v34_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=34"
+        ).fetchone()
+        if v34_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v34_reply_aggregation_tx(
+                    conn,
+                    allow_create=False,
+                )
+        if current < 35 and v34_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v35_codex_config_profile_tx(
+                    conn,
+                    allow_create=True,
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (35, _utc_text()),
+                )
+        v35_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=35"
+        ).fetchone()
+        if v35_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v35_codex_config_profile_tx(
+                    conn,
+                    allow_create=False,
+                )
         self._finish_initialize_sync(
             conn,
             current=current,
             recover_startup_state=recover_startup_state,
         )
+
+    @staticmethod
+    def _apply_schema_v35_codex_config_profile_tx(
+        conn: sqlite3.Connection,
+        *,
+        allow_create: bool,
+    ) -> None:
+        """Add and validate immutable per-Agent Codex profile selection."""
+
+        columns = {
+            str(row[1]): row
+            for row in conn.execute("PRAGMA table_info(agent_profiles)")
+        }
+        if "codex_config_profile" not in columns:
+            if not allow_create:
+                raise StoreError(
+                    "schema v35 marker exists without Codex config profile storage"
+                )
+            conn.execute(
+                "ALTER TABLE agent_profiles ADD COLUMN "
+                "codex_config_profile TEXT NOT NULL DEFAULT ''"
+            )
+            columns = {
+                str(row[1]): row
+                for row in conn.execute("PRAGMA table_info(agent_profiles)")
+            }
+        descriptor = columns.get("codex_config_profile")
+        if descriptor is None or (
+            str(descriptor[2]).upper() != "TEXT"
+            or int(descriptor[3]) != 1
+            or str(descriptor[4]) != "''"
+            or int(descriptor[5]) != 0
+        ):
+            raise StoreError("schema v35 Codex config profile storage is incomplete")
+
+        from .policy import normalize_codex_config_profile
+
+        for row in conn.execute(
+            "SELECT agent_id, profile_version, codex_config_profile "
+            "FROM agent_profiles"
+        ):
+            try:
+                normalized = normalize_codex_config_profile(
+                    row["codex_config_profile"]
+                )
+            except ValueError:
+                raise StoreError(
+                    "schema v35 Codex config profile value is invalid: "
+                    f"{row['agent_id']}@{row['profile_version']}"
+                ) from None
+            if normalized != str(row["codex_config_profile"]):
+                raise StoreError(
+                    "schema v35 Codex config profile value is not canonical: "
+                    f"{row['agent_id']}@{row['profile_version']}"
+                )
+
+    @classmethod
+    def _reply_aggregate_hash(cls, value: Any) -> str:
+        return hashlib.sha256(json_dumps(value).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _reply_aggregate_payload_hash(
+        cls,
+        *,
+        wire_kind: str,
+        content: str,
+        attachments: Sequence[Any],
+    ) -> str:
+        return cls._reply_aggregate_hash(
+            {
+                "attachments": cls._json_snapshot(list(attachments)),
+                "content": str(content or ""),
+                "kind": str(wire_kind),
+            }
+        )
+
+    def _apply_schema_v34_reply_aggregation_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        allow_create: bool,
+    ) -> None:
+        """Create, migrate, and validate the durable wire-aggregate boundary."""
+
+        aggregate_table = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='reply_aggregates'"
+        ).fetchone()
+        member_table = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='reply_aggregate_members'"
+        ).fetchone()
+        if aggregate_table is None or member_table is None:
+            if not allow_create:
+                raise StoreError(
+                    "schema v34 marker exists without reply aggregation storage"
+                )
+            _executescript_atomic(conn, _MIGRATION_34_REPLY_AGGREGATION)
+            aggregate_table = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='reply_aggregates'"
+            ).fetchone()
+            member_table = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='reply_aggregate_members'"
+            ).fetchone()
+        if aggregate_table is None or member_table is None:
+            raise StoreError("schema v34 reply aggregation storage is unavailable")
+
+        expected_aggregate_columns = {
+            "reply_aggregate_id",
+            "aggregation_key_hash",
+            "aggregation_key_json",
+            "origin_reply_scope_id",
+            "channel",
+            "bot_id",
+            "external_user_id",
+            "session_id",
+            "reply_target_json",
+            "provenance_kind",
+            "provenance_id",
+            "task_id",
+            "execution_id",
+            "command_id",
+            "agent_id",
+            "sender_format",
+            "sender_prefix",
+            "notify_enabled",
+            "foreground",
+            "priority",
+            "delivery_mode",
+            "presentation_class",
+            "renderer_version",
+            "wire_kind",
+            "state",
+            "content",
+            "attachments_json",
+            "content_hash",
+            "payload_hash",
+            "character_count",
+            "first_source_sequence",
+            "last_source_sequence",
+            "next_member_ordinal",
+            "representative_reply_candidate_id",
+            "flush_due_at",
+            "created_at",
+            "updated_at",
+            "sealed_at",
+            "seal_reason",
+            "wire_reply_fragment_id",
+        }
+        expected_member_columns = {
+            "reply_aggregate_member_id",
+            "reply_aggregate_id",
+            "member_ordinal",
+            "reply_candidate_id",
+            "source_fragment_ordinal",
+            "source_reply_fragment_id",
+            "source_sequence",
+            "source_character_start",
+            "source_character_count",
+            "prefix_before",
+            "separator_before",
+            "rendered_content",
+            "rendered_content_hash",
+            "source_rendered_content_hash",
+            "source_rendered_character_count",
+            "aggregate_character_start",
+            "created_at",
+        }
+        actual_aggregate_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(reply_aggregates)")
+        }
+        actual_member_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(reply_aggregate_members)")
+        }
+        if (
+            actual_aggregate_columns != expected_aggregate_columns
+            or actual_member_columns != expected_member_columns
+        ):
+            raise StoreError("schema v34 reply aggregation storage is incomplete")
+
+        for table_name in ("reply_fragments", "reply_slots", "user_outbox"):
+            columns = {
+                str(row[1])
+                for row in conn.execute(f"PRAGMA table_info({table_name})")
+            }
+            if "reply_aggregate_id" not in columns:
+                if not allow_create:
+                    raise StoreError(
+                        "schema v34 marker exists without aggregate allocation links"
+                    )
+                conn.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN reply_aggregate_id TEXT "
+                    "REFERENCES reply_aggregates(reply_aggregate_id) ON DELETE RESTRICT"
+                )
+        receipt_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(command_receipts)")
+        }
+        if "response_aggregates_json" not in receipt_columns:
+            if not allow_create:
+                raise StoreError(
+                    "schema v34 marker exists without command aggregate snapshots"
+                )
+            conn.execute(
+                "ALTER TABLE command_receipts ADD COLUMN "
+                "response_aggregates_json TEXT NOT NULL DEFAULT '[]'"
+            )
+
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_reply_fragments_aggregate "
+            "ON reply_fragments(reply_aggregate_id) "
+            "WHERE reply_aggregate_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_reply_slots_aggregate "
+            "ON reply_slots(reply_aggregate_id) "
+            "WHERE reply_aggregate_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_outbox_reply_aggregate "
+            "ON user_outbox(reply_aggregate_id) "
+            "WHERE reply_aggregate_id IS NOT NULL"
+        )
+        _executescript_atomic(
+            conn,
+            _MIGRATION_34_REPLY_AGGREGATE_ALLOCATION_TRIGGERS,
+        )
+        self._backfill_reply_aggregates_v34_tx(
+            conn,
+            max_age_seconds=self.reply_aggregation_max_age_seconds,
+        )
+        missing_links = conn.execute(
+            "SELECT 1 FROM reply_fragments WHERE reply_aggregate_id IS NULL LIMIT 1"
+        ).fetchone()
+        if missing_links is not None:
+            raise StoreError("schema v34 reply fragment aggregate backfill is incomplete")
+
+    @classmethod
+    def _backfill_reply_aggregates_v34_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        max_age_seconds: float = DEFAULT_REPLY_AGGREGATION_MAX_AGE_SECONDS,
+    ) -> None:
+        """Wrap every pre-v34 wire fragment in one unchanged sealed singleton."""
+
+        fragments = conn.execute(
+            """SELECT f.*, c.source_item_ordinal, c.agent_id, c.priority,
+                      c.delivery_mode, c.notify_enabled, c.foreground,
+                      c.task_id, c.execution_id
+                 FROM reply_fragments AS f
+                 JOIN reply_candidates AS c
+                   ON c.reply_candidate_id=f.reply_candidate_id
+                WHERE f.reply_aggregate_id IS NULL
+                ORDER BY f.created_at, f.reply_candidate_id, f.fragment_ordinal"""
+        ).fetchall()
+        for fragment in fragments:
+            cls._wrap_reply_fragment_aggregate_tx(
+                conn,
+                fragment_id=str(fragment["reply_fragment_id"]),
+                max_age_seconds=max_age_seconds,
+            )
+
+    @classmethod
+    def _wrap_reply_fragment_aggregate_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        fragment_id: str,
+        max_age_seconds: float = DEFAULT_REPLY_AGGREGATION_MAX_AGE_SECONDS,
+    ) -> sqlite3.Row:
+        """Wrap a legacy/direct fragment in one sealed aggregate unchanged."""
+
+        fragment = conn.execute(
+            """SELECT f.*, c.source_item_ordinal, c.agent_id, c.priority,
+                      c.delivery_mode, c.notify_enabled, c.foreground,
+                      c.task_id, c.execution_id
+                 FROM reply_fragments AS f
+                 JOIN reply_candidates AS c
+                   ON c.reply_candidate_id=f.reply_candidate_id
+                WHERE f.reply_fragment_id=?""",
+            (str(fragment_id),),
+        ).fetchone()
+        if fragment is None:
+            raise StoreError("reply fragment aggregate source disappeared")
+        if fragment["reply_aggregate_id"] is not None:
+            aggregate = conn.execute(
+                "SELECT * FROM reply_aggregates WHERE reply_aggregate_id=?",
+                (fragment["reply_aggregate_id"],),
+            ).fetchone()
+            if aggregate is None or str(aggregate["state"]) != "sealed":
+                raise StoreError("reply fragment has an invalid aggregate link")
+            return aggregate
+        scope = conn.execute(
+            "SELECT * FROM reply_scopes WHERE reply_scope_id=?",
+            (fragment["origin_reply_scope_id"],),
+        ).fetchone()
+        if scope is None:
+            raise StoreError("legacy reply fragment has no origin scope")
+        target = cls._reply_target_for_scope_tx(conn, scope)
+        aggregate_id = compound_id(
+            "reply-aggregate-v34-migration",
+            (fragment_id,),
+        )
+        key = {
+            "legacy_fragment_id": str(fragment_id),
+            "origin_reply_scope_id": str(scope["reply_scope_id"]),
+            "reply_target": target.to_dict(),
+            "schema": 34,
+        }
+        content = str(fragment["content"] or "")
+        attachments = tuple(json_loads(fragment["attachments_json"], []) or [])
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        payload_hash = cls._reply_aggregate_payload_hash(
+            wire_kind=str(fragment["fragment_kind"]),
+            content=content,
+            attachments=attachments,
+        )
+        created_at = _utc_text(fragment["created_at"])
+        source_sequence = (
+            int(fragment["source_item_ordinal"])
+            if fragment["source_item_ordinal"] is not None
+            else int(fragment["fragment_ordinal"])
+        )
+        due_at = _utc_text(
+            (text_to_datetime(created_at) or utcnow())
+            + timedelta(seconds=float(max_age_seconds))
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO reply_aggregates
+               (reply_aggregate_id, aggregation_key_hash,
+                aggregation_key_json, origin_reply_scope_id,
+                channel, bot_id, external_user_id, session_id,
+                reply_target_json, provenance_kind, provenance_id,
+                task_id, execution_id, command_id, agent_id,
+                sender_format, sender_prefix, notify_enabled, foreground,
+                priority, delivery_mode, presentation_class,
+                renderer_version, wire_kind, state, content,
+                attachments_json, content_hash, payload_hash,
+                character_count, first_source_sequence,
+                last_source_sequence, next_member_ordinal,
+                representative_reply_candidate_id, flush_due_at,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'migration', ?, ?, ?,
+                       NULL, ?, 'legacy-v33', '', ?, ?, ?, ?, 'legacy',
+                       'legacy-v33', ?, 'open', ?, ?, ?, ?, ?, ?, ?, 2,
+                       ?, ?, ?, ?)""",
+            (
+                aggregate_id,
+                cls._reply_aggregate_hash(key),
+                json_dumps(key),
+                scope["reply_scope_id"],
+                scope["channel"],
+                scope["bot_id"],
+                scope["external_user_id"],
+                scope["session_id"],
+                json_dumps(target.to_dict()),
+                fragment_id,
+                fragment["task_id"],
+                fragment["execution_id"],
+                fragment["agent_id"],
+                int(bool(fragment["notify_enabled"])),
+                int(bool(fragment["foreground"])),
+                int(fragment["priority"]),
+                str(fragment["delivery_mode"]),
+                str(fragment["fragment_kind"]),
+                content,
+                json_dumps(list(attachments)),
+                content_hash,
+                payload_hash,
+                len(content),
+                source_sequence,
+                source_sequence,
+                fragment["reply_candidate_id"],
+                due_at,
+                created_at,
+                created_at,
+            ),
+        )
+        aggregate = conn.execute(
+            "SELECT * FROM reply_aggregates WHERE reply_aggregate_id=?",
+            (aggregate_id,),
+        ).fetchone()
+        if aggregate is None:
+            raise StoreError("legacy reply aggregate insert failed")
+        existing_member = conn.execute(
+            "SELECT * FROM reply_aggregate_members "
+            "WHERE source_reply_fragment_id=?",
+            (fragment_id,),
+        ).fetchone()
+        if existing_member is None:
+            conn.execute(
+                """INSERT INTO reply_aggregate_members
+                   (reply_aggregate_member_id, reply_aggregate_id,
+                    member_ordinal, reply_candidate_id,
+                    source_fragment_ordinal, source_reply_fragment_id,
+                    source_sequence, source_character_start,
+                    source_character_count, prefix_before,
+                    separator_before, rendered_content,
+                    rendered_content_hash, source_rendered_content_hash,
+                    source_rendered_character_count,
+                    aggregate_character_start, created_at)
+                   VALUES (?, ?, 1, ?, ?, ?, ?, 0, ?, '', '', ?, ?, ?, ?, 0, ?)""",
+                (
+                    compound_id(
+                        "reply-aggregate-member-v34",
+                        (fragment["reply_candidate_id"], fragment["fragment_ordinal"]),
+                    ),
+                    aggregate_id,
+                    fragment["reply_candidate_id"],
+                    int(fragment["fragment_ordinal"]),
+                    fragment_id,
+                    source_sequence,
+                    len(content),
+                    content,
+                    content_hash,
+                    content_hash,
+                    len(content),
+                    created_at,
+                ),
+            )
+        if str(aggregate["state"]) == ReplyAggregateState.OPEN.value:
+            conn.execute(
+                """UPDATE reply_aggregates
+                   SET state='sealed', flush_due_at=NULL, sealed_at=?,
+                       seal_reason='migration_v34',
+                       wire_reply_fragment_id=?, updated_at=?
+                   WHERE reply_aggregate_id=? AND state='open'""",
+                (created_at, fragment_id, created_at, aggregate_id),
+            )
+        conn.execute(
+            "UPDATE reply_fragments SET reply_aggregate_id=? "
+            "WHERE reply_fragment_id=? AND reply_aggregate_id IS NULL",
+            (aggregate_id, fragment_id),
+        )
+        conn.execute(
+            "UPDATE reply_slots SET reply_aggregate_id=? "
+            "WHERE reply_fragment_id=? AND reply_aggregate_id IS NULL",
+            (aggregate_id, fragment_id),
+        )
+        conn.execute(
+            "UPDATE user_outbox SET reply_aggregate_id=? "
+            "WHERE reply_fragment_id=? AND reply_aggregate_id IS NULL",
+            (aggregate_id, fragment_id),
+        )
+        aggregate = conn.execute(
+            "SELECT * FROM reply_aggregates WHERE reply_aggregate_id=?",
+            (aggregate_id,),
+        ).fetchone()
+        if aggregate is None or str(aggregate["state"]) != "sealed":
+            raise StoreError("legacy reply aggregate sealing failed")
+        return aggregate
+
+    def _apply_schema_v33_working_directories_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        allow_create: bool,
+    ) -> None:
+        """Create or validate the complete session-Agent cwd boundary."""
+
+        table = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='session_agent_working_directories'"
+        ).fetchone()
+        if table is None:
+            if not allow_create:
+                raise StoreError(
+                    "schema v33 marker exists without Agent working-directory storage"
+                )
+            _executescript_atomic(
+                conn,
+                _MIGRATION_33_SESSION_AGENT_WORKING_DIRECTORIES,
+            )
+            table = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='session_agent_working_directories'"
+            ).fetchone()
+        if table is None:
+            raise StoreError("schema v33 working-directory storage is unavailable")
+
+        expected_columns = {
+            "channel": ("TEXT", 1, 1),
+            "bot_id": ("TEXT", 1, 2),
+            "external_user_id": ("TEXT", 1, 3),
+            "session_id": ("TEXT", 1, 4),
+            "agent_id": ("TEXT", 1, 5),
+            "relative_path": ("TEXT", 1, 0),
+            "directory_device": ("INTEGER", 1, 0),
+            "directory_inode": ("INTEGER", 1, 0),
+            "updated_by": ("TEXT", 1, 0),
+            "updated_at": ("TEXT", 1, 0),
+        }
+        columns = {
+            str(row[1]): (str(row[2]).upper(), int(row[3]), int(row[5]))
+            for row in conn.execute(
+                "PRAGMA table_info(session_agent_working_directories)"
+            ).fetchall()
+        }
+        normalized_sql = " ".join(str(table["sql"] or "").lower().split())
+        required_sql = (
+            "without rowid",
+            "length(trim(channel)) > 0",
+            "length(trim(bot_id)) > 0",
+            "length(trim(external_user_id)) > 0",
+            "length(trim(session_id)) > 0",
+            "length(trim(agent_id)) > 0",
+            "length(relative_path) > 0",
+            "instr(relative_path, char(0)) = 0",
+            "typeof(directory_device) = 'integer'",
+            "directory_device >= 0",
+            "typeof(directory_inode) = 'integer'",
+            "directory_inode >= 0",
+        )
+        if columns != expected_columns or any(
+            fragment not in normalized_sql for fragment in required_sql
+        ):
+            raise StoreError(
+                "schema v33 working-directory storage is incomplete"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            "idx_session_agent_working_directories_agent "
+            "ON session_agent_working_directories(agent_id)"
+        )
+        index_columns = [
+            str(row[2])
+            for row in conn.execute(
+                "PRAGMA index_info(idx_session_agent_working_directories_agent)"
+            ).fetchall()
+        ]
+        index_table = conn.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_session_agent_working_directories_agent'"
+        ).fetchone()
+        index_descriptor = next(
+            (
+                row
+                for row in conn.execute(
+                    "PRAGMA index_list(session_agent_working_directories)"
+                ).fetchall()
+                if str(row[1])
+                == "idx_session_agent_working_directories_agent"
+            ),
+            None,
+        )
+        if (
+            index_table is None
+            or index_descriptor is None
+            or str(index_table["tbl_name"])
+            != "session_agent_working_directories"
+            or int(index_descriptor[2]) != 0
+            or str(index_descriptor[3]) != "c"
+            or int(index_descriptor[4]) != 0
+            or index_columns != ["agent_id"]
+        ):
+            raise StoreError(
+                "schema v33 working-directory index conflicts"
+            )
 
     def _apply_schema_v32_reply_candidate_presentation_tx(
         self,
@@ -6262,6 +7390,19 @@ class SQLiteStore:
                     ),
                     created_at=now_text,
                 )
+                sealed_task_aggregates = self._seal_task_reply_aggregates_tx(
+                    conn,
+                    task_id=str(row["task_id"]),
+                    execution_id=current_task.execution_id,
+                    reason="task_orphaned",
+                    now=now_text,
+                )
+                for aggregate in sealed_task_aggregates:
+                    self._materialize_sealed_reply_aggregate_tx(
+                        conn,
+                        aggregate=aggregate,
+                        now=now_text,
+                    )
             conn.execute(
                 "UPDATE tasks SET state='orphaned', claimed_by=NULL, "
                 "claim_token=NULL, lease_expires_at=NULL, updated_at=?, "
@@ -6285,6 +7426,7 @@ class SQLiteStore:
                 raise StoreError(
                     "startup task invocation was already released"
                 )
+        self._materialize_pending_reply_aggregates_tx(conn, now=now_text)
 
         outbox_rows = conn.execute(
             "SELECT outbox_id, state FROM user_outbox "
@@ -7989,6 +9131,11 @@ class SQLiteStore:
             ),
             created_at=text_to_datetime(row["created_at"]),
             allocated_at=text_to_datetime(row["allocated_at"]),
+            reply_aggregate_id=(
+                row["reply_aggregate_id"]
+                if "reply_aggregate_id" in row.keys()
+                else None
+            ),
         )
 
     @staticmethod
@@ -8006,6 +9153,95 @@ class SQLiteStore:
             active_wire_variant=str(row["active_wire_variant"] or "primary"),
             outbox_id=row["outbox_id"],
             payload=json_loads(row["payload_json"], {}) or {},
+            created_at=text_to_datetime(row["created_at"]),
+            reply_aggregate_id=(
+                row["reply_aggregate_id"]
+                if "reply_aggregate_id" in row.keys()
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _reply_aggregate_from_row(
+        row: sqlite3.Row | None,
+    ) -> ReplyAggregateRecord | None:
+        if row is None:
+            return None
+        return ReplyAggregateRecord(
+            reply_aggregate_id=str(row["reply_aggregate_id"]),
+            aggregation_key_hash=str(row["aggregation_key_hash"]),
+            aggregation_key=json_loads(row["aggregation_key_json"], {}) or {},
+            origin_reply_scope_id=str(row["origin_reply_scope_id"]),
+            channel=str(row["channel"]),
+            bot_id=str(row["bot_id"]),
+            external_user_id=str(row["external_user_id"]),
+            session_id=str(row["session_id"] or "default"),
+            reply_target=ReplyTarget.from_value(
+                json_loads(row["reply_target_json"], {}) or {}
+            ),
+            provenance_kind=str(row["provenance_kind"]),
+            provenance_id=str(row["provenance_id"]),
+            task_id=row["task_id"],
+            execution_id=row["execution_id"],
+            command_id=row["command_id"],
+            agent_id=str(row["agent_id"]),
+            sender_format=str(row["sender_format"]),
+            sender_prefix=str(row["sender_prefix"] or ""),
+            notify_enabled=bool(row["notify_enabled"]),
+            foreground=bool(row["foreground"]),
+            priority=EventPriority(int(row["priority"])),
+            delivery_mode=DeliveryMode(str(row["delivery_mode"])),
+            presentation_class=str(row["presentation_class"]),
+            renderer_version=str(row["renderer_version"]),
+            wire_kind=str(row["wire_kind"]),
+            state=ReplyAggregateState(str(row["state"])),
+            content=str(row["content"] or ""),
+            attachments=tuple(json_loads(row["attachments_json"], []) or []),
+            content_hash=str(row["content_hash"]),
+            payload_hash=str(row["payload_hash"]),
+            character_count=int(row["character_count"]),
+            first_source_sequence=int(row["first_source_sequence"]),
+            last_source_sequence=int(row["last_source_sequence"]),
+            representative_reply_candidate_id=str(
+                row["representative_reply_candidate_id"]
+            ),
+            flush_due_at=text_to_datetime(row["flush_due_at"]),
+            created_at=text_to_datetime(row["created_at"]),
+            updated_at=text_to_datetime(row["updated_at"]),
+            sealed_at=text_to_datetime(row["sealed_at"]),
+            seal_reason=(
+                str(row["seal_reason"]) if row["seal_reason"] is not None else None
+            ),
+            wire_reply_fragment_id=row["wire_reply_fragment_id"],
+        )
+
+    @staticmethod
+    def _reply_aggregate_member_from_row(
+        row: sqlite3.Row | None,
+    ) -> ReplyAggregateMemberRecord | None:
+        if row is None:
+            return None
+        return ReplyAggregateMemberRecord(
+            reply_aggregate_member_id=str(row["reply_aggregate_member_id"]),
+            reply_aggregate_id=str(row["reply_aggregate_id"]),
+            member_ordinal=int(row["member_ordinal"]),
+            reply_candidate_id=str(row["reply_candidate_id"]),
+            source_fragment_ordinal=int(row["source_fragment_ordinal"]),
+            source_reply_fragment_id=row["source_reply_fragment_id"],
+            source_sequence=int(row["source_sequence"]),
+            source_character_start=int(row["source_character_start"]),
+            source_character_count=int(row["source_character_count"]),
+            prefix_before=str(row["prefix_before"] or ""),
+            separator_before=str(row["separator_before"] or ""),
+            rendered_content=str(row["rendered_content"] or ""),
+            rendered_content_hash=str(row["rendered_content_hash"]),
+            source_rendered_content_hash=str(
+                row["source_rendered_content_hash"]
+            ),
+            source_rendered_character_count=int(
+                row["source_rendered_character_count"]
+            ),
+            aggregate_character_start=int(row["aggregate_character_start"]),
             created_at=text_to_datetime(row["created_at"]),
         )
 
@@ -8593,6 +9829,11 @@ class SQLiteStore:
             reply_fragment_id=(
                 row["reply_fragment_id"]
                 if "reply_fragment_id" in row.keys()
+                else None
+            ),
+            reply_aggregate_id=(
+                row["reply_aggregate_id"]
+                if "reply_aggregate_id" in row.keys()
                 else None
             ),
             from_user_id=(
@@ -10021,6 +11262,8 @@ class SQLiteStore:
                 raise StoreError("profile snapshot does not match task ownership")
         def j(name: str, default: Any = ()) -> str:
             return json_dumps(cls._json_snapshot(data.get(name, default)))
+        from .policy import normalize_codex_config_profile
+
         return (
             {
                 "display_name": str(data.get("display_name", agent_id) or ""),
@@ -10037,6 +11280,9 @@ class SQLiteStore:
                 "max_children_per_task": int(data.get("max_children_per_task", 0) or 0),
                 "enabled": int(bool(data.get("enabled", True))),
                 "default_mode_id": str(data.get("default_mode_id", "chat") or "chat"),
+                "codex_config_profile": normalize_codex_config_profile(
+                    data.get("codex_config_profile", "")
+                ),
             },
             bool(data),
         )
@@ -10099,6 +11345,7 @@ class SQLiteStore:
             and int(row["max_children_per_task"] or 0) == 0
             and int(row["enabled"] or 0) == 1
             and str(row["default_mode_id"] or "") == "chat"
+            and str(row["codex_config_profile"] or "") == ""
         )
 
     @staticmethod
@@ -10215,8 +11462,8 @@ class SQLiteStore:
                 responsibilities_json, constraints_json, capabilities_json,
                 allowed_peers_json, denied_peers_json, allowed_request_types_json,
                 denied_request_types_json, max_child_depth, max_children_per_task,
-                enabled, default_mode_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                enabled, default_mode_id, codex_config_profile, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 agent_id,
                 int(profile_version),
@@ -10234,6 +11481,7 @@ class SQLiteStore:
                 values["max_children_per_task"],
                 values["enabled"],
                 values["default_mode_id"],
+                values["codex_config_profile"],
                 now,
             ),
         )
@@ -15214,6 +16462,31 @@ class SQLiteStore:
                         allow_compatibility_final=user_visible,
                         max_agent_queue=self.max_agent_queue,
                         max_global_queue=self.max_global_queue,
+                        reply_aggregation_max_age_seconds=(
+                            self.reply_aggregation_max_age_seconds
+                        ),
+                    )
+                if terminal or target is TaskState.ORPHANED:
+                    sealed_task_aggregates = (
+                        self._seal_task_reply_aggregates_tx(
+                            conn,
+                            task_id=task_id,
+                            execution_id=(
+                                active_execution_id or current.execution_id
+                            ),
+                            reason=f"task_{target.value}",
+                            now=now_text,
+                        )
+                    )
+                    for aggregate in sealed_task_aggregates:
+                        self._materialize_sealed_reply_aggregate_tx(
+                            conn,
+                            aggregate=aggregate,
+                            now=now_text,
+                        )
+                    self._materialize_pending_reply_aggregates_tx(
+                        conn,
+                        now=now_text,
                     )
                 placeholders = ",".join("?" for _ in sources)
                 filters = ["task_id = ?", f"state IN ({placeholders})"]
@@ -17065,6 +18338,37 @@ class SQLiteStore:
         )
 
     @classmethod
+    def _is_canonical_failure_notice_event(cls, event: Any) -> bool:
+        """Recognize only the fixed worker-owned terminal failure protocol."""
+
+        visibility = str(
+            _enum_value(
+                cls._reply_event_field(
+                    event, "visibility", EventVisibility.USER.value
+                ),
+                EventVisibility.USER.value,
+            )
+        )
+        event_type = str(cls._reply_event_field(event, "event_type", "") or "")
+        task_id = str(cls._reply_event_field(event, "task_id", "") or "")
+        content = str(cls._reply_event_field(event, "content", "") or "")
+        canonical_content = {
+            f"task failed: {task_id}\n"
+            "check /tasks before retrying. /retry reuses the same context; "
+            "/clear starts fresh.",
+            f"task failed: {task_id}\n"
+            "check /tasks before retrying or sending a new prompt.",
+        }
+        return bool(
+            visibility == EventVisibility.USER.value
+            and not cls._reply_event_field(event, "destination_agent_id", None)
+            and event_type == "failure_notice"
+            and bool(task_id)
+            and content in canonical_content
+            and not tuple(cls._reply_event_field(event, "attachments", ()) or ())
+        )
+
+    @classmethod
     def _project_event_tx(
         cls,
         conn: sqlite3.Connection,
@@ -17077,6 +18381,9 @@ class SQLiteStore:
         allow_compatibility_final: bool = False,
         max_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
         max_global_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+        reply_aggregation_max_age_seconds: float = (
+            DEFAULT_REPLY_AGGREGATION_MAX_AGE_SECONDS
+        ),
     ) -> None:
         """Create user/mailbox projections for an already-appended event."""
         visibility = _enum_value(event.visibility, EventVisibility.INTERNAL.value)
@@ -17262,7 +18569,10 @@ class SQLiteStore:
             return
         if not cls._is_stable_completed_reply_event(event) and not (
             allow_compatibility_final
-            and cls._is_compatibility_final_reply_event(event)
+            and (
+                cls._is_compatibility_final_reply_event(event)
+                or cls._is_canonical_failure_notice_event(event)
+            )
         ):
             return
         route = conn.execute(
@@ -17271,13 +18581,21 @@ class SQLiteStore:
             (target.channel, target.bot_id, target.external_user_id, target.session_id),
         ).fetchone()
         metadata = task.metadata if isinstance(task.metadata, Mapping) else {}
-        projected_content = str(event.content or "")
+        raw_content = str(event.content or "")
+        sender_format = "none-v1"
+        sender_prefix = ""
         if (
             metadata.get("user_reply_format")
             == USER_REPLY_FORMAT_AGENT_PREFIX_V1
-            and projected_content.strip()
+            and raw_content.strip()
         ):
-            projected_content = f"{task.agent_id}: {projected_content.strip()}"
+            sender_format = USER_REPLY_FORMAT_AGENT_PREFIX_V1
+            sender_prefix = f"{task.agent_id}: "
+        projected_content = (
+            sender_prefix + raw_content.strip()
+            if sender_prefix and raw_content.strip()
+            else raw_content
+        )
         accepted_front_agent = str(
             metadata.get("front_agent_id_at_acceptance", "") or ""
         )
@@ -17351,7 +18669,7 @@ class SQLiteStore:
                 if execution_scope
                 else target
             )
-            if not projected_content.strip() and not event.attachments:
+            if not raw_content.strip() and not event.attachments:
                 return
             source_key = (
                 f"item:{event.source_item_id}"
@@ -17362,11 +18680,198 @@ class SQLiteStore:
                     else f"event:{event.event_id}"
                 )
             )
+            text_candidate = bool(
+                raw_content.strip() and not event.attachments and event.execution_id
+            )
+            if text_candidate:
+                existing_candidate = None
+                if event.source_item_id:
+                    existing_candidate = conn.execute(
+                        "SELECT * FROM reply_candidates WHERE task_id=? "
+                        "AND execution_id=? AND source_item_id=?",
+                        (
+                            task.task_id,
+                            event.execution_id,
+                            str(event.source_item_id),
+                        ),
+                    ).fetchone()
+                elif event.source_item_ordinal is not None:
+                    existing_candidate = conn.execute(
+                        "SELECT * FROM reply_candidates WHERE task_id=? "
+                        "AND execution_id=? AND source_item_ordinal=? "
+                        "AND (source_item_id IS NULL OR "
+                        "length(trim(source_item_id))=0)",
+                        (
+                            task.task_id,
+                            event.execution_id,
+                            int(event.source_item_ordinal),
+                        ),
+                    ).fetchone()
+                mode_value = str(
+                    _enum_value(delivery_mode, DeliveryMode.PUSH_ELIGIBLE.value)
+                )
+                computed_push_eligible = bool(
+                    notify_enabled
+                    and mode_value != DeliveryMode.INBOX_ONLY.value
+                )
+                candidate_push_eligible = (
+                    bool(existing_candidate["notify_enabled"])
+                    and str(existing_candidate["delivery_mode"])
+                    != DeliveryMode.INBOX_ONLY.value
+                    if existing_candidate is not None
+                    else computed_push_eligible
+                )
+                candidate_content = (
+                    str(existing_candidate["content"])
+                    if existing_candidate is not None
+                    else raw_content
+                    if candidate_push_eligible
+                    else projected_content
+                )
+                retained = cls._project_reply_candidate_tx(
+                    conn,
+                    target=delivery_target,
+                    source_key=source_key,
+                    content=candidate_content,
+                    attachments=(),
+                    reply_scope_id=str(resolved_scope["reply_scope_id"]),
+                    agent_id=task.agent_id,
+                    task_id=task.task_id,
+                    execution_id=event.execution_id,
+                    event_id=event.event_id,
+                    source_item_id=event.source_item_id,
+                    source_item_type=event.source_item_type,
+                    source_item_ordinal=event.source_item_ordinal,
+                    priority=event.priority,
+                    delivery_mode=delivery_mode,
+                    notify_enabled=bool(notify_enabled),
+                    foreground=foreground,
+                    retain_only=True,
+                    preserve_existing_delivery_snapshot=True,
+                    from_user_id=delivery_target.bot_id,
+                    now=_utc_text(event.created_at),
+                )
+                if retained.candidate is None:
+                    raise StoreError("reply aggregate candidate retention failed")
+                candidate = conn.execute(
+                    "SELECT * FROM reply_candidates WHERE reply_candidate_id=?",
+                    (retained.candidate.reply_candidate_id,),
+                ).fetchone()
+                if candidate is None:
+                    raise StoreError("reply aggregate candidate disappeared")
+                prior_membership = conn.execute(
+                    """SELECT a.provenance_kind FROM reply_aggregate_members m
+                         JOIN reply_aggregates a
+                           ON a.reply_aggregate_id=m.reply_aggregate_id
+                        WHERE m.reply_candidate_id=?
+                        ORDER BY m.source_fragment_ordinal LIMIT 1""",
+                    (candidate["reply_candidate_id"],),
+                ).fetchone()
+                if (
+                    prior_membership is not None
+                    and str(prior_membership["provenance_kind"]) != "live"
+                ):
+                    # A pre-v34/direct singleton already owns this item. Its
+                    # immutable candidate delivery snapshot wins over mutable
+                    # route/notification state observed during terminal replay.
+                    return
+                if candidate_push_eligible:
+                    if (
+                        prior_membership is None
+                        and cls._is_canonical_failure_notice_event(event)
+                    ):
+                        # A source item can fill ordinal ten and leave a small
+                        # open spillover aggregate.  The terminal notice must
+                        # never coalesce into that progress-owned aggregate:
+                        # its representative candidate/event is the durable
+                        # authority for the sole saturated-quota safety send.
+                        sealed_progress = cls._seal_task_reply_aggregates_tx(
+                            conn,
+                            task_id=task.task_id,
+                            execution_id=event.execution_id,
+                            reason="terminal_failure_barrier",
+                            now=_utc_text(event.created_at),
+                        )
+                        for aggregate in sealed_progress:
+                            cls._materialize_sealed_reply_aggregate_tx(
+                                conn,
+                                aggregate=aggregate,
+                                now=_utc_text(event.created_at),
+                                from_user_id=delivery_target.bot_id,
+                            )
+                        cls._materialize_pending_reply_aggregates_tx(
+                            conn,
+                            now=_utc_text(event.created_at),
+                            reply_scope_id=str(
+                                resolved_scope["reply_scope_id"]
+                            ),
+                        )
+                    aggregation = cls._append_reply_aggregate_candidate_tx(
+                        conn,
+                        candidate=candidate,
+                        target=delivery_target,
+                        source_sequence=(
+                            int(event.source_item_ordinal)
+                            if event.source_item_ordinal is not None
+                            else int(event.sequence)
+                        ),
+                        provenance_kind="live",
+                        provenance_id=f"{task.task_id}:{event.execution_id}",
+                        command_id=None,
+                        sender_format=sender_format,
+                        sender_prefix=sender_prefix,
+                        presentation_class="live",
+                        renderer_version="wechat-text-v1",
+                        max_age_seconds=reply_aggregation_max_age_seconds,
+                        now=_utc_text(event.created_at),
+                        seal_after_append=False,
+                    )
+                    for aggregate in aggregation.sealed_aggregates:
+                        cls._materialize_sealed_reply_aggregate_tx(
+                            conn,
+                            aggregate=aggregate.reply_aggregate_id,
+                            now=_utc_text(event.created_at),
+                            from_user_id=delivery_target.bot_id,
+                        )
+                    cls._materialize_pending_reply_aggregates_tx(
+                        conn,
+                        now=_utc_text(event.created_at),
+                        reply_scope_id=str(resolved_scope["reply_scope_id"]),
+                    )
+                    return
+
+            # Media, adapter bundles, and inbox-only text are hard ordering
+            # barriers. Flush any compatible text that preceded this source
+            # item before the legacy singleton projection reserves a slot or
+            # becomes independently presentable in the inbox.
+            sealed_before_barrier = cls._seal_task_reply_aggregates_tx(
+                conn,
+                task_id=task.task_id,
+                execution_id=event.execution_id,
+                reason=(
+                    "media_barrier"
+                    if event.attachments
+                    else "delivery_class_barrier"
+                ),
+                now=_utc_text(event.created_at),
+            )
+            for aggregate in sealed_before_barrier:
+                cls._materialize_sealed_reply_aggregate_tx(
+                    conn,
+                    aggregate=aggregate,
+                    now=_utc_text(event.created_at),
+                    from_user_id=delivery_target.bot_id,
+                )
+            cls._materialize_pending_reply_aggregates_tx(
+                conn,
+                now=_utc_text(event.created_at),
+                reply_scope_id=str(resolved_scope["reply_scope_id"]),
+            )
             cls._project_reply_candidate_tx(
                 conn,
                 target=delivery_target,
                 source_key=source_key,
-                content=projected_content,
+                content=(candidate_content if text_candidate else projected_content),
                 attachments=event.attachments,
                 reply_scope_id=str(resolved_scope["reply_scope_id"]),
                 agent_id=task.agent_id,
@@ -17745,6 +19250,9 @@ class SQLiteStore:
                         task=task,
                         max_agent_queue=self.max_agent_queue,
                         max_global_queue=self.max_global_queue,
+                        reply_aggregation_max_age_seconds=(
+                            self.reply_aggregation_max_age_seconds
+                        ),
                     )
                 return result
 
@@ -17843,6 +19351,7 @@ class SQLiteStore:
             "interrupted": TaskState.INTERRUPTED,
             "cancelled": TaskState.CANCELLED,
             "canceled": TaskState.CANCELLED,
+            "orphaned": TaskState.ORPHANED,
         }
         target_state = state_map.get(terminal_status, TaskState.FAILED)
         if error and target_state == TaskState.COMPLETED:
@@ -17856,10 +19365,16 @@ class SQLiteStore:
         if output:
             compatibility_event_contents: list[str] = []
             has_stable_completed_reply = False
+            has_canonical_failure_notice = False
             for item in supplied_events:
                 values = self._event_values(item)
                 if self._is_stable_completed_reply_event(values):
                     has_stable_completed_reply = True
+                elif (
+                    target_state == TaskState.FAILED
+                    and self._is_canonical_failure_notice_event(values)
+                ):
+                    has_canonical_failure_notice = True
                 elif self._is_compatibility_final_reply_event(values):
                     compatibility_event_contents.append(
                         str(values.get("content") or "")
@@ -17871,9 +19386,14 @@ class SQLiteStore:
             # second aggregate reply.  An identity-less compatibility event is
             # accepted only when exactly one such final represents the result;
             # multiple progress-like messages become one synthesized final.
-            represented = has_stable_completed_reply or (
-                len(compatibility_event_contents) == 1
-                and compatibility_event_contents[0].strip() == normalized_output
+            represented = (
+                has_stable_completed_reply
+                or has_canonical_failure_notice
+                or (
+                    len(compatibility_event_contents) == 1
+                    and compatibility_event_contents[0].strip()
+                    == normalized_output
+                )
             )
             if not represented:
                 # Use ``sequence=None`` so it is allocated after any progress
@@ -18121,7 +19641,11 @@ class SQLiteStore:
                     ).fetchone()
                     has_terminal_event = existing_terminal is not None
                 if not has_terminal_event and target_state in {
-                    TaskState.COMPLETED, TaskState.FAILED, TaskState.INTERRUPTED, TaskState.CANCELLED
+                    TaskState.COMPLETED,
+                    TaskState.FAILED,
+                    TaskState.INTERRUPTED,
+                    TaskState.CANCELLED,
+                    TaskState.ORPHANED,
                 }:
                     # Keep a terminal audit event even when the runtime has no
                     # user-visible text.  The deterministic idempotency key
@@ -18146,7 +19670,29 @@ class SQLiteStore:
                     for item in appended
                     if self._is_stable_completed_reply_event(item)
                 }
-                if stable_reply_event_ids:
+                canonical_failure_notices = sorted(
+                    (
+                        item
+                        for item in appended
+                        if target_state == TaskState.FAILED
+                        and self._is_canonical_failure_notice_event(item)
+                    ),
+                    key=lambda item: (int(item.sequence), item.event_id),
+                )
+                canonical_failure_notice_ids = (
+                    {canonical_failure_notices[0].event_id}
+                    if canonical_failure_notices
+                    else set()
+                )
+                if canonical_failure_notice_ids:
+                    # Completed Agent messages may already have been delivered
+                    # as progress.  Keep them idempotent and add exactly one
+                    # explicit terminal failure reply rather than mistaking
+                    # their aggregate content for failure acknowledgement.
+                    terminal_reply_event_ids = (
+                        stable_reply_event_ids | canonical_failure_notice_ids
+                    )
+                elif stable_reply_event_ids:
                     terminal_reply_event_ids = stable_reply_event_ids
                 elif synthesized_reply_event_ids:
                     terminal_reply_event_ids = synthesized_reply_event_ids
@@ -18194,7 +19740,30 @@ class SQLiteStore:
                         ),
                         max_agent_queue=self.max_agent_queue,
                         max_global_queue=self.max_global_queue,
+                        reply_aggregation_max_age_seconds=(
+                            self.reply_aggregation_max_age_seconds
+                        ),
                     )
+                sealed_task_aggregates = self._seal_task_reply_aggregates_tx(
+                    conn,
+                    task_id=task_id,
+                    execution_id=effective_execution_id,
+                    reason=f"task_{target_state.value}",
+                    now=now_text,
+                )
+                for aggregate in sealed_task_aggregates:
+                    self._materialize_sealed_reply_aggregate_tx(
+                        conn,
+                        aggregate=aggregate,
+                        now=now_text,
+                        allow_terminal_failure_safety=(
+                            target_state == TaskState.FAILED
+                        ),
+                    )
+                self._materialize_pending_reply_aggregates_tx(
+                    conn,
+                    now=now_text,
+                )
                 changed = conn.execute(
                     """UPDATE tasks SET state = ?, updated_at = ?, terminal_at = ?,
                            last_error = ?, result_json = ?, claimed_by = NULL,
@@ -18692,6 +20261,28 @@ class SQLiteStore:
                             "system role mutation receipt requires atomic completion: "
                             f"{command_id}"
                         )
+                if str(row["command_name"] or "").strip().lower() == "cd":
+                    # A successful `/cd` response is inseparable from its
+                    # session/Agent preference.  Invalid/read-form commands
+                    # may still publish an ordinary deterministic response.
+                    command_text = str(row["command_text"] or "")
+                    match = re.match(
+                        r"^\s*/cd(?=$|\s)",
+                        command_text,
+                        flags=re.IGNORECASE,
+                    )
+                    raw_tail = (
+                        command_text[match.end() :].lstrip(" \t")
+                        if match is not None
+                        else ""
+                    )
+                    if raw_tail.strip() and response_text.startswith(
+                        "working directory: "
+                    ):
+                        raise StoreError(
+                            "working-directory mutation receipt requires atomic "
+                            f"completion: {command_id}"
+                        )
                 if existing_state == "interrupted" and allow_interrupted:
                     if str(row["command_name"] or "").strip().lower() not in {
                         "ask",
@@ -19029,6 +20620,7 @@ class SQLiteStore:
         preferred_client_id: str | None = None,
         preferred_contextless_client_id: str | None = None,
         from_user_id: str | None = None,
+        terminal_quota_bypass: bool = False,
     ) -> sqlite3.Row:
         """Create/update the sole subordinate outbox row for a fragment."""
 
@@ -19074,11 +20666,21 @@ class SQLiteStore:
             )
             reply_scope_id = str(fragment["origin_reply_scope_id"])
             reply_slot_id = None
-            reply_ordinal = None
+            reply_ordinal = (
+                REPLY_SCOPE_CAPACITY if terminal_quota_bypass else None
+            )
+        active_wire_variant = (
+            "contextless" if terminal_quota_bypass else "primary"
+        )
         sender_value = str(from_user_id or target.bot_id or "")
         if sender_value != str(target.bot_id or ""):
             raise StoreError("outbox sender identity conflicts with reply target bot")
         event_id = candidate["event_id"] if fragment_ordinal == 1 else None
+        aggregate_id = (
+            str(fragment["reply_aggregate_id"] or "")
+            if "reply_aggregate_id" in fragment.keys()
+            else ""
+        ) or None
         values = (
             outbox_id,
             event_id,
@@ -19108,9 +20710,10 @@ class SQLiteStore:
             reply_ordinal,
             candidate["reply_candidate_id"],
             fragment_id,
+            aggregate_id,
             sender_value,
             contextless_value,
-            "primary",
+            active_wire_variant,
         )
         conn.execute(
             """INSERT OR IGNORE INTO user_outbox
@@ -19120,10 +20723,11 @@ class SQLiteStore:
                 attachments_json, priority, delivery_mode, notify_enabled,
                 foreground, state, presentation, client_id, attempts, created_at,
                 reply_scope_id, reply_slot_id, reply_ordinal,
-                reply_candidate_id, reply_fragment_id, from_user_id,
+                reply_candidate_id, reply_fragment_id, reply_aggregate_id,
+                from_user_id,
                 contextless_client_id, active_wire_variant)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             values,
         )
         row = conn.execute(
@@ -19139,6 +20743,7 @@ class SQLiteStore:
             str(row["reply_candidate_id"] or "")
             != str(candidate["reply_candidate_id"])
             or str(row["reply_fragment_id"] or "") != fragment_id
+            or str(row["reply_aggregate_id"] or "") != str(aggregate_id or "")
         ):
             raise StoreError("reply outbox identity conflicts with its fragment")
         if slot is not None:
@@ -19199,6 +20804,24 @@ class SQLiteStore:
             row = conn.execute(
                 "SELECT * FROM user_outbox WHERE outbox_id=?", (outbox_id,)
             ).fetchone()
+        elif terminal_quota_bypass:
+            if (
+                str(row["reply_scope_id"] or "") != reply_scope_id
+                or row["reply_slot_id"] is not None
+                or int(row["reply_ordinal"] or 0) != REPLY_SCOPE_CAPACITY
+                or str(row["content"] or "") != content_value
+                or cls._json_snapshot(
+                    json_loads(row["attachments_json"], []) or []
+                )
+                != cls._json_snapshot(list(attachments_value))
+                or str(row["from_user_id"] or "") != sender_value
+                or str(row["contextless_client_id"] or "")
+                != str(contextless_value or "")
+                or str(row["active_wire_variant"] or "") != "contextless"
+            ):
+                raise StoreError(
+                    "terminal failure safety outbox conflicts with its envelope"
+                )
         if row is None:
             raise StoreError("reply outbox disappeared")
         return row
@@ -19236,6 +20859,106 @@ class SQLiteStore:
         return stored
 
     @classmethod
+    def _is_canonical_failure_notice_candidate_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        candidate: sqlite3.Row,
+        fragment: sqlite3.Row,
+    ) -> bool:
+        """Fail closed unless a candidate is the exact worker failure protocol."""
+
+        event_id = str(candidate["event_id"] or "")
+        task_id = str(candidate["task_id"] or "")
+        execution_id = str(candidate["execution_id"] or "")
+        if not event_id or not task_id or not execution_id:
+            return False
+        event_row = conn.execute(
+            "SELECT * FROM task_events WHERE event_id=? AND task_id=? "
+            "AND execution_id=?",
+            (event_id, task_id, execution_id),
+        ).fetchone()
+        if event_row is None:
+            return False
+        event = cls._task_event_from_row(event_row)
+        return bool(
+            cls._is_canonical_failure_notice_event(event)
+            and str(candidate["content"] or "") == str(event.content or "")
+            and not tuple(json_loads(candidate["attachments_json"], []) or ())
+            and str(fragment["reply_candidate_id"])
+            == str(candidate["reply_candidate_id"])
+            and str(fragment["origin_reply_scope_id"])
+            == str(candidate["origin_reply_scope_id"])
+            and str(fragment["content"] or "") == str(event.content or "")
+            and not tuple(json_loads(fragment["attachments_json"], []) or ())
+            and str(fragment["fragment_kind"]) == "text"
+        )
+
+    @classmethod
+    def _allocate_saturated_failure_notice_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        fragment: sqlite3.Row,
+        scope: sqlite3.Row,
+        target: ReplyTarget,
+        candidate: sqlite3.Row,
+        now: str,
+        from_user_id: str | None = None,
+    ) -> tuple[sqlite3.Row, sqlite3.Row]:
+        """Create one ordered contextless safety send after ordinal ten."""
+
+        if int(scope["used_slots"]) != int(scope["capacity"]):
+            raise StoreError("terminal failure safety send requires saturated quota")
+        if not cls._is_canonical_failure_notice_candidate_tx(
+            conn,
+            candidate=candidate,
+            fragment=fragment,
+        ):
+            raise StoreError("noncanonical reply cannot bypass saturated quota")
+        fragment_id = str(fragment["reply_fragment_id"])
+        if int(fragment["fragment_ordinal"]) != 1:
+            raise StoreError("terminal failure safety notice must be one fragment")
+        outbox_id = compound_id("reply-outbox", (fragment_id,))
+        client_id, contextless_client_id = cls._reply_wire_ids(fragment_id)
+        cls._assert_reply_wire_ids_available_tx(
+            conn,
+            primary_client_id=client_id,
+            contextless_client_id=contextless_client_id,
+            owner_outbox_id=outbox_id,
+        )
+        changed = conn.execute(
+            """UPDATE reply_fragments
+               SET state='allocated', delivery_reply_scope_id=?,
+                   reply_slot_id=NULL, deferred_sequence=NULL, allocated_at=?
+               WHERE reply_fragment_id=? AND reply_slot_id IS NULL
+                 AND state='retained'""",
+            (scope["reply_scope_id"], now, fragment_id),
+        ).rowcount
+        if changed != 1:
+            raise StoreError("terminal failure safety allocation was lost")
+        stored_fragment = conn.execute(
+            "SELECT * FROM reply_fragments WHERE reply_fragment_id=?",
+            (fragment_id,),
+        ).fetchone()
+        if stored_fragment is None:
+            raise StoreError("terminal failure safety fragment disappeared")
+        outbox = cls._reply_outbox_for_fragment_tx(
+            conn,
+            candidate=candidate,
+            fragment=stored_fragment,
+            target=target,
+            slot=None,
+            now=now,
+            preferred_outbox_id=outbox_id,
+            preferred_client_id=client_id,
+            preferred_contextless_client_id=contextless_client_id,
+            from_user_id=from_user_id,
+            terminal_quota_bypass=True,
+        )
+        return stored_fragment, outbox
+
+    @classmethod
     def _allocate_reply_fragment_tx(
         cls,
         conn: sqlite3.Connection,
@@ -19249,6 +20972,7 @@ class SQLiteStore:
         preferred_client_id: str | None = None,
         preferred_contextless_client_id: str | None = None,
         from_user_id: str | None = None,
+        allow_terminal_failure_safety: bool = False,
     ) -> tuple[sqlite3.Row | None, sqlite3.Row, sqlite3.Row | None]:
         """Reserve one never-recycled scope ordinal or durably defer it."""
 
@@ -19275,6 +20999,25 @@ class SQLiteStore:
         used_slots = int(scope["used_slots"])
         capacity = int(scope["capacity"])
         if used_slots >= capacity:
+            if allow_terminal_failure_safety and (
+                cls._is_canonical_failure_notice_candidate_tx(
+                    conn,
+                    candidate=candidate,
+                    fragment=fragment,
+                )
+            ):
+                stored_fragment, outbox = (
+                    cls._allocate_saturated_failure_notice_tx(
+                        conn,
+                        fragment=fragment,
+                        scope=scope,
+                        target=target,
+                        candidate=candidate,
+                        now=now,
+                        from_user_id=from_user_id,
+                    )
+                )
+                return None, stored_fragment, outbox
             deferred = cls._defer_reply_fragment_tx(conn, fragment)
             # A quota-deferred fragment is retained content, not a canonical
             # send.  Creating a pending outbox here would let an ordinary
@@ -19330,6 +21073,11 @@ class SQLiteStore:
             "attachments": json_loads(fragment["attachments_json"], []) or [],
             "target": target.to_dict(),
             "from_user_id": str(from_user_id or target.bot_id or ""),
+            "reply_aggregate_id": (
+                fragment["reply_aggregate_id"]
+                if "reply_aggregate_id" in fragment.keys()
+                else None
+            ),
         }
         changed = conn.execute(
             """UPDATE reply_scopes SET used_slots=?
@@ -19343,8 +21091,8 @@ class SQLiteStore:
                (reply_slot_id, reply_scope_id, reply_ordinal,
                 reply_fragment_id, delivery_id, client_id,
                 contextless_client_id, active_wire_variant, payload_json,
-                created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'primary', ?, ?)""",
+                created_at, reply_aggregate_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'primary', ?, ?, ?)""",
             (
                 reply_slot_id,
                 reply_scope_id,
@@ -19355,6 +21103,11 @@ class SQLiteStore:
                 contextless_value,
                 json_dumps(payload),
                 now,
+                (
+                    fragment["reply_aggregate_id"]
+                    if "reply_aggregate_id" in fragment.keys()
+                    else None
+                ),
             ),
         )
         conn.execute(
@@ -19471,6 +21224,7 @@ class SQLiteStore:
         delivery_mode: DeliveryMode | str = DeliveryMode.PUSH_ELIGIBLE,
         notify_enabled: bool = True,
         foreground: bool = False,
+        retain_only: bool = False,
         preserve_existing_delivery_snapshot: bool = False,
         preferred_outbox_id: str | None = None,
         preferred_client_id: str | None = None,
@@ -19644,6 +21398,26 @@ class SQLiteStore:
                 "reply candidate identity conflicts: " + ", ".join(conflicts)
             )
         reply_candidate_id = str(existing["reply_candidate_id"])
+        existing_membership = conn.execute(
+            "SELECT 1 FROM reply_aggregate_members "
+            "WHERE reply_candidate_id=? LIMIT 1",
+            (reply_candidate_id,),
+        ).fetchone()
+        if retain_only:
+            return ReplyProjectionResult(
+                candidate=cls._reply_candidate_from_row(existing),
+                replayed=not created,
+            )
+        if existing_membership is not None:
+            # The aggregate path owns this completed item.  In particular, a
+            # non-representative member intentionally has no candidate-owned
+            # wire fragment; a terminal event replay must not manufacture a
+            # legacy singleton for it.
+            return cls._reply_projection_for_candidate_tx(
+                conn,
+                reply_candidate_id,
+                replayed=True,
+            )
         existing_fragments = conn.execute(
             "SELECT 1 FROM reply_fragments WHERE reply_candidate_id=? LIMIT 1",
             (reply_candidate_id,),
@@ -19718,6 +21492,16 @@ class SQLiteStore:
             ).fetchone()
             if fragment_row is None:
                 raise StoreError("reply fragment insert failed")
+            cls._wrap_reply_fragment_aggregate_tx(
+                conn,
+                fragment_id=fragment_id,
+            )
+            fragment_row = conn.execute(
+                "SELECT * FROM reply_fragments WHERE reply_fragment_id=?",
+                (fragment_id,),
+            ).fetchone()
+            if fragment_row is None:
+                raise StoreError("reply fragment aggregate link disappeared")
             scope = conn.execute(
                 "SELECT * FROM reply_scopes WHERE reply_scope_id=?",
                 (scope["reply_scope_id"],),
@@ -19837,6 +21621,1316 @@ class SQLiteStore:
                         now=now_text,
                     )
                 return projection
+
+        return await self._call(op)
+
+    @classmethod
+    def _reply_aggregation_result_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        aggregate_ids: Sequence[str],
+        reply_candidate_id: str | None = None,
+        replayed: bool = False,
+    ) -> ReplyAggregationResult:
+        ids = tuple(dict.fromkeys(str(value) for value in aggregate_ids if value))
+        if not ids:
+            return ReplyAggregationResult(replayed=replayed)
+        placeholders = ",".join("?" for _ in ids)
+        aggregate_rows = conn.execute(
+            f"SELECT * FROM reply_aggregates WHERE reply_aggregate_id IN "
+            f"({placeholders}) ORDER BY created_at, reply_aggregate_id",
+            ids,
+        ).fetchall()
+        if len(aggregate_rows) != len(ids):
+            raise StoreError("reply aggregate result is incomplete")
+        if reply_candidate_id:
+            member_rows = conn.execute(
+                f"""SELECT * FROM reply_aggregate_members
+                    WHERE reply_aggregate_id IN ({placeholders})
+                      AND reply_candidate_id=?
+                    ORDER BY source_fragment_ordinal""",
+                (*ids, str(reply_candidate_id)),
+            ).fetchall()
+        else:
+            member_rows = conn.execute(
+                f"""SELECT * FROM reply_aggregate_members
+                    WHERE reply_aggregate_id IN ({placeholders})
+                    ORDER BY reply_aggregate_id, member_ordinal""",
+                ids,
+            ).fetchall()
+        aggregates = tuple(
+            record
+            for row in aggregate_rows
+            if (record := cls._reply_aggregate_from_row(row)) is not None
+        )
+        members = tuple(
+            record
+            for row in member_rows
+            if (record := cls._reply_aggregate_member_from_row(row)) is not None
+        )
+        sealed = tuple(
+            aggregate
+            for aggregate in aggregates
+            if aggregate.state is ReplyAggregateState.SEALED
+        )
+        open_records = tuple(
+            aggregate
+            for aggregate in aggregates
+            if aggregate.state is ReplyAggregateState.OPEN
+        )
+        return ReplyAggregationResult(
+            aggregates=aggregates,
+            members=members,
+            sealed_aggregates=sealed,
+            open_aggregate=open_records[-1] if open_records else None,
+            replayed=replayed,
+        )
+
+    @classmethod
+    def _seal_reply_aggregate_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        aggregate_id: str,
+        reason: str,
+        now: str,
+    ) -> sqlite3.Row:
+        """Seal one open group and create its sole retained wire fragment."""
+
+        reason_value = str(reason or "").strip()
+        if not reason_value:
+            raise ValueError("reply aggregate seal reason is required")
+        aggregate = conn.execute(
+            "SELECT * FROM reply_aggregates WHERE reply_aggregate_id=?",
+            (str(aggregate_id),),
+        ).fetchone()
+        if aggregate is None:
+            raise NotFoundError(f"reply aggregate not found: {aggregate_id}")
+        if str(aggregate["state"]) == ReplyAggregateState.SEALED.value:
+            return aggregate
+        member_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM reply_aggregate_members "
+                "WHERE reply_aggregate_id=?",
+                (aggregate_id,),
+            ).fetchone()[0]
+        )
+        if member_count <= 0:
+            raise StoreError("cannot seal a reply aggregate without membership")
+        candidate_id = str(aggregate["representative_reply_candidate_id"])
+        candidate = conn.execute(
+            "SELECT * FROM reply_candidates WHERE reply_candidate_id=?",
+            (candidate_id,),
+        ).fetchone()
+        if candidate is None:
+            raise StoreError("reply aggregate representative candidate disappeared")
+        fragment_ordinal = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(fragment_ordinal), 0) + 1 "
+                "FROM reply_fragments WHERE reply_candidate_id=?",
+                (candidate_id,),
+            ).fetchone()[0]
+        )
+        fragment_id = compound_id(
+            "reply-aggregate-fragment-v34",
+            (aggregate_id,),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO reply_fragments
+               (reply_fragment_id, reply_candidate_id,
+                origin_reply_scope_id, channel, bot_id, external_user_id,
+                session_id, fragment_ordinal, fragment_kind, content,
+                attachments_json, state, created_at, reply_aggregate_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'retained', ?, ?)""",
+            (
+                fragment_id,
+                candidate_id,
+                aggregate["origin_reply_scope_id"],
+                aggregate["channel"],
+                aggregate["bot_id"],
+                aggregate["external_user_id"],
+                aggregate["session_id"],
+                fragment_ordinal,
+                aggregate["wire_kind"],
+                aggregate["content"],
+                aggregate["attachments_json"],
+                now,
+                aggregate_id,
+            ),
+        )
+        fragment = conn.execute(
+            "SELECT * FROM reply_fragments WHERE reply_fragment_id=?",
+            (fragment_id,),
+        ).fetchone()
+        if fragment is None or str(fragment["reply_aggregate_id"] or "") != str(
+            aggregate_id
+        ):
+            raise StoreError("reply aggregate wire fragment identity conflicts")
+        changed = conn.execute(
+            """UPDATE reply_aggregates
+               SET state='sealed', flush_due_at=NULL, sealed_at=?,
+                   seal_reason=?, wire_reply_fragment_id=?, updated_at=?
+               WHERE reply_aggregate_id=? AND state='open'""",
+            (now, reason_value, fragment_id, now, aggregate_id),
+        ).rowcount
+        if changed != 1:
+            aggregate = conn.execute(
+                "SELECT * FROM reply_aggregates WHERE reply_aggregate_id=?",
+                (aggregate_id,),
+            ).fetchone()
+            if aggregate is None or str(aggregate["state"]) != "sealed":
+                raise StoreError("reply aggregate sealing lost its reservation")
+            return aggregate
+        aggregate = conn.execute(
+            "SELECT * FROM reply_aggregates WHERE reply_aggregate_id=?",
+            (aggregate_id,),
+        ).fetchone()
+        if aggregate is None:
+            raise StoreError("sealed reply aggregate disappeared")
+        return aggregate
+
+    @classmethod
+    def _seal_task_reply_aggregates_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        task_id: str,
+        execution_id: str | None,
+        reason: str,
+        now: str,
+    ) -> tuple[sqlite3.Row, ...]:
+        """Transaction-internal terminal/barrier flush used by task projection."""
+
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='reply_aggregates'"
+        ).fetchone() is None:
+            # Migration-boundary tests intentionally initialize an older
+            # schema before the v34 tables exist. Startup recovery remains a
+            # no-op for aggregation until that migration is actually applied.
+            return ()
+
+        clauses = ["state='open'", "task_id=?"]
+        params: list[Any] = [str(task_id)]
+        if execution_id is not None:
+            clauses.append("execution_id=?")
+            params.append(str(execution_id))
+        rows = conn.execute(
+            "SELECT reply_aggregate_id FROM reply_aggregates WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at, reply_aggregate_id",
+            params,
+        ).fetchall()
+        return tuple(
+            cls._seal_reply_aggregate_tx(
+                conn,
+                aggregate_id=str(row["reply_aggregate_id"]),
+                reason=reason,
+                now=now,
+            )
+            for row in rows
+        )
+
+    @classmethod
+    def _seal_due_reply_aggregates_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        now: str,
+        limit: int = 100,
+    ) -> tuple[sqlite3.Row, ...]:
+        """Seal a deterministic due batch inside an existing store transaction."""
+
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='reply_aggregates'"
+        ).fetchone() is None:
+            return ()
+
+        row_limit = max(0, min(10_000, int(limit)))
+        rows = conn.execute(
+            """SELECT reply_aggregate_id FROM reply_aggregates
+                WHERE state='open' AND flush_due_at<=?
+                ORDER BY flush_due_at, reply_aggregate_id LIMIT ?""",
+            (now, row_limit),
+        ).fetchall()
+        return tuple(
+            cls._seal_reply_aggregate_tx(
+                conn,
+                aggregate_id=str(row["reply_aggregate_id"]),
+                reason="max_age",
+                now=now,
+            )
+            for row in rows
+        )
+
+    @classmethod
+    def _materialize_sealed_reply_aggregate_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        aggregate: sqlite3.Row | str,
+        now: str,
+        from_user_id: str | None = None,
+        allow_terminal_failure_safety: bool = False,
+    ) -> ReplyProjectionResult:
+        """Allocate/defer one sealed aggregate's sole wire fragment exactly once."""
+
+        row = (
+            conn.execute(
+                "SELECT * FROM reply_aggregates WHERE reply_aggregate_id=?",
+                (str(aggregate),),
+            ).fetchone()
+            if isinstance(aggregate, str)
+            else aggregate
+        )
+        if row is None:
+            raise NotFoundError(f"reply aggregate not found: {aggregate}")
+        aggregate_id = str(row["reply_aggregate_id"])
+        if str(row["state"]) != ReplyAggregateState.SEALED.value:
+            raise StoreError("only a sealed reply aggregate can be materialized")
+        if (
+            not allow_terminal_failure_safety
+            and row["task_id"] is not None
+            and row["execution_id"] is not None
+        ):
+            # A terminal failure aggregate can be held behind an older open
+            # aggregate from another task.  By the time ordered reconciliation
+            # reaches it, the original completion transaction (and its explicit
+            # safety flag) is gone.  Recover that authority only from the exact
+            # durable failed execution still current on its task; the allocator
+            # below and the SQL trigger independently require canonical notice
+            # provenance before permitting the slotless send.
+            allow_terminal_failure_safety = conn.execute(
+                """SELECT 1 FROM tasks AS failed_task
+                     JOIN task_executions AS failed_execution
+                       ON failed_execution.execution_id=?
+                      AND failed_execution.task_id=failed_task.task_id
+                    WHERE failed_task.task_id=?
+                      AND failed_task.current_execution_id=
+                          failed_execution.execution_id
+                      AND failed_task.state='failed'
+                      AND failed_execution.state='failed'
+                      AND failed_execution.finished_at IS NOT NULL""",
+                (row["execution_id"], row["task_id"]),
+            ).fetchone() is not None
+        fragment_id = str(row["wire_reply_fragment_id"] or "")
+        if not fragment_id:
+            raise StoreError("sealed reply aggregate has no wire fragment")
+        fragment = conn.execute(
+            "SELECT * FROM reply_fragments WHERE reply_fragment_id=?",
+            (fragment_id,),
+        ).fetchone()
+        candidate = conn.execute(
+            "SELECT * FROM reply_candidates WHERE reply_candidate_id=?",
+            (row["representative_reply_candidate_id"],),
+        ).fetchone()
+        scope = conn.execute(
+            "SELECT * FROM reply_scopes WHERE reply_scope_id=?",
+            (row["origin_reply_scope_id"],),
+        ).fetchone()
+        if fragment is None or candidate is None or scope is None:
+            raise StoreError("sealed reply aggregate projection is incomplete")
+        if str(fragment["reply_aggregate_id"] or "") != aggregate_id:
+            raise StoreError("sealed reply aggregate wire fragment conflicts")
+        if str(fragment["content"] or "") != str(row["content"] or ""):
+            raise StoreError("sealed reply aggregate wire content conflicts")
+        predecessor = conn.execute(
+            """SELECT older.* FROM reply_aggregates AS older
+                LEFT JOIN reply_fragments AS older_fragment
+                  ON older_fragment.reply_fragment_id=
+                     older.wire_reply_fragment_id
+                WHERE older.origin_reply_scope_id=?
+                  AND older.reply_aggregate_id<>?
+                  AND (
+                    older.created_at < ?
+                    OR (older.created_at = ? AND
+                        older.first_source_sequence < ?)
+                    OR (older.created_at = ? AND
+                        older.first_source_sequence = ? AND
+                        older.reply_aggregate_id < ?)
+                  )
+                  AND (
+                    older.state='open'
+                    OR (older.state='sealed'
+                        AND older_fragment.reply_slot_id IS NULL
+                        AND older_fragment.state='retained')
+                  )
+                ORDER BY older.created_at, older.first_source_sequence,
+                         older.reply_aggregate_id
+                LIMIT 1""",
+            (
+                row["origin_reply_scope_id"],
+                aggregate_id,
+                row["created_at"],
+                row["created_at"],
+                row["first_source_sequence"],
+                row["created_at"],
+                row["first_source_sequence"],
+                aggregate_id,
+            ),
+        ).fetchone()
+        if predecessor is not None and str(predecessor["state"]) == "sealed":
+            cls._materialize_sealed_reply_aggregate_tx(
+                conn,
+                aggregate=predecessor,
+                now=now,
+                from_user_id=from_user_id,
+                allow_terminal_failure_safety=allow_terminal_failure_safety,
+            )
+            predecessor = conn.execute(
+                """SELECT older.reply_aggregate_id
+                     FROM reply_aggregates AS older
+                     LEFT JOIN reply_fragments AS older_fragment
+                       ON older_fragment.reply_fragment_id=
+                          older.wire_reply_fragment_id
+                    WHERE older.origin_reply_scope_id=?
+                      AND older.reply_aggregate_id<>?
+                      AND (
+                        older.created_at < ?
+                        OR (older.created_at = ? AND
+                            older.first_source_sequence < ?)
+                        OR (older.created_at = ? AND
+                            older.first_source_sequence = ? AND
+                            older.reply_aggregate_id < ?)
+                      )
+                      AND (
+                        older.state='open'
+                        OR (older.state='sealed'
+                            AND older_fragment.reply_slot_id IS NULL
+                            AND older_fragment.state='retained')
+                      )
+                    LIMIT 1""",
+                (
+                    row["origin_reply_scope_id"],
+                    aggregate_id,
+                    row["created_at"],
+                    row["created_at"],
+                    row["first_source_sequence"],
+                    row["created_at"],
+                    row["first_source_sequence"],
+                    aggregate_id,
+                ),
+            ).fetchone()
+        if predecessor is not None:
+            # A later terminal task may finish first, but it cannot consume an
+            # earlier pending aggregate's predicted ordinal.  Keep this wire
+            # fragment retained until the predecessor seals/materializes.
+            return ReplyProjectionResult(
+                candidate=cls._reply_candidate_from_row(candidate),
+                fragments=tuple(
+                    value
+                    for value in (cls._reply_fragment_from_row(fragment),)
+                    if value is not None
+                ),
+                replayed=False,
+            )
+        wire_limit = cls._reply_aggregate_wire_limit_tx(
+            conn,
+            reply_scope_id=str(row["origin_reply_scope_id"]),
+            aggregate_id=aggregate_id,
+        )
+        if (
+            str(fragment["fragment_kind"]) in {"text", "bundle"}
+            and len(str(fragment["content"] or "")) > wire_limit
+            and fragment["reply_slot_id"] is None
+        ):
+            raise StoreError(
+                "sealed reply aggregate exceeds its immutable ordinal-ten limit"
+            )
+        target = ReplyTarget.from_value(
+            json_loads(row["reply_target_json"], {}) or {}
+        )
+        canonical_target = cls._reply_target_for_scope_tx(conn, scope)
+        if cls._reply_target_snapshot(target.to_dict()) != cls._reply_target_snapshot(
+            canonical_target.to_dict()
+        ):
+            raise StoreError("sealed reply aggregate target conflicts with its scope")
+        replayed = str(fragment["state"]) != ReplyFragmentState.RETAINED.value
+        push_eligible = bool(candidate["notify_enabled"]) and str(
+            candidate["delivery_mode"]
+        ) != DeliveryMode.INBOX_ONLY.value
+        if push_eligible:
+            slot, stored_fragment, outbox = cls._allocate_reply_fragment_tx(
+                conn,
+                fragment=fragment,
+                scope=scope,
+                target=target,
+                candidate=candidate,
+                now=now,
+                from_user_id=from_user_id,
+                allow_terminal_failure_safety=allow_terminal_failure_safety,
+            )
+        else:
+            if str(fragment["state"]) == ReplyFragmentState.RETAINED.value:
+                conn.execute(
+                    "UPDATE reply_fragments SET state='inbox_only' "
+                    "WHERE reply_fragment_id=? AND state='retained'",
+                    (fragment_id,),
+                )
+            slot = None
+            outbox = None
+            stored_fragment = conn.execute(
+                "SELECT * FROM reply_fragments WHERE reply_fragment_id=?",
+                (fragment_id,),
+            ).fetchone()
+        if stored_fragment is None:
+            raise StoreError("materialized reply aggregate fragment disappeared")
+        if slot is not None:
+            conn.execute(
+                "UPDATE reply_slots SET reply_aggregate_id=? "
+                "WHERE reply_slot_id=? AND reply_aggregate_id IS NULL",
+                (aggregate_id, slot["reply_slot_id"]),
+            )
+            slot = conn.execute(
+                "SELECT * FROM reply_slots WHERE reply_slot_id=?",
+                (slot["reply_slot_id"],),
+            ).fetchone()
+        if outbox is not None:
+            conn.execute(
+                "UPDATE user_outbox SET reply_aggregate_id=? "
+                "WHERE outbox_id=? AND reply_aggregate_id IS NULL",
+                (aggregate_id, outbox["outbox_id"]),
+            )
+            outbox = conn.execute(
+                "SELECT * FROM user_outbox WHERE outbox_id=?",
+                (outbox["outbox_id"],),
+            ).fetchone()
+        return ReplyProjectionResult(
+            candidate=cls._reply_candidate_from_row(candidate),
+            fragments=tuple(
+                value
+                for value in (cls._reply_fragment_from_row(stored_fragment),)
+                if value is not None
+            ),
+            slots=tuple(
+                value
+                for value in (cls._reply_slot_from_row(slot),)
+                if value is not None
+            ),
+            outbox_items=tuple(
+                value
+                for value in (cls._outbox_from_row(outbox),)
+                if value is not None
+            ),
+            replayed=replayed,
+        )
+
+    @classmethod
+    def _materialize_pending_reply_aggregates_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        now: str,
+        reply_scope_id: str | None = None,
+        limit: int = 1000,
+    ) -> tuple[ReplyProjectionResult, ...]:
+        """Materialize sealed retained groups in their predicted wire order.
+
+        A later task can finish while an older aggregate for the same inbound
+        scope is still open.  The individual materializer correctly refuses
+        to leapfrog that predecessor.  Re-running this ordered reconciliation
+        whenever a predecessor seals makes the retained successor claimable
+        without waiting for another Agent event or a process-local timer.
+        """
+
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='reply_aggregates'"
+        ).fetchone() is None:
+            return ()
+
+        clauses = [
+            "a.state='sealed'",
+            "f.reply_slot_id IS NULL",
+            "f.state='retained'",
+        ]
+        params: list[Any] = []
+        if reply_scope_id is not None:
+            clauses.append("a.origin_reply_scope_id=?")
+            params.append(str(reply_scope_id))
+        params.append(max(0, min(10_000, int(limit))))
+        rows = conn.execute(
+            """SELECT a.* FROM reply_aggregates AS a
+                 JOIN reply_fragments AS f
+                   ON f.reply_fragment_id=a.wire_reply_fragment_id
+                WHERE """
+            + " AND ".join(clauses)
+            + " ORDER BY a.created_at, a.first_source_sequence, "
+              "a.reply_aggregate_id LIMIT ?",
+            params,
+        ).fetchall()
+        return tuple(
+            cls._materialize_sealed_reply_aggregate_tx(
+                conn,
+                aggregate=row,
+                now=now,
+            )
+            for row in rows
+        )
+
+    @classmethod
+    def _append_reply_aggregate_candidate_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        candidate: sqlite3.Row,
+        target: ReplyTarget,
+        source_sequence: int,
+        provenance_kind: str,
+        provenance_id: str,
+        command_id: str | None,
+        sender_format: str,
+        sender_prefix: str,
+        presentation_class: str,
+        renderer_version: str,
+        max_age_seconds: float,
+        now: str,
+        seal_after_append: bool,
+    ) -> ReplyAggregationResult:
+        """Pack one retained text candidate into exact-key durable groups."""
+
+        candidate_id = str(candidate["reply_candidate_id"])
+        source_text = str(candidate["content"] or "")
+        if not source_text:
+            raise ValueError("reply aggregate candidate has no text")
+        if tuple(json_loads(candidate["attachments_json"], []) or ()):
+            raise ValueError(
+                "reply aggregate text path does not accept attachment candidates"
+            )
+        try:
+            source_sequence_value = int(source_sequence)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("reply aggregate source_sequence must be nonnegative") from exc
+        if source_sequence_value < 0:
+            raise ValueError("reply aggregate source_sequence must be nonnegative")
+        provenance_kind_value = str(provenance_kind or "").strip().lower()
+        if provenance_kind_value not in {"live", "command"}:
+            raise ValueError("reply aggregate provenance_kind must be live or command")
+        provenance_id_value = str(provenance_id or "").strip()
+        if not provenance_id_value:
+            raise ValueError("reply aggregate provenance_id is required")
+        sender_format_value = str(sender_format or "").strip()
+        presentation_value = str(presentation_class or "").strip()
+        renderer_value = str(renderer_version or "").strip()
+        if not sender_format_value or not presentation_value or not renderer_value:
+            raise ValueError("reply aggregate renderer descriptors are required")
+        sender_prefix_value = str(sender_prefix or "")
+        if len(sender_prefix_value) >= REPLY_TEXT_MAX_CHARS:
+            raise ValueError("reply aggregate sender prefix leaves no text capacity")
+        task_id = candidate["task_id"]
+        execution_id = candidate["execution_id"]
+        command_id_value = str(command_id or "").strip() or None
+        if provenance_kind_value == "live":
+            if not task_id or not execution_id or command_id_value is not None:
+                raise ValueError(
+                    "live reply aggregation requires task/execution and no command"
+                )
+        elif command_id_value is None:
+            raise ValueError("command reply aggregation requires command_id")
+        key = {
+            "agent_id": str(candidate["agent_id"]),
+            "command_id": command_id_value,
+            "delivery_mode": str(candidate["delivery_mode"]),
+            "execution_id": execution_id,
+            "foreground": bool(candidate["foreground"]),
+            "notify_enabled": bool(candidate["notify_enabled"]),
+            "origin_reply_scope_id": str(candidate["origin_reply_scope_id"]),
+            "presentation_class": presentation_value,
+            "priority": int(candidate["priority"]),
+            "provenance_id": provenance_id_value,
+            "provenance_kind": provenance_kind_value,
+            "renderer_version": renderer_value,
+            "reply_target": target.to_dict(),
+            "sender_format": sender_format_value,
+            "sender_prefix": sender_prefix_value,
+            "task_id": task_id,
+            "wire_kind": "text",
+        }
+        key_json = json_dumps(key)
+        key_hash = cls._reply_aggregate_hash(key)
+        prior_members = conn.execute(
+            """SELECT m.*, a.aggregation_key_hash, a.aggregation_key_json
+                 FROM reply_aggregate_members AS m
+                 JOIN reply_aggregates AS a
+                   ON a.reply_aggregate_id=m.reply_aggregate_id
+                WHERE m.reply_candidate_id=?
+                ORDER BY m.source_fragment_ordinal""",
+            (candidate_id,),
+        ).fetchall()
+        if prior_members:
+            if any(
+                str(row["aggregation_key_hash"]) != key_hash
+                or str(row["aggregation_key_json"]) != key_json
+                or int(row["source_sequence"]) != source_sequence_value
+                or str(row["source_rendered_content_hash"])
+                != hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+                or int(row["source_rendered_character_count"]) != len(source_text)
+                for row in prior_members
+            ):
+                raise StoreError("reply aggregate candidate replay conflicts")
+            reconstructed = "".join(
+                str(row["rendered_content"] or "") for row in prior_members
+            )
+            if reconstructed != source_text:
+                raise StoreError("reply aggregate candidate replay is incomplete")
+            return cls._reply_aggregation_result_tx(
+                conn,
+                aggregate_ids=tuple(
+                    str(row["reply_aggregate_id"]) for row in prior_members
+                ),
+                reply_candidate_id=candidate_id,
+                replayed=True,
+            )
+
+        # A change in any immutable delivery/rendering property is an ordered
+        # barrier within this provenance stream.
+        barrier_rows = conn.execute(
+            """SELECT reply_aggregate_id FROM reply_aggregates
+                WHERE state='open' AND origin_reply_scope_id=?
+                  AND provenance_kind=? AND provenance_id=?
+                  AND aggregation_key_hash<>?
+                ORDER BY created_at, reply_aggregate_id""",
+            (
+                candidate["origin_reply_scope_id"],
+                provenance_kind_value,
+                provenance_id_value,
+                key_hash,
+            ),
+        ).fetchall()
+        touched_ids: list[str] = []
+        for row in barrier_rows:
+            aggregate_id = str(row["reply_aggregate_id"])
+            cls._seal_reply_aggregate_tx(
+                conn,
+                aggregate_id=aggregate_id,
+                reason="aggregation_key_change",
+                now=now,
+            )
+            touched_ids.append(aggregate_id)
+
+        existing_open = conn.execute(
+            "SELECT * FROM reply_aggregates "
+            "WHERE aggregation_key_hash=? AND state='open'",
+            (key_hash,),
+        ).fetchone()
+        if existing_open is not None and str(
+            existing_open["aggregation_key_json"]
+        ) != key_json:
+            raise StoreError("reply aggregate grouping-key hash collision")
+        if (
+            existing_open is not None
+            and str(existing_open["flush_due_at"]) <= str(now)
+        ):
+            expired_id = str(existing_open["reply_aggregate_id"])
+            cls._seal_reply_aggregate_tx(
+                conn,
+                aggregate_id=expired_id,
+                reason="max_age",
+                now=now,
+            )
+            touched_ids.append(expired_id)
+            existing_open = None
+
+        source_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+        cursor = 0
+        source_fragment_ordinal = 1
+        open_row = existing_open
+        while cursor < len(source_text):
+            wire_limit = cls._reply_aggregate_wire_limit_tx(
+                conn,
+                reply_scope_id=str(candidate["origin_reply_scope_id"]),
+                aggregate_id=(
+                    str(open_row["reply_aggregate_id"])
+                    if open_row is not None
+                    else None
+                ),
+            )
+            if open_row is not None:
+                if int(open_row["character_count"]) > wire_limit:
+                    raise StoreError(
+                        "open reply aggregate exceeds its predicted ordinal limit"
+                    )
+                last_member = conn.execute(
+                    """SELECT reply_candidate_id FROM reply_aggregate_members
+                        WHERE reply_aggregate_id=? ORDER BY member_ordinal DESC
+                        LIMIT 1""",
+                    (open_row["reply_aggregate_id"],),
+                ).fetchone()
+                if (
+                    int(open_row["last_source_sequence"]) >= source_sequence_value
+                    and (
+                        last_member is None
+                        or str(last_member["reply_candidate_id"]) != candidate_id
+                    )
+                ):
+                    raise StoreError("reply aggregate source order conflicts")
+                separator = (
+                    "\n\n"
+                    if last_member is not None
+                    and str(last_member["reply_candidate_id"]) != candidate_id
+                    else ""
+                )
+                available = wire_limit - int(open_row["character_count"])
+                if available <= len(separator):
+                    full_id = str(open_row["reply_aggregate_id"])
+                    cls._seal_reply_aggregate_tx(
+                        conn,
+                        aggregate_id=full_id,
+                        reason="size_boundary",
+                        now=now,
+                    )
+                    touched_ids.append(full_id)
+                    open_row = None
+                    continue
+                piece = source_text[cursor : cursor + available - len(separator)]
+                if not piece:
+                    raise StoreError("reply aggregate packer made no progress")
+                member_ordinal = int(open_row["next_member_ordinal"])
+                aggregate_start = int(open_row["character_count"]) + len(separator)
+                member_id = compound_id(
+                    "reply-aggregate-member-v34",
+                    (candidate_id, source_fragment_ordinal),
+                )
+                conn.execute(
+                    """INSERT INTO reply_aggregate_members
+                       (reply_aggregate_member_id, reply_aggregate_id,
+                        member_ordinal, reply_candidate_id,
+                        source_fragment_ordinal, source_reply_fragment_id,
+                        source_sequence, source_character_start,
+                        source_character_count, prefix_before,
+                        separator_before, rendered_content,
+                        rendered_content_hash, source_rendered_content_hash,
+                        source_rendered_character_count,
+                        aggregate_character_start, created_at)
+                       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        member_id,
+                        open_row["reply_aggregate_id"],
+                        member_ordinal,
+                        candidate_id,
+                        source_fragment_ordinal,
+                        source_sequence_value,
+                        cursor,
+                        len(piece),
+                        separator,
+                        piece,
+                        hashlib.sha256(piece.encode("utf-8")).hexdigest(),
+                        source_hash,
+                        len(source_text),
+                        aggregate_start,
+                        now,
+                    ),
+                )
+                new_content = str(open_row["content"]) + separator + piece
+                conn.execute(
+                    """UPDATE reply_aggregates
+                       SET content=?, content_hash=?, payload_hash=?,
+                           character_count=?, last_source_sequence=?,
+                           next_member_ordinal=?, updated_at=?
+                       WHERE reply_aggregate_id=? AND state='open'""",
+                    (
+                        new_content,
+                        hashlib.sha256(new_content.encode("utf-8")).hexdigest(),
+                        cls._reply_aggregate_payload_hash(
+                            wire_kind="text",
+                            content=new_content,
+                            attachments=(),
+                        ),
+                        len(new_content),
+                        source_sequence_value,
+                        member_ordinal + 1,
+                        now,
+                        open_row["reply_aggregate_id"],
+                    ),
+                )
+                cursor += len(piece)
+                source_fragment_ordinal += 1
+                open_row = conn.execute(
+                    "SELECT * FROM reply_aggregates WHERE reply_aggregate_id=?",
+                    (open_row["reply_aggregate_id"],),
+                ).fetchone()
+            else:
+                capacity = wire_limit - len(sender_prefix_value)
+                if capacity <= 0:
+                    raise ValueError("reply aggregate sender prefix leaves no capacity")
+                piece = source_text[cursor : cursor + capacity]
+                aggregate_id = compound_id(
+                    "reply-aggregate-v34",
+                    (key_hash, candidate_id, source_fragment_ordinal),
+                )
+                initial_content = sender_prefix_value + piece
+                due_at = _utc_text(
+                    (text_to_datetime(now) or utcnow())
+                    + timedelta(seconds=float(max_age_seconds))
+                )
+                conn.execute(
+                    """INSERT INTO reply_aggregates
+                       (reply_aggregate_id, aggregation_key_hash,
+                        aggregation_key_json, origin_reply_scope_id,
+                        channel, bot_id, external_user_id, session_id,
+                        reply_target_json, provenance_kind, provenance_id,
+                        task_id, execution_id, command_id, agent_id,
+                        sender_format, sender_prefix, notify_enabled, foreground,
+                        priority, delivery_mode, presentation_class,
+                        renderer_version, wire_kind, state, content,
+                        attachments_json, content_hash, payload_hash,
+                        character_count, first_source_sequence,
+                        last_source_sequence, next_member_ordinal,
+                        representative_reply_candidate_id, flush_due_at,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, 'text', 'open', ?, '[]', ?, ?, ?,
+                               ?, ?, 2, ?, ?, ?, ?)""",
+                    (
+                        aggregate_id,
+                        key_hash,
+                        key_json,
+                        candidate["origin_reply_scope_id"],
+                        candidate["channel"],
+                        candidate["bot_id"],
+                        candidate["external_user_id"],
+                        candidate["session_id"],
+                        json_dumps(target.to_dict()),
+                        provenance_kind_value,
+                        provenance_id_value,
+                        task_id,
+                        execution_id,
+                        command_id_value,
+                        candidate["agent_id"],
+                        sender_format_value,
+                        sender_prefix_value,
+                        int(bool(candidate["notify_enabled"])),
+                        int(bool(candidate["foreground"])),
+                        int(candidate["priority"]),
+                        str(candidate["delivery_mode"]),
+                        presentation_value,
+                        renderer_value,
+                        initial_content,
+                        hashlib.sha256(initial_content.encode("utf-8")).hexdigest(),
+                        cls._reply_aggregate_payload_hash(
+                            wire_kind="text",
+                            content=initial_content,
+                            attachments=(),
+                        ),
+                        len(initial_content),
+                        source_sequence_value,
+                        source_sequence_value,
+                        candidate_id,
+                        due_at,
+                        now,
+                        now,
+                    ),
+                )
+                member_id = compound_id(
+                    "reply-aggregate-member-v34",
+                    (candidate_id, source_fragment_ordinal),
+                )
+                conn.execute(
+                    """INSERT INTO reply_aggregate_members
+                       (reply_aggregate_member_id, reply_aggregate_id,
+                        member_ordinal, reply_candidate_id,
+                        source_fragment_ordinal, source_reply_fragment_id,
+                        source_sequence, source_character_start,
+                        source_character_count, prefix_before,
+                        separator_before, rendered_content,
+                        rendered_content_hash, source_rendered_content_hash,
+                        source_rendered_character_count,
+                        aggregate_character_start, created_at)
+                       VALUES (?, ?, 1, ?, ?, NULL, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)""",
+                    (
+                        member_id,
+                        aggregate_id,
+                        candidate_id,
+                        source_fragment_ordinal,
+                        source_sequence_value,
+                        cursor,
+                        len(piece),
+                        sender_prefix_value,
+                        piece,
+                        hashlib.sha256(piece.encode("utf-8")).hexdigest(),
+                        source_hash,
+                        len(source_text),
+                        len(sender_prefix_value),
+                        now,
+                    ),
+                )
+                touched_ids.append(aggregate_id)
+                cursor += len(piece)
+                source_fragment_ordinal += 1
+                open_row = conn.execute(
+                    "SELECT * FROM reply_aggregates WHERE reply_aggregate_id=?",
+                    (aggregate_id,),
+                ).fetchone()
+            if open_row is None:
+                raise StoreError("reply aggregate packer lost its open group")
+            if int(open_row["character_count"]) >= wire_limit:
+                full_id = str(open_row["reply_aggregate_id"])
+                cls._seal_reply_aggregate_tx(
+                    conn,
+                    aggregate_id=full_id,
+                    reason="size_boundary",
+                    now=now,
+                )
+                touched_ids.append(full_id)
+                open_row = None
+
+        if seal_after_append and open_row is not None:
+            final_id = str(open_row["reply_aggregate_id"])
+            cls._seal_reply_aggregate_tx(
+                conn,
+                aggregate_id=final_id,
+                reason="explicit_boundary",
+                now=now,
+            )
+            touched_ids.append(final_id)
+        candidate_members = conn.execute(
+            "SELECT reply_aggregate_id FROM reply_aggregate_members "
+            "WHERE reply_candidate_id=? ORDER BY source_fragment_ordinal",
+            (candidate_id,),
+        ).fetchall()
+        touched_ids.extend(str(row["reply_aggregate_id"]) for row in candidate_members)
+        return cls._reply_aggregation_result_tx(
+            conn,
+            aggregate_ids=touched_ids,
+            reply_candidate_id=candidate_id,
+            replayed=False,
+        )
+
+    @classmethod
+    def _reply_aggregate_wire_limit_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        reply_scope_id: str,
+        aggregate_id: str | None,
+    ) -> int:
+        """Return the safe immutable size for an aggregate's future ordinal."""
+
+        scope = conn.execute(
+            "SELECT used_slots FROM reply_scopes WHERE reply_scope_id=?",
+            (str(reply_scope_id),),
+        ).fetchone()
+        if scope is None:
+            raise StoreError("reply aggregate origin scope disappeared")
+        pending = conn.execute(
+            """SELECT a.reply_aggregate_id
+                 FROM reply_aggregates AS a
+                 LEFT JOIN reply_fragments AS f
+                   ON f.reply_fragment_id=a.wire_reply_fragment_id
+                WHERE a.origin_reply_scope_id=? AND (
+                    a.state='open'
+                    OR (a.state='sealed' AND f.reply_slot_id IS NULL
+                        AND f.state IN ('retained','deferred_quota'))
+                )
+                ORDER BY a.created_at, a.first_source_sequence,
+                         a.reply_aggregate_id""",
+            (str(reply_scope_id),),
+        ).fetchall()
+        pending_ids = [str(row["reply_aggregate_id"]) for row in pending]
+        if aggregate_id is not None and str(aggregate_id) in pending_ids:
+            pending_position = pending_ids.index(str(aggregate_id)) + 1
+        else:
+            pending_position = len(pending_ids) + 1
+        predicted_ordinal = int(scope["used_slots"]) + pending_position
+        if predicted_ordinal >= REPLY_SCOPE_CAPACITY:
+            return REPLY_TEXT_MAX_CHARS - len(REPLY_CONTINUATION_SUFFIX)
+        return REPLY_TEXT_MAX_CHARS
+
+    async def append_reply_aggregate_member(
+        self,
+        *,
+        target: ReplyTarget | Mapping[str, Any],
+        source_key: str,
+        content: str,
+        source_sequence: int,
+        reply_scope_id: str | None = None,
+        agent_id: str = "codex",
+        task_id: str | None = None,
+        execution_id: str | None = None,
+        event_id: str | None = None,
+        source_item_id: str | None = None,
+        source_item_type: str | None = None,
+        source_item_ordinal: int | None = None,
+        priority: EventPriority | int = EventPriority.NORMAL,
+        delivery_mode: DeliveryMode | str = DeliveryMode.PUSH_ELIGIBLE,
+        notify_enabled: bool = True,
+        foreground: bool = False,
+        provenance_kind: str = "live",
+        provenance_id: str | None = None,
+        command_id: str | None = None,
+        sender_format: str = "none-v1",
+        sender_prefix: str = "",
+        presentation_class: str = "live",
+        renderer_version: str = "wechat-text-v1",
+        seal_after_append: bool = False,
+        preserve_existing_delivery_snapshot: bool = True,
+        now: datetime | str | None = None,
+    ) -> ReplyAggregationResult:
+        """Atomically retain one candidate and pack it into bounded wire groups."""
+
+        target_value = self._coerce_reply_target(target)
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> ReplyAggregationResult:
+            with _transaction(conn):
+                retained = self._project_reply_candidate_tx(
+                    conn,
+                    target=target_value,
+                    source_key=source_key,
+                    content=content,
+                    attachments=(),
+                    reply_scope_id=reply_scope_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    execution_id=execution_id,
+                    event_id=event_id,
+                    source_item_id=source_item_id,
+                    source_item_type=source_item_type,
+                    source_item_ordinal=source_item_ordinal,
+                    priority=priority,
+                    delivery_mode=delivery_mode,
+                    notify_enabled=notify_enabled,
+                    foreground=foreground,
+                    retain_only=True,
+                    preserve_existing_delivery_snapshot=(
+                        preserve_existing_delivery_snapshot
+                    ),
+                    now=now_text,
+                )
+                if retained.candidate is None:
+                    raise StoreError("reply aggregate candidate retention failed")
+                candidate = conn.execute(
+                    "SELECT * FROM reply_candidates WHERE reply_candidate_id=?",
+                    (retained.candidate.reply_candidate_id,),
+                ).fetchone()
+                if candidate is None:
+                    raise StoreError("reply aggregate candidate disappeared")
+                canonical_target = self._reply_target_for_scope_tx(
+                    conn,
+                    conn.execute(
+                        "SELECT * FROM reply_scopes WHERE reply_scope_id=?",
+                        (candidate["origin_reply_scope_id"],),
+                    ).fetchone(),
+                )
+                effective_provenance_id = str(
+                    provenance_id
+                    or (
+                        f"{task_id}:{execution_id}"
+                        if str(provenance_kind).strip().lower() == "live"
+                        else command_id
+                    )
+                    or ""
+                )
+                return self._append_reply_aggregate_candidate_tx(
+                    conn,
+                    candidate=candidate,
+                    target=canonical_target,
+                    source_sequence=source_sequence,
+                    provenance_kind=provenance_kind,
+                    provenance_id=effective_provenance_id,
+                    command_id=command_id,
+                    sender_format=sender_format,
+                    sender_prefix=sender_prefix,
+                    presentation_class=presentation_class,
+                    renderer_version=renderer_version,
+                    max_age_seconds=self.reply_aggregation_max_age_seconds,
+                    now=now_text,
+                    seal_after_append=bool(seal_after_append),
+                )
+
+        return await self._call(op)
+
+    async def get_reply_aggregate(
+        self,
+        reply_aggregate_id: str,
+    ) -> ReplyAggregateRecord | None:
+        aggregate_id = str(reply_aggregate_id or "").strip()
+        if not aggregate_id:
+            raise ValueError("reply_aggregate_id is required")
+
+        def op(conn: sqlite3.Connection) -> ReplyAggregateRecord | None:
+            return self._reply_aggregate_from_row(
+                conn.execute(
+                    "SELECT * FROM reply_aggregates WHERE reply_aggregate_id=?",
+                    (aggregate_id,),
+                ).fetchone()
+            )
+
+        return await self._call(op)
+
+    async def list_reply_aggregates(
+        self,
+        *,
+        state: ReplyAggregateState | str | None = None,
+        task_id: str | None = None,
+        execution_id: str | None = None,
+        reply_scope_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[ReplyAggregateRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state is not None:
+            state_value = str(_enum_value(state, ""))
+            if state_value not in {"open", "sealed"}:
+                raise ValueError("reply aggregate state must be open or sealed")
+            clauses.append("state=?")
+            params.append(state_value)
+        for column, value in (
+            ("task_id", task_id),
+            ("execution_id", execution_id),
+            ("origin_reply_scope_id", reply_scope_id),
+        ):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                params.append(str(value))
+        row_limit = max(0, min(10_000, int(limit)))
+
+        def op(conn: sqlite3.Connection) -> list[ReplyAggregateRecord]:
+            sql = "SELECT * FROM reply_aggregates"
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
+            sql += " ORDER BY created_at, reply_aggregate_id LIMIT ?"
+            rows = conn.execute(sql, (*params, row_limit)).fetchall()
+            return [
+                record
+                for row in rows
+                if (record := self._reply_aggregate_from_row(row)) is not None
+            ]
+
+        return await self._call(op)
+
+    async def list_reply_aggregate_members(
+        self,
+        reply_aggregate_id: str,
+    ) -> list[ReplyAggregateMemberRecord]:
+        aggregate_id = str(reply_aggregate_id or "").strip()
+        if not aggregate_id:
+            raise ValueError("reply_aggregate_id is required")
+
+        def op(conn: sqlite3.Connection) -> list[ReplyAggregateMemberRecord]:
+            rows = conn.execute(
+                "SELECT * FROM reply_aggregate_members "
+                "WHERE reply_aggregate_id=? ORDER BY member_ordinal",
+                (aggregate_id,),
+            ).fetchall()
+            return [
+                record
+                for row in rows
+                if (record := self._reply_aggregate_member_from_row(row)) is not None
+            ]
+
+        return await self._call(op)
+
+    async def seal_reply_aggregates(
+        self,
+        *,
+        aggregate_ids: Iterable[str] = (),
+        task_id: str | None = None,
+        execution_id: str | None = None,
+        reply_scope_id: str | None = None,
+        provenance_id: str | None = None,
+        reason: str,
+        now: datetime | str | None = None,
+    ) -> tuple[ReplyAggregateRecord, ...]:
+        ids = tuple(dict.fromkeys(str(value) for value in aggregate_ids if value))
+        if not ids and not any(
+            value is not None
+            for value in (task_id, execution_id, reply_scope_id, provenance_id)
+        ):
+            raise ValueError("reply aggregate sealing requires an exact filter")
+        reason_value = str(reason or "").strip()
+        if not reason_value:
+            raise ValueError("reply aggregate seal reason is required")
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> tuple[ReplyAggregateRecord, ...]:
+            with _transaction(conn):
+                clauses = ["state='open'"]
+                params: list[Any] = []
+                if ids:
+                    placeholders = ",".join("?" for _ in ids)
+                    clauses.append(f"reply_aggregate_id IN ({placeholders})")
+                    params.extend(ids)
+                for column, value in (
+                    ("task_id", task_id),
+                    ("execution_id", execution_id),
+                    ("origin_reply_scope_id", reply_scope_id),
+                    ("provenance_id", provenance_id),
+                ):
+                    if value is not None:
+                        clauses.append(f"{column}=?")
+                        params.append(str(value))
+                rows = conn.execute(
+                    "SELECT reply_aggregate_id FROM reply_aggregates WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY created_at, reply_aggregate_id",
+                    params,
+                ).fetchall()
+                sealed_rows = [
+                    self._seal_reply_aggregate_tx(
+                        conn,
+                        aggregate_id=str(row["reply_aggregate_id"]),
+                        reason=reason_value,
+                        now=now_text,
+                    )
+                    for row in rows
+                ]
+                return tuple(
+                    record
+                    for row in sealed_rows
+                    if (record := self._reply_aggregate_from_row(row)) is not None
+                )
+
+        return await self._call(op)
+
+    async def seal_due_reply_aggregates(
+        self,
+        *,
+        now: datetime | str | None = None,
+        limit: int = 100,
+    ) -> tuple[ReplyAggregateRecord, ...]:
+        now_text = self._now(now)
+        row_limit = max(0, min(10_000, int(limit)))
+
+        def op(conn: sqlite3.Connection) -> tuple[ReplyAggregateRecord, ...]:
+            with _transaction(conn):
+                sealed_rows = self._seal_due_reply_aggregates_tx(
+                    conn,
+                    now=now_text,
+                    limit=row_limit,
+                )
+                return tuple(
+                    record
+                    for row in sealed_rows
+                    if (record := self._reply_aggregate_from_row(row)) is not None
+                )
+
+        return await self._call(op)
+
+    async def materialize_sealed_reply_aggregate(
+        self,
+        reply_aggregate_id: str,
+        *,
+        from_user_id: str | None = None,
+        now: datetime | str | None = None,
+    ) -> ReplyProjectionResult:
+        """Allocate or quota-defer one already sealed aggregate idempotently."""
+
+        aggregate_id = str(reply_aggregate_id or "").strip()
+        if not aggregate_id:
+            raise ValueError("reply_aggregate_id is required")
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> ReplyProjectionResult:
+            with _transaction(conn):
+                return self._materialize_sealed_reply_aggregate_tx(
+                    conn,
+                    aggregate=aggregate_id,
+                    now=now_text,
+                    from_user_id=from_user_id,
+                )
 
         return await self._call(op)
 
@@ -20691,6 +23785,100 @@ class SQLiteStore:
     get_user_outbox_item = get_outbox_item
     get_delivery = get_outbox_item
 
+    @staticmethod
+    def _terminal_failure_safety_outbox_sql(alias: str) -> str:
+        """Return the fail-closed SQL predicate for the sole quota bypass."""
+
+        outbox = str(alias or "").strip()
+        if not outbox.replace("_", "").isalnum():
+            raise ValueError("invalid outbox SQL alias")
+        return f"""(
+            {outbox}.reply_slot_id IS NULL
+            AND {outbox}.reply_ordinal={REPLY_SCOPE_CAPACITY}
+            AND {outbox}.active_wire_variant='contextless'
+            AND {outbox}.contextless_client_id IS NOT NULL
+            AND {outbox}.contextless_client_id<>{outbox}.client_id
+            AND {outbox}.reply_scope_id IS NOT NULL
+            AND {outbox}.reply_candidate_id IS NOT NULL
+            AND {outbox}.reply_fragment_id IS NOT NULL
+            AND {outbox}.reply_aggregate_id IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                  FROM task_events AS failure_event
+                  JOIN reply_candidates AS failure_candidate
+                    ON failure_candidate.reply_candidate_id=
+                       {outbox}.reply_candidate_id
+                  JOIN reply_fragments AS failure_fragment
+                    ON failure_fragment.reply_fragment_id=
+                       {outbox}.reply_fragment_id
+                  JOIN reply_aggregates AS failure_aggregate
+                    ON failure_aggregate.reply_aggregate_id=
+                       {outbox}.reply_aggregate_id
+                 WHERE failure_event.event_id={outbox}.event_id
+                   AND failure_event.task_id={outbox}.task_id
+                   AND failure_event.execution_id=
+                       failure_candidate.execution_id
+                   AND failure_event.event_type='failure_notice'
+                   AND failure_event.visibility='user'
+                   AND failure_event.destination_agent_id IS NULL
+                   AND failure_event.attachments_json='[]'
+                   AND failure_event.content IN (
+                       'task failed: ' || failure_event.task_id || char(10) ||
+                       'check /tasks before retrying. /retry reuses the same context; /clear starts fresh.',
+                       'task failed: ' || failure_event.task_id || char(10) ||
+                       'check /tasks before retrying or sending a new prompt.'
+                   )
+                   AND failure_candidate.event_id=failure_event.event_id
+                   AND failure_candidate.task_id=failure_event.task_id
+                   AND failure_candidate.content=failure_event.content
+                   AND failure_candidate.attachments_json='[]'
+                   AND failure_candidate.origin_reply_scope_id=
+                       {outbox}.reply_scope_id
+                   AND failure_candidate.channel={outbox}.channel
+                   AND failure_candidate.bot_id={outbox}.bot_id
+                   AND failure_candidate.external_user_id=
+                       {outbox}.external_user_id
+                   AND failure_candidate.session_id={outbox}.session_id
+                   AND failure_candidate.agent_id={outbox}.agent_id
+                   AND failure_candidate.priority={outbox}.priority
+                   AND failure_candidate.delivery_mode={outbox}.delivery_mode
+                   AND failure_candidate.notify_enabled={outbox}.notify_enabled
+                   AND failure_candidate.foreground={outbox}.foreground
+                   AND failure_fragment.reply_candidate_id=
+                       failure_candidate.reply_candidate_id
+                   AND failure_fragment.origin_reply_scope_id=
+                       {outbox}.reply_scope_id
+                   AND failure_fragment.fragment_ordinal=1
+                   AND failure_fragment.fragment_kind='text'
+                   AND failure_fragment.content=failure_event.content
+                   AND failure_fragment.attachments_json='[]'
+                   AND failure_fragment.state='allocated'
+                   AND failure_fragment.delivery_reply_scope_id=
+                       {outbox}.reply_scope_id
+                   AND failure_fragment.reply_slot_id IS NULL
+                   AND failure_fragment.deferred_sequence IS NULL
+                   AND failure_fragment.reply_aggregate_id=
+                       failure_aggregate.reply_aggregate_id
+                   AND failure_aggregate.state='sealed'
+                   AND failure_aggregate.wire_reply_fragment_id=
+                       failure_fragment.reply_fragment_id
+                   AND failure_aggregate.representative_reply_candidate_id=
+                       failure_candidate.reply_candidate_id
+                   AND failure_aggregate.origin_reply_scope_id=
+                       {outbox}.reply_scope_id
+                   AND failure_aggregate.task_id=failure_event.task_id
+                   AND failure_aggregate.execution_id=
+                       failure_event.execution_id
+                   AND failure_aggregate.content=failure_event.content
+                   AND failure_aggregate.attachments_json='[]'
+                   AND failure_aggregate.reply_target_json=
+                       {outbox}.reply_target_json
+                   AND {outbox}.content=failure_event.content
+                   AND {outbox}.attachments_json='[]'
+                   AND {outbox}.from_user_id={outbox}.bot_id
+            )
+        )"""
+
     async def claim_outbox(
         self,
         worker_id: str,
@@ -20711,18 +23899,47 @@ class SQLiteStore:
         def op(conn: sqlite3.Connection) -> list[UserOutboxItem]:
             with _transaction(conn):
                 now_text = self._now(now)
+                sealed_due = self._seal_due_reply_aggregates_tx(
+                    conn,
+                    now=now_text,
+                    limit=max(100, int(limit) * 4),
+                )
+                for aggregate in sealed_due:
+                    self._materialize_sealed_reply_aggregate_tx(
+                        conn,
+                        aggregate=aggregate,
+                        now=now_text,
+                    )
+                self._materialize_pending_reply_aggregates_tx(
+                    conn,
+                    now=now_text,
+                    limit=max(100, int(limit) * 4),
+                )
                 lease = self._lease_deadline(now_text, lease_seconds)
+                terminal_failure_safety = (
+                    self._terminal_failure_safety_outbox_sql("user_outbox")
+                )
                 filters = [
                     "state IN ('pending','retry_wait')",
                     "(next_attempt_at IS NULL OR next_attempt_at <= ?)",
                     # Legacy unscoped rows remain compatible.  Every v19
                     # candidate row, however, becomes claimable only after a
-                    # canonical reply slot exists.
-                    "(reply_candidate_id IS NULL OR reply_slot_id IS NOT NULL)",
+                    # canonical reply slot exists, except for the exact
+                    # schema-validated terminal failure safety protocol.
+                    "(reply_candidate_id IS NULL OR reply_slot_id IS NOT NULL OR "
+                    + terminal_failure_safety
+                    + ")",
                     """(reply_scope_id IS NULL OR NOT EXISTS (
                            SELECT 1 FROM user_outbox AS predecessor
                            WHERE predecessor.reply_scope_id=user_outbox.reply_scope_id
-                             AND predecessor.reply_ordinal < user_outbox.reply_ordinal
+                             AND (
+                                 predecessor.reply_ordinal < user_outbox.reply_ordinal
+                                 OR (
+                                     predecessor.reply_ordinal=user_outbox.reply_ordinal
+                                     AND user_outbox.reply_slot_id IS NULL
+                                     AND predecessor.reply_slot_id IS NOT NULL
+                                 )
+                             )
                              AND predecessor.state NOT IN (
                                  'sent','failed_permanent','delivery_unknown'
                              )
@@ -20773,11 +23990,20 @@ class SQLiteStore:
                         f"""UPDATE user_outbox SET state='claimed', claimed_by=?,
                                claim_token=?, lease_expires_at=?, attempts=attempts+1
                            WHERE outbox_id=? AND state IN ('pending','retry_wait')
-                             AND (reply_candidate_id IS NULL OR reply_slot_id IS NOT NULL)
+                             AND (reply_candidate_id IS NULL
+                                  OR reply_slot_id IS NOT NULL
+                                  OR {terminal_failure_safety})
                              AND (reply_scope_id IS NULL OR NOT EXISTS (
                                  SELECT 1 FROM user_outbox AS predecessor
                                  WHERE predecessor.reply_scope_id=user_outbox.reply_scope_id
-                                   AND predecessor.reply_ordinal < user_outbox.reply_ordinal
+                                   AND (
+                                       predecessor.reply_ordinal < user_outbox.reply_ordinal
+                                       OR (
+                                           predecessor.reply_ordinal=user_outbox.reply_ordinal
+                                           AND user_outbox.reply_slot_id IS NULL
+                                           AND predecessor.reply_slot_id IS NOT NULL
+                                       )
+                                   )
                                    AND predecessor.state NOT IN (
                                        'sent','failed_permanent','delivery_unknown'
                                    )
@@ -21116,6 +24342,7 @@ class SQLiteStore:
                            last_error=NULL WHERE outbox_id=? AND state IN ('delivery_unknown','failed_permanent')""",
                     (now_text, outbox_id),
                 ).rowcount == 1
+                return changed
         return await self._call(op)
 
     # ------------------------------------------------------------------
@@ -23232,30 +26459,12 @@ class SQLiteStore:
                         raise StoreError(
                             "mailbox request expiry conflicts with existing request"
                         )
-                    if supplied_execution_snapshot is not None:
-                        existing_snapshot = json_loads(
-                            existing["execution_snapshot_json"]
-                            if "execution_snapshot_json" in existing.keys()
-                            else "{}",
-                            {},
-                        ) or {}
-                        incoming_snapshot = self._mailbox_execution_snapshot_tx(
-                            conn,
-                            destination_agent_id=destination_agent_id,
-                            request_id=rid,
-                            supplied=supplied_execution_snapshot,
-                            reply_target=reply_target,
-                            channel=channel,
-                            bot_id=bot_id,
-                            external_user_id=external_user_id,
-                            session_id=session_id,
-                        )
-                        if self._json_snapshot(existing_snapshot) != self._json_snapshot(
-                            incoming_snapshot
-                        ):
-                            raise StoreError(
-                                "mailbox execution snapshot conflicts with existing request"
-                            )
+                    # The immutable envelope fields above own retry identity.
+                    # Its execution snapshot was frozen by the transaction
+                    # that inserted the row and must be replayed verbatim.
+                    # Revalidating a newly supplied snapshot here would make a
+                    # response-loss retry depend on mutable mode/cwd state and
+                    # could reject an operation that already committed.
                     item = self._mailbox_from_row(existing)
                     if item is not None:
                         self._retain_attachment_refs_tx(
@@ -23526,6 +26735,622 @@ class SQLiteStore:
     # ------------------------------------------------------------------
     # Routes, profiles, modes, and conversations
     # ------------------------------------------------------------------
+    async def get_session_working_directory(
+        self,
+        *,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str = "default",
+        agent_id: str,
+    ) -> dict[str, Any] | None:
+        """Return one session/Agent working-directory preference, if set."""
+
+        scope = (
+            str(channel or ""),
+            str(bot_id or ""),
+            str(external_user_id or ""),
+            str(session_id or "default"),
+            str(agent_id or ""),
+        )
+        if not all(scope):
+            raise ValueError("working-directory scope is incomplete")
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any] | None:
+            row = conn.execute(
+                """SELECT * FROM session_agent_working_directories
+                   WHERE channel=? AND bot_id=? AND external_user_id=?
+                     AND session_id=? AND agent_id=?""",
+                scope,
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "channel": str(row["channel"]),
+                "bot_id": str(row["bot_id"]),
+                "external_user_id": str(row["external_user_id"]),
+                "session_id": str(row["session_id"]),
+                "agent_id": str(row["agent_id"]),
+                "relative_path": str(row["relative_path"]),
+                "directory_device": int(row["directory_device"]),
+                "directory_inode": int(row["directory_inode"]),
+                "updated_by": str(row["updated_by"]),
+                "updated_at": str(row["updated_at"]),
+            }
+
+        return await self._call(op)
+
+    async def set_session_working_directory(
+        self,
+        relative_path: str,
+        *,
+        absolute_path: str,
+        directory_device: int,
+        directory_inode: int,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str = "default",
+        agent_id: str,
+        updated_by: str = "",
+        command_id: str | None = None,
+        now: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        """Persist one resolved `/cd` preference and optionally its receipt.
+
+        Only the workspace-relative path and the resolved directory identity
+        are stored in the preference table.  ``absolute_path`` is accepted to
+        construct the exact user response; it is never copied into that table.
+        When ``command_id`` is supplied, the preference and completed receipt
+        are committed in the same SQLite transaction.
+        """
+
+        raw_relative = str(relative_path or "")
+        if not raw_relative or "\x00" in raw_relative:
+            raise ValueError("relative_path is required")
+        normalized_relative = os.path.normpath(raw_relative)
+        relative = Path(normalized_relative)
+        if relative.is_absolute() or any(part == ".." for part in relative.parts):
+            raise ValueError("relative_path must stay within the workspace")
+        canonical_relative = relative.as_posix() or "."
+
+        raw_absolute = str(absolute_path or "")
+        if not raw_absolute or "\x00" in raw_absolute:
+            raise ValueError("absolute_path is required")
+        absolute = Path(os.path.normpath(raw_absolute))
+        if not absolute.is_absolute():
+            raise ValueError("absolute_path must be absolute")
+        canonical_absolute = str(absolute)
+
+        def directory_identity(value: Any, field: str) -> int:
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{field} must be a non-negative integer")
+            return value
+
+        device = directory_identity(directory_device, "directory_device")
+        inode = directory_identity(directory_inode, "directory_inode")
+        scope = (
+            str(channel or ""),
+            str(bot_id or ""),
+            str(external_user_id or ""),
+            str(session_id or "default"),
+            str(agent_id or ""),
+        )
+        if not all(scope):
+            raise ValueError("working-directory scope is incomplete")
+        actor = str(updated_by or "")
+        receipt_id = str(command_id or "").strip()
+        now_text = self._now(now)
+        response = format_working_directory_response(canonical_absolute)
+
+        def snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
+            return {
+                "channel": str(row["channel"]),
+                "bot_id": str(row["bot_id"]),
+                "external_user_id": str(row["external_user_id"]),
+                "session_id": str(row["session_id"]),
+                "agent_id": str(row["agent_id"]),
+                "relative_path": str(row["relative_path"]),
+                "directory_device": int(row["directory_device"]),
+                "directory_inode": int(row["directory_inode"]),
+                "updated_by": str(row["updated_by"]),
+                "updated_at": str(row["updated_at"]),
+            }
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any]:
+            with _transaction(conn):
+                receipt_row: sqlite3.Row | None = None
+                if receipt_id:
+                    receipt_row = conn.execute(
+                        "SELECT * FROM command_receipts WHERE command_id=?",
+                        (receipt_id,),
+                    ).fetchone()
+                    if receipt_row is None:
+                        raise NotFoundError(
+                            f"command receipt not found: {receipt_id}"
+                        )
+                    for column, expected in (
+                        ("channel", scope[0]),
+                        ("bot_id", scope[1]),
+                        ("external_user_id", scope[2]),
+                        ("session_id", scope[3]),
+                    ):
+                        if str(receipt_row[column] or "") != expected:
+                            raise StoreError(
+                                "cd command receipt scope conflicts: "
+                                f"{receipt_id} ({column})"
+                            )
+                    if str(receipt_row["command_name"] or "").strip().lower() != "cd":
+                        raise StoreError(
+                            f"cd command receipt name conflicts: {receipt_id}"
+                        )
+                    command_text = str(receipt_row["command_text"] or "")
+                    match = re.match(
+                        r"^\s*/cd(?=$|\s)", command_text, flags=re.IGNORECASE
+                    )
+                    if match is None:
+                        raise StoreError(
+                            f"cd command receipt text conflicts: {receipt_id}"
+                        )
+                    raw_tail = command_text[match.end() :].lstrip(" \t")
+                    if not raw_tail.strip():
+                        raise StoreError(
+                            "cd command receipt does not describe a mutation: "
+                            f"{receipt_id}"
+                        )
+                    try:
+                        semantic_paths = tuple(shlex.split(raw_tail, posix=True))
+                    except ValueError as exc:
+                        raise StoreError(
+                            "cd command receipt identity conflicts: "
+                            f"{receipt_id} (command_text)"
+                        ) from exc
+                    if (
+                        len(semantic_paths) != 1
+                        or not semantic_paths[0]
+                        or "\x00" in semantic_paths[0]
+                    ):
+                        raise StoreError(
+                            "cd command receipt identity conflicts: "
+                            f"{receipt_id} (command_text)"
+                        )
+                    receipt_path = semantic_paths[0]
+                    parsed_tokens = tuple(command_text.strip()[1:].split())
+                    raw_receipt_args = json_loads(
+                        receipt_row["command_args_json"], None
+                    )
+                    receipt_args = (
+                        tuple(str(value) for value in raw_receipt_args)
+                        if isinstance(raw_receipt_args, list)
+                        else ()
+                    )
+                    if (
+                        not parsed_tokens
+                        or parsed_tokens[0].lower() != "cd"
+                        or not isinstance(raw_receipt_args, list)
+                        or receipt_args != parsed_tokens[1:]
+                    ):
+                        raise StoreError(
+                            "cd command receipt identity conflicts: "
+                            f"{receipt_id} (command_args)"
+                        )
+                    receipt_state = str(receipt_row["state"] or "")
+                    if receipt_state not in {"started", "completed"}:
+                        raise StoreError(
+                            "cd command receipt is not active: "
+                            f"{receipt_id} ({receipt_state or 'unknown'})"
+                        )
+
+                    # An absolute token can be bound to the manager-supplied
+                    # resolved target directly (or through its live symlink
+                    # identity).  A relative token is based on the immutable
+                    # command-acceptance cwd, which this store API does not
+                    # receive; do not claim a lexical equivalence that cannot
+                    # be proved here.  Completed outcomes are still bound by
+                    # their resolved path/device/inode snapshot below.
+                    receipt_target = Path(os.path.normpath(receipt_path))
+                    if receipt_target.is_absolute():
+                        target_matches = str(receipt_target) == canonical_absolute
+                        if not target_matches:
+                            try:
+                                resolved_receipt_target = receipt_target.resolve(
+                                    strict=True
+                                )
+                                receipt_stat = receipt_target.stat()
+                            except (OSError, RuntimeError):
+                                target_matches = False
+                            else:
+                                target_matches = (
+                                    str(resolved_receipt_target)
+                                    == canonical_absolute
+                                    and int(receipt_stat.st_dev) == device
+                                    and int(receipt_stat.st_ino) == inode
+                                )
+                        if not target_matches:
+                            raise StoreError(
+                                "cd command receipt mutation conflicts: "
+                                f"{receipt_id} (command_text)"
+                            )
+
+                    if receipt_state == "completed":
+                        try:
+                            receipt = (
+                                self._command_receipt_from_row(receipt_row) or {}
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise StoreError(
+                                "cd command receipt completion conflicts: "
+                                f"{receipt_id} (encoding)"
+                            ) from exc
+                        outcome = receipt.get("outcome")
+                        outcome_version = (
+                            outcome.get("version")
+                            if isinstance(outcome, Mapping)
+                            else None
+                        )
+                        expected_keys = {
+                            "type",
+                            "version",
+                            "command_id",
+                            "scope",
+                            "working_directory",
+                            "changed",
+                            "command_response",
+                            "response_agent_id",
+                            "presentation_ids",
+                        }
+                        if outcome_version == 2:
+                            expected_keys.add("absolute_path")
+                        scope_keys = {
+                            "channel",
+                            "bot_id",
+                            "external_user_id",
+                            "session_id",
+                            "agent_id",
+                        }
+                        expected_scope = {
+                            "channel": scope[0],
+                            "bot_id": scope[1],
+                            "external_user_id": scope[2],
+                            "session_id": scope[3],
+                            "agent_id": scope[4],
+                        }
+                        stored_scope = (
+                            outcome.get("scope")
+                            if isinstance(outcome, Mapping)
+                            else None
+                        )
+                        stored_response = (
+                            outcome.get("command_response")
+                            if isinstance(outcome, Mapping)
+                            else None
+                        )
+                        stored_absolute_value = (
+                            outcome.get("absolute_path")
+                            if isinstance(outcome, Mapping)
+                            and outcome_version == 2
+                            else (
+                                stored_response[
+                                    len(WORKING_DIRECTORY_RESPONSE_PREFIX) :
+                                ]
+                                if isinstance(stored_response, str)
+                                and stored_response.startswith(
+                                    WORKING_DIRECTORY_RESPONSE_PREFIX
+                                )
+                                else ""
+                            )
+                        )
+                        stored_absolute = ""
+                        if (
+                            type(stored_absolute_value) is str
+                            and stored_absolute_value
+                            and "\x00" not in stored_absolute_value
+                        ):
+                            normalized_stored_absolute = Path(
+                                os.path.normpath(stored_absolute_value)
+                            )
+                            if (
+                                normalized_stored_absolute.is_absolute()
+                                and str(normalized_stored_absolute)
+                                == stored_absolute_value
+                            ):
+                                stored_absolute = stored_absolute_value
+                        try:
+                            canonical_stored_response = (
+                                format_working_directory_response(stored_absolute)
+                                if stored_absolute
+                                else ""
+                            )
+                        except ValueError:
+                            canonical_stored_response = ""
+                        completed_at = receipt_row["completed_at"]
+                        try:
+                            canonical_completed_at = (
+                                _utc_text(completed_at)
+                                if type(completed_at) is str
+                                else ""
+                            )
+                        except (TypeError, ValueError):
+                            canonical_completed_at = ""
+                        if (
+                            not isinstance(outcome, Mapping)
+                            or set(outcome) != expected_keys
+                            or outcome.get("type") != "working_directory"
+                            or type(outcome_version) is not int
+                            or outcome_version not in {1, 2}
+                            or outcome.get("command_id") != receipt_id
+                            or not isinstance(stored_scope, Mapping)
+                            or set(stored_scope) != scope_keys
+                            or any(
+                                type(stored_scope.get(key)) is not str
+                                or not stored_scope.get(key)
+                                for key in scope_keys
+                            )
+                            or any(
+                                stored_scope.get(key)
+                                != str(receipt_row[column] or "")
+                                for key, column in (
+                                    ("channel", "channel"),
+                                    ("bot_id", "bot_id"),
+                                    ("external_user_id", "external_user_id"),
+                                    ("session_id", "session_id"),
+                                )
+                            )
+                            or type(outcome.get("changed")) is not bool
+                            or type(stored_response) is not str
+                            or not stored_absolute
+                            or stored_response != canonical_stored_response
+                            or stored_response
+                            != str(receipt.get("response_text", "") or "")
+                            or outcome.get("response_agent_id")
+                            != stored_scope.get("agent_id")
+                            or outcome.get("presentation_ids") != []
+                            or str(receipt.get("response_agent_id", "") or "")
+                            != stored_scope.get("agent_id")
+                            or json_loads(
+                                receipt_row["presentation_ids_json"], None
+                            )
+                            != []
+                            or json_loads(
+                                receipt_row["response_fragments_json"], None
+                            )
+                            != []
+                            or tuple(receipt.get("presentation_ids", ()))
+                            or tuple(receipt.get("response_fragments", ()))
+                            or canonical_completed_at != completed_at
+                        ):
+                            raise StoreError(
+                                "cd command receipt completion conflicts: "
+                                f"{receipt_id}"
+                            )
+                        stored_snapshot = outcome.get("working_directory")
+                        if not isinstance(stored_snapshot, Mapping):
+                            raise StoreError(
+                                "cd command receipt completion conflicts: "
+                                f"{receipt_id} (working_directory)"
+                            )
+                        replay_snapshot = dict(stored_snapshot)
+                        snapshot_keys = {
+                            "channel",
+                            "bot_id",
+                            "external_user_id",
+                            "session_id",
+                            "agent_id",
+                            "relative_path",
+                            "directory_device",
+                            "directory_inode",
+                            "updated_by",
+                            "updated_at",
+                        }
+                        updated_at = replay_snapshot.get("updated_at")
+                        stored_relative = replay_snapshot.get("relative_path")
+                        canonical_stored_relative = ""
+                        if (
+                            type(stored_relative) is str
+                            and stored_relative
+                            and "\x00" not in stored_relative
+                        ):
+                            normalized_stored_relative = Path(
+                                os.path.normpath(stored_relative)
+                            )
+                            if (
+                                not normalized_stored_relative.is_absolute()
+                                and ".." not in normalized_stored_relative.parts
+                            ):
+                                candidate_relative = (
+                                    normalized_stored_relative.as_posix() or "."
+                                )
+                                if candidate_relative == stored_relative:
+                                    canonical_stored_relative = candidate_relative
+                        try:
+                            canonical_updated_at = (
+                                _utc_text(updated_at)
+                                if type(updated_at) is str
+                                else ""
+                            )
+                        except (TypeError, ValueError):
+                            canonical_updated_at = ""
+                        requested_identity = (
+                            canonical_relative,
+                            device,
+                            inode,
+                        )
+                        retained_identity = (
+                            replay_snapshot.get("relative_path"),
+                            replay_snapshot.get("directory_device"),
+                            replay_snapshot.get("directory_inode"),
+                        )
+                        if (
+                            set(replay_snapshot) != snapshot_keys
+                            or type(replay_snapshot.get("relative_path")) is not str
+                            or not canonical_stored_relative
+                            or type(replay_snapshot.get("directory_device")) is not int
+                            or type(replay_snapshot.get("directory_inode")) is not int
+                            or replay_snapshot["directory_device"] < 0
+                            or replay_snapshot["directory_inode"] < 0
+                            or type(replay_snapshot.get("updated_by")) is not str
+                            or canonical_updated_at != updated_at
+                            or any(
+                                replay_snapshot.get(key) != value
+                                for key, value in stored_scope.items()
+                            )
+                        ):
+                            raise StoreError(
+                                "cd command receipt completion conflicts: "
+                                f"{receipt_id} (working_directory)"
+                            )
+                        if (
+                            dict(stored_scope) != expected_scope
+                            or retained_identity != requested_identity
+                            or stored_absolute != canonical_absolute
+                            or stored_response != response
+                        ):
+                            raise StoreError(
+                                "cd command receipt mutation conflicts: "
+                                f"{receipt_id}"
+                            )
+                        return {
+                            **replay_snapshot,
+                            "changed": bool(outcome["changed"]),
+                            "command_response": response,
+                            "command_receipt": receipt,
+                        }
+
+                    route = conn.execute(
+                        """SELECT active_agent_id FROM routes
+                           WHERE channel=? AND bot_id=? AND external_user_id=?
+                             AND session_id=?""",
+                        scope[:4],
+                    ).fetchone()
+                    if (
+                        route is not None
+                        and str(route["active_agent_id"] or "") != scope[4]
+                    ):
+                        raise StoreError(
+                            "front Agent changed while setting the working "
+                            "directory"
+                        )
+                    if route is None:
+                        conn.execute(
+                            """INSERT INTO routes(
+                                   channel, bot_id, external_user_id, session_id,
+                                   active_agent_id, updated_at
+                               ) VALUES (?, ?, ?, ?, ?, ?)""",
+                            (*scope, now_text),
+                        )
+
+                current_row = conn.execute(
+                    """SELECT * FROM session_agent_working_directories
+                       WHERE channel=? AND bot_id=? AND external_user_id=?
+                         AND session_id=? AND agent_id=?""",
+                    scope,
+                ).fetchone()
+                changed = current_row is None or (
+                    str(current_row["relative_path"]),
+                    int(current_row["directory_device"]),
+                    int(current_row["directory_inode"]),
+                ) != (canonical_relative, device, inode)
+                if changed:
+                    conn.execute(
+                        """INSERT INTO session_agent_working_directories (
+                               channel, bot_id, external_user_id, session_id,
+                               agent_id, relative_path, directory_device,
+                               directory_inode, updated_by, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(
+                               channel, bot_id, external_user_id, session_id,
+                               agent_id
+                           ) DO UPDATE SET
+                               relative_path=excluded.relative_path,
+                               directory_device=excluded.directory_device,
+                               directory_inode=excluded.directory_inode,
+                               updated_by=excluded.updated_by,
+                               updated_at=excluded.updated_at""",
+                        (
+                            *scope,
+                            canonical_relative,
+                            device,
+                            inode,
+                            actor,
+                            now_text,
+                        ),
+                    )
+                    current_row = conn.execute(
+                        """SELECT * FROM session_agent_working_directories
+                           WHERE channel=? AND bot_id=? AND external_user_id=?
+                             AND session_id=? AND agent_id=?""",
+                        scope,
+                    ).fetchone()
+                if current_row is None:
+                    raise StoreError("working-directory persistence failed")
+                snapshot = snapshot_from_row(current_row)
+
+                result = {
+                    **snapshot,
+                    "changed": bool(changed),
+                    "command_response": response,
+                }
+                if receipt_row is None:
+                    return result
+                if any(
+                    (
+                        receipt_row["response_text"],
+                        receipt_row["response_agent_id"],
+                        receipt_row["completed_at"],
+                    )
+                ) or tuple(
+                    json_loads(receipt_row["presentation_ids_json"], []) or []
+                ) or self._normalize_command_response_fragments(
+                    json_loads(receipt_row["response_fragments_json"], []) or []
+                ) or json_loads(receipt_row["outcome_json"], {}) != {}:
+                    raise StoreError(
+                        f"cd command receipt completion conflicts: {receipt_id}"
+                    )
+                outcome = {
+                    "type": "working_directory",
+                    "version": 2,
+                    "command_id": receipt_id,
+                    "scope": {
+                        "channel": scope[0],
+                        "bot_id": scope[1],
+                        "external_user_id": scope[2],
+                        "session_id": scope[3],
+                        "agent_id": scope[4],
+                    },
+                    "absolute_path": canonical_absolute,
+                    "working_directory": snapshot,
+                    "changed": bool(changed),
+                    "command_response": response,
+                    "response_agent_id": scope[4],
+                    "presentation_ids": [],
+                }
+                updated = conn.execute(
+                    """UPDATE command_receipts
+                       SET state='completed', response_text=?,
+                           response_agent_id=?, presentation_ids_json='[]',
+                           outcome_json=?, completed_at=?
+                       WHERE command_id=? AND state='started'""",
+                    (
+                        response,
+                        scope[4],
+                        json_dumps(outcome),
+                        now_text,
+                        receipt_id,
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise StoreError(
+                        "cd command receipt completion lost its reservation"
+                    )
+                completed_row = conn.execute(
+                    "SELECT * FROM command_receipts WHERE command_id=?",
+                    (receipt_id,),
+                ).fetchone()
+                receipt = self._command_receipt_from_row(completed_row) or {}
+                return {**result, "command_receipt": receipt}
+
+        return await self._call(op)
+
     async def get_session_role(
         self,
         *,
@@ -24111,7 +27936,11 @@ class SQLiteStore:
 
         def op(conn: sqlite3.Connection) -> int:
             with _transaction(conn):
-                self._assert_agent_retirable_tx(conn, agent_id)
+                self._assert_agent_retirable_tx(
+                    conn,
+                    agent_id,
+                    now_text=now_text,
+                )
                 cursor = conn.execute(
                     "UPDATE agent_profiles SET enabled=0 WHERE agent_id=?",
                     (agent_id,),
@@ -24142,6 +27971,14 @@ class SQLiteStore:
                     source_id=source_id,
                     provenance={"compatibility_path": "retire_agent"},
                     profile_version=int(profile["profile_version"]),
+                )
+                # A recreated Agent starts without the retired incarnation's
+                # per-session directory preferences.  Immutable task/history
+                # records remain untouched.
+                conn.execute(
+                    "DELETE FROM session_agent_working_directories "
+                    "WHERE agent_id=?",
+                    (agent_id,),
                 )
                 conn.execute(
                     "UPDATE routes SET active_agent_id=?, updated_at=? "
@@ -24425,7 +28262,10 @@ class SQLiteStore:
 
     @staticmethod
     def _assert_agent_retirable_tx(
-        conn: sqlite3.Connection, agent_id: str
+        conn: sqlite3.Connection,
+        agent_id: str,
+        *,
+        now_text: str,
     ) -> None:
         placeholders = ",".join(
             "?" for _ in _AGENT_RETIREMENT_BLOCKING_TASK_STATES
@@ -24448,10 +28288,16 @@ class SQLiteStore:
             raise InvalidTransition(
                 f"cannot delete Agent {agent_id}: unfinished Agent work remains"
             )
+        # An orphan at or past its immutable expiry can no longer be retried:
+        # `review_mailbox_orphan(..., "retry")` rejects it as expired.  Keep
+        # that terminal incident and its invocation history for audit, but do
+        # not let it make the destination Agent undeletable forever.  Missing
+        # or future expiry still represents actionable unresolved work.
         unresolved_mailbox = conn.execute(
             "SELECT 1 FROM agent_mailbox WHERE destination_agent_id=? "
-            "AND state='orphaned_mailbox' LIMIT 1",
-            (agent_id,),
+            "AND state='orphaned_mailbox' "
+            "AND (expires_at IS NULL OR expires_at>?) LIMIT 1",
+            (agent_id, now_text),
         ).fetchone()
         if unresolved_mailbox is not None:
             raise InvalidTransition(
@@ -24541,6 +28387,11 @@ class SQLiteStore:
                 enabled=bool(row["enabled"]),
                 profile_version=int(row["profile_version"]),
                 default_mode_id=(row["default_mode_id"] if "default_mode_id" in row.keys() else "chat"),
+                codex_config_profile=(
+                    row["codex_config_profile"]
+                    if "codex_config_profile" in row.keys()
+                    else ""
+                ),
             )
 
         return await self._call(op)
@@ -24584,7 +28435,11 @@ class SQLiteStore:
 
         def op(conn: sqlite3.Connection) -> bool:
             with _transaction(conn):
-                self._assert_agent_retirable_tx(conn, agent_id)
+                self._assert_agent_retirable_tx(
+                    conn,
+                    agent_id,
+                    now_text=now_text,
+                )
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO deleted_agents(agent_id, deleted_at) VALUES (?, ?)",
                     (agent_id, now_text),
@@ -26544,6 +30399,21 @@ class SQLiteStore:
                             ),
                             created_at=now_text,
                         )
+                        sealed_task_aggregates = (
+                            self._seal_task_reply_aggregates_tx(
+                                conn,
+                                task_id=str(row["task_id"]),
+                                execution_id=current_task.execution_id,
+                                reason="task_orphaned",
+                                now=now_text,
+                            )
+                        )
+                        for aggregate in sealed_task_aggregates:
+                            self._materialize_sealed_reply_aggregate_tx(
+                                conn,
+                                aggregate=aggregate,
+                                now=now_text,
+                            )
                     conn.execute("UPDATE tasks SET state='orphaned', claimed_by=NULL, claim_token=NULL, lease_expires_at=NULL, updated_at=?, last_error=COALESCE(last_error,?) WHERE task_id=?", (now_text, recovery_reason, row["task_id"]))
                     conn.execute("UPDATE task_executions SET state='orphaned', finished_at=?, worker_id=NULL, claim_token=NULL, lease_expires_at=NULL, last_error=COALESCE(last_error,?) WHERE task_id=? AND finished_at IS NULL", (now_text, recovery_reason, row["task_id"]))
                     current_id = conn.execute(
@@ -26557,6 +30427,10 @@ class SQLiteStore:
                         raise StoreError(
                             "recovered task invocation was already released"
                         )
+                self._materialize_pending_reply_aggregates_tx(
+                    conn,
+                    now=now_text,
+                )
                 # A legacy/direct sender may have written ``sending`` before
                 # lease support was enabled, leaving a NULL expiry.  Treat
                 # that row as recoverable as well; modern rows always carry a

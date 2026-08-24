@@ -9,21 +9,38 @@ import inspect
 import logging
 import math
 import os
+from pathlib import Path
 import re
 import uuid
 from collections.abc import Mapping
 from typing import Any, Iterable, Sequence
 
 from src.agents.base import AgentTask, ReplyTarget, utc_now
+from src.agents.config_profile import require_profile_file
+from src.agents.workspace import (
+    EXECUTION_WORKSPACE_KEY,
+    WorkspaceError,
+    build_workspace_snapshot,
+    validate_workspace_snapshot,
+)
 
 from .dispatcher import SQLiteDispatcher, _call_compatible
-from .identity import conversation_id, mailbox_conversation_id
+from .identity import (
+    conversation_id,
+    conversation_id_matches,
+    mailbox_conversation_id,
+)
 from .models import iter_model_descriptors
 from .registry import AgentRegistry, DYNAMIC_AGENT_SUMMARY, codex_profile
 from .worker import TaskWorker
 from .modes import ModeRegistry
 from .media import canonical_media_inputs
-from .policy import AgentProfile, EffectivePolicy, PolicyEngine
+from .policy import (
+    AgentProfile,
+    EffectivePolicy,
+    PolicyEngine,
+    normalize_codex_config_profile,
+)
 from .roles import (
     RoleValidationError,
     build_role_snapshot,
@@ -38,7 +55,7 @@ from .skills import (
     normalize_skill,
     normalize_skills,
 )
-from .store import QueueFullError
+from .store import QueueFullError, format_working_directory_response
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +78,40 @@ class _NamedAgentRuntime:
     factory: those aliases retain the historical shared-delegate behavior.
     """
 
-    def __init__(self, agent_id: str, delegate: Any) -> None:
+    def __init__(
+        self,
+        agent_id: str,
+        delegate: Any,
+        *,
+        codex_config_profile: str = "",
+    ) -> None:
         self.agent_id = str(agent_id)
+        self.codex_config_profile = normalize_codex_config_profile(
+            codex_config_profile
+        )
         factory = getattr(delegate, "for_agent", None)
         if callable(factory):
-            owned_delegate = factory(self.agent_id)
+            try:
+                parameters = inspect.signature(factory).parameters.values()
+            except (TypeError, ValueError):
+                parameters = ()
+            supports_profile = any(
+                parameter.name == "codex_config_profile"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            if self.codex_config_profile and not supports_profile:
+                raise ValueError(
+                    "Agent runtime does not support Codex config profiles"
+                )
+            owned_delegate = factory(
+                self.agent_id,
+                **(
+                    {"codex_config_profile": self.codex_config_profile}
+                    if supports_profile
+                    else {}
+                ),
+            )
             if inspect.isawaitable(owned_delegate):
                 raise TypeError("Agent runtime for_agent() must be synchronous")
             if owned_delegate is delegate:
@@ -75,6 +121,10 @@ class _NamedAgentRuntime:
             self._delegate = owned_delegate
             self._owns_delegate = True
         else:
+            if self.codex_config_profile:
+                raise ValueError(
+                    "Agent runtime does not support Codex config profiles"
+                )
             self._delegate = delegate
             self._owns_delegate = False
 
@@ -288,8 +338,10 @@ class TaskManager:
         policy_engine: PolicyEngine | None = None,
         trusted_default_execute: bool = False,
         allow_dynamic_agents: bool = False,
+        allowed_codex_config_profiles: Iterable[str] | None = None,
         dynamic_agent_template_id: str | None = None,
         require_process_isolation: bool = False,
+        workspace_root: str | os.PathLike[str] | None = None,
         reconcile_interval: float | None = 15.0,
     ) -> None:
         if worker_count < 0:
@@ -376,14 +428,42 @@ class TaskManager:
         # durable WeChat startup enables it; generic embedders remain
         # fail-closed unless they opt in.
         self.allow_dynamic_agents = bool(allow_dynamic_agents)
+        configured_profiles = (
+            (allowed_codex_config_profiles,)
+            if isinstance(allowed_codex_config_profiles, str)
+            else tuple(allowed_codex_config_profiles or ())
+        )
+        # Named Codex configuration files are administrator-owned authority:
+        # they may contain provider credentials, MCP servers, hooks, and other
+        # capabilities.  Dynamic Agent creation therefore defaults to denying
+        # every non-empty selector even when a matching private file exists.
+        self.allowed_codex_config_profiles = frozenset(
+            normalized
+            for normalized in (
+                normalize_codex_config_profile(value)
+                for value in configured_profiles
+            )
+            if normalized
+        )
         # Generic embedders may still use in-memory runtimes.  The production
         # launcher opts into this fail-closed topology gate so it can never
         # silently fall back to shared/coroutine Agent execution.
         self.require_process_isolation = bool(require_process_isolation)
+        self.workspace_root: str | None = None
+        self._workspace_root_snapshot: dict[str, Any] | None = None
+        if workspace_root is not None:
+            root_snapshot = build_workspace_snapshot(workspace_root, ".")
+            self.workspace_root = str(root_snapshot["root"])
+            self._workspace_root_snapshot = root_snapshot
         self.dynamic_agent_template_id = str(
             dynamic_agent_template_id or self.default_agent_id
         ).strip() or self.default_agent_id
         self._dynamic_agent_lock = asyncio.Lock()
+        # Dynamic aliases registered before the supervisor starts remain
+        # process-local until their child runtime has actually passed startup.
+        # Publishing them earlier would let a crash or failed child leave an
+        # enabled Profile that a later supervisor mistakes for a proven Agent.
+        self._provisional_dynamic_agent_ids: set[str] = set()
         self.mode_registry = mode_registry or ModeRegistry()
         self.policy_engine = policy_engine or PolicyEngine()
         self._active_workers: set[str] = set()
@@ -622,7 +702,10 @@ class TaskManager:
         return value
 
     async def _persist_registry_definitions(
-        self, *, only_agent_ids: Iterable[str] | None = None
+        self,
+        *,
+        only_agent_ids: Iterable[str] | None = None,
+        exclude_agent_ids: Iterable[str] = (),
     ) -> None:
         """Publish registered Profile/Mode snapshots before workers start.
 
@@ -653,6 +736,11 @@ class TaskManager:
                 if str(agent_id).strip()
             )
         )
+        excluded_agent_ids = frozenset(
+            str(agent_id).strip()
+            for agent_id in exclude_agent_ids
+            if str(agent_id).strip()
+        )
 
         profile_writer = getattr(self.store, "put_profile", None) or getattr(
             self.store, "register_profile", None
@@ -679,7 +767,7 @@ class TaskManager:
                 if (
                     selected_agent_ids is not None
                     and agent_id not in selected_agent_ids
-                ):
+                ) or agent_id in excluded_agent_ids:
                     continue
                 try:
                     version = int(
@@ -712,7 +800,7 @@ class TaskManager:
             if (
                 selected_agent_ids is not None
                 and agent_id not in selected_agent_ids
-            ):
+            ) or agent_id in excluded_agent_ids:
                 continue
             agent_ids.add(agent_id)
             if profile_list is None:
@@ -826,6 +914,7 @@ class TaskManager:
             return
         registry_start_attempted = False
         started_workers: list[TaskWorker] = []
+        provisional_agent_ids: frozenset[str] = frozenset()
         initialize = getattr(self.store, "initialize", None)
         try:
             self._validate_trusted_default_execute()
@@ -847,8 +936,13 @@ class TaskManager:
             # workers so queued tasks can resolve their original owner after
             # a restart.
             await self._restore_dynamic_agents()
+            provisional_agent_ids = frozenset(
+                self._provisional_dynamic_agent_ids
+            )
             self._validate_process_isolation(require_live=False)
-            await self._persist_registry_definitions()
+            await self._persist_registry_definitions(
+                exclude_agent_ids=provisional_agent_ids
+            )
             await self._upgrade_collaboration_mode_preferences()
             # ``AgentRegistry.start`` rolls back runtimes it started itself,
             # but a failure can still occur before it returns.  Treat the
@@ -857,6 +951,14 @@ class TaskManager:
             registry_start_attempted = True
             await self.registry.start()
             self._validate_process_isolation(require_live=True)
+            if provisional_agent_ids:
+                # The child processes are now proven live.  Publish their
+                # immutable definitions only at this point, immediately
+                # before workers can create durable work that references
+                # them.
+                await self._persist_registry_definitions(
+                    only_agent_ids=provisional_agent_ids
+                )
             for worker in self._workers:
                 # Record the attempt before awaiting: a worker can allocate a
                 # dispatcher task and then raise, so it still needs rollback.
@@ -864,8 +966,11 @@ class TaskManager:
                 await worker.start()
                 self._active_workers.add(worker.worker_id)
             self._start_reconcile_loop()
+            self._provisional_dynamic_agent_ids.difference_update(
+                provisional_agent_ids
+            )
             self._started = True
-        except BaseException:
+        except BaseException as startup_error:
             self._started = False
             await self._stop_reconcile_loop()
             for worker in reversed(started_workers):
@@ -879,6 +984,18 @@ class TaskManager:
                     await self.registry.stop()
                 except Exception:
                     logger.debug("failed to roll back Agent registry startup", exc_info=True)
+            for agent_id in sorted(provisional_agent_ids):
+                try:
+                    await self._rollback_uncommitted_dynamic_agent(
+                        agent_id,
+                        retire_durable_profile=True,
+                    )
+                except BaseException:
+                    logger.exception(
+                        "failed to roll back provisional dynamic Agent %s "
+                        "after supervisor startup error",
+                        agent_id,
+                    )
             # Initialization/reconciliation may allocate resources before
             # raising without exposing a SQLite-style ``_conn`` attribute.
             # The manager owns the store lifecycle, so always invoke its
@@ -1150,6 +1267,25 @@ class TaskManager:
             await self.ensure_agent(resolved_agent)
         self.registry.require(resolved_agent)
         target = target_for_route
+        try:
+            execution_workspace = await self._execution_workspace_for_target(
+                target_for_route,
+                resolved_agent,
+            )
+        except WorkspaceError:
+            if (
+                create_task
+                or transcription_candidates is not None
+                or audio_candidates is not None
+            ):
+                raise
+            # A stale cwd must fail every task or cwd-consuming command, but
+            # it must not poison the control plane.  Persist cwd-independent
+            # commands without a workspace snapshot so `/agent`, `/help`, and
+            # an absolute `/cd` can recover the session.  Relative `/cd`,
+            # `/sh`, and skill discovery still resolve the invalid preference
+            # later and fail closed.
+            execution_workspace = None
         # Resolve the per-session mode after the Agent route is known.  A mode
         # change only affects this new snapshot; running tasks retain theirs.
         route_mode = await self._get_mode_for_target(
@@ -1202,6 +1338,8 @@ class TaskManager:
             target_for_route, resolved_agent
         )
         metadata = {**metadata, "session_role": session_role}
+        if execution_workspace is not None:
+            metadata[EXECUTION_WORKSPACE_KEY] = execution_workspace
         if agent_id is None:
             # This inbound was routed through the user's front Agent rather
             # than an explicit task-level override. Persist that fact for a
@@ -1217,6 +1355,11 @@ class TaskManager:
             skill = await self._resolve_trusted_skill_snapshot(
                 skill_snapshot,
                 agent_id=resolved_agent,
+                cwd=(
+                    str(execution_workspace["path"])
+                    if execution_workspace is not None
+                    else None
+                ),
             )
             task_inputs["skill"] = skill
             metadata = {
@@ -1298,6 +1441,7 @@ class TaskManager:
                 dedupe_key=dedupe_key,
                 metadata=metadata,
                 _role_snapshot_override=session_role,
+                _workspace_snapshot_override=execution_workspace,
                 skill_snapshot=skill_snapshot,
                 actor=actor,
                 explicit=explicit,
@@ -1316,6 +1460,11 @@ class TaskManager:
                     "policy_version": resolved_policy_version,
                     "model": resolved_model,
                     "reasoning_effort": resolved_reasoning_effort,
+                    **(
+                        {EXECUTION_WORKSPACE_KEY: execution_workspace}
+                        if execution_workspace is not None
+                        else {}
+                    ),
                     **(
                         {"synthetic_command_name": _synthetic_command_name}
                         if _synthetic_command_name
@@ -1452,6 +1601,7 @@ class TaskManager:
         explicit: bool = False,
         _policy_snapshot_override: Mapping[str, Any] | None = None,
         _role_snapshot_override: Mapping[str, Any] | None = None,
+        _workspace_snapshot_override: Mapping[str, Any] | None = None,
         skill_snapshot: Mapping[str, Any] | None = None,
         initial_reply: Any = None,
         delivery_reply_scope_id: str | None = None,
@@ -1477,6 +1627,27 @@ class TaskManager:
         if self.allow_dynamic_agents:
             await self.ensure_agent(resolved_agent)
         self.registry.require(resolved_agent)
+        workspace_override = _workspace_snapshot_override
+        if (
+            workspace_override is None
+            and isinstance(_policy_snapshot_override, Mapping)
+            and isinstance(
+                _policy_snapshot_override.get(EXECUTION_WORKSPACE_KEY),
+                Mapping,
+            )
+        ):
+            workspace_override = _policy_snapshot_override[
+                EXECUTION_WORKSPACE_KEY
+            ]
+        if workspace_override is None:
+            execution_workspace = await self._execution_workspace_for_target(
+                target,
+                resolved_agent,
+            )
+        else:
+            execution_workspace = self._validate_execution_workspace(
+                workspace_override
+            )
         route_mode = None
         if mode_id is None:
             route_mode = await self._get_mode_for_target(target, resolved_agent)
@@ -1529,7 +1700,11 @@ class TaskManager:
             # persisted candidate.  Its policy snapshot is authoritative even
             # when the mode/profile registry has since advanced or the front
             # Agent has switched.  Do not resolve the current policy here.
-            policy_metadata = dict(_policy_snapshot_override)
+            policy_metadata = {
+                key: value
+                for key, value in _policy_snapshot_override.items()
+                if key != EXECUTION_WORKSPACE_KEY
+            }
         if _role_snapshot_override is None:
             session_role = await self._session_role_for_target(
                 target, resolved_agent
@@ -1556,14 +1731,22 @@ class TaskManager:
                         "agent_mode",
                         "mode_authorization",
                         "session_role",
+                        EXECUTION_WORKSPACE_KEY,
                     }
                 }
             )
         merged_metadata["session_role"] = session_role
+        if execution_workspace is not None:
+            merged_metadata[EXECUTION_WORKSPACE_KEY] = execution_workspace
         if skill_snapshot is not None:
             skill = await self._resolve_trusted_skill_snapshot(
                 skill_snapshot,
                 agent_id=resolved_agent,
+                cwd=(
+                    str(execution_workspace["path"])
+                    if execution_workspace is not None
+                    else None
+                ),
             )
             merged_metadata.update(
                 {
@@ -1658,10 +1841,15 @@ class TaskManager:
         delivery_reply_scope_id: str | None = None,
         _child_parent_id: str | None = None,
         _child_max_children: int | None = None,
+        _workspace_snapshot_override: Mapping[str, Any] | None = None,
     ) -> Any:
         """Create a task ordered against route/mode mutations for its session."""
 
         self._assert_loop()
+        if _workspace_snapshot_override is not None and _child_parent_id is None:
+            raise PermissionError(
+                "execution workspace overrides are manager-controlled"
+            )
         target = self._coerce_target(reply_target)
         kwargs = {
             "task_id": task_id,
@@ -1685,6 +1873,7 @@ class TaskManager:
             "delivery_reply_scope_id": delivery_reply_scope_id,
             "_child_parent_id": _child_parent_id,
             "_child_max_children": _child_max_children,
+            "_workspace_snapshot_override": _workspace_snapshot_override,
         }
         if not target.external_user_id:
             return await self._submit_impl(inputs, target, **kwargs)
@@ -2061,7 +2250,12 @@ class TaskManager:
         return runtime, profile
 
     @staticmethod
-    def _named_profile(agent_id: str, template: AgentProfile) -> AgentProfile:
+    def _named_profile(
+        agent_id: str,
+        template: AgentProfile,
+        *,
+        codex_config_profile: str = "",
+    ) -> AgentProfile:
         # Named Agents start in read-only chat even when the administrator's
         # static Codex Agent defaults to trusted execute.  Execute remains an
         # explicit, per-session ``/mode execute`` decision.
@@ -2071,7 +2265,81 @@ class TaskManager:
             display_name=agent_id,
             summary=_DYNAMIC_AGENT_SUMMARY,
             default_mode_id="chat",
+            codex_config_profile=codex_config_profile,
         )
+
+    def _require_allowed_codex_config_profile(self, value: Any) -> str:
+        """Authorize one selector without revealing private file existence."""
+
+        normalized = normalize_codex_config_profile(value)
+        if (
+            normalized
+            and normalized not in self.allowed_codex_config_profiles
+        ):
+            raise PermissionError("Codex config profile is not enabled")
+        return normalized
+
+    async def _rollback_uncommitted_dynamic_agent(
+        self,
+        agent_id: str,
+        *,
+        retire_durable_profile: bool,
+    ) -> None:
+        """Hide a failed new alias durably, then release its runtime handle.
+
+        Profile publication consists of compatibility-store calls and can be
+        ambiguous when a store commits and then raises.  A brand-new alias is
+        therefore compensated with the existing retirement transaction: its
+        immutable history remains auditable, while the disabled Profile plus
+        tombstone cannot be restored as a runnable child.  Retained aliases
+        are never retired by this helper; their earlier durable lifecycle is
+        authoritative.
+        """
+
+        durable_error: BaseException | None = None
+        if retire_durable_profile:
+            profile_reader = getattr(self.store, "get_profile", None)
+            durable_profile = (
+                await _call_compatible(profile_reader, agent_id)
+                if profile_reader is not None
+                else None
+            )
+            if durable_profile is not None:
+                retire = getattr(self.store, "retire_agent", None) or getattr(
+                    self.store, "mark_agent_deleted", None
+                )
+                if retire is None:
+                    durable_error = RuntimeError(
+                        "store cannot retire an uncommitted Agent profile"
+                    )
+                else:
+                    try:
+                        await _call_compatible(
+                            retire,
+                            agent_id,
+                            default_agent_id=self.default_agent_id,
+                            fallback_agent_id=self.default_agent_id,
+                        )
+                    except BaseException as exc:
+                        durable_error = exc
+
+        current = self.registry.registration(agent_id)
+        if current is not None:
+            try:
+                await current.runtime.stop()
+            except BaseException as cleanup_error:
+                # Keep the only handle that can retry an uncertain process
+                # cleanup.  The caller surfaces the cleanup failure chained
+                # from the operation that initiated rollback.
+                if durable_error is not None:
+                    raise cleanup_error from durable_error
+                raise
+            if durable_error is None:
+                self.registry.unregister(agent_id, allow_started=True)
+
+        if durable_error is not None:
+            raise durable_error
+        self._provisional_dynamic_agent_ids.discard(agent_id)
 
     async def _restore_dynamic_agents(self) -> None:
         """Reattach persisted ``/agent`` aliases after a process restart.
@@ -2135,7 +2403,27 @@ class TaskManager:
             # and historical task snapshots.  A version bump is the only safe
             # way to add collaboration authority; never rewrite an existing
             # profile row in place.
-            desired = self._named_profile(agent_id, template)
+            config_profile = normalize_codex_config_profile(
+                profile.codex_config_profile
+            )
+            try:
+                config_profile = self._require_allowed_codex_config_profile(
+                    config_profile
+                )
+            except PermissionError:
+                # Keep the immutable profile and route as durable truth, but
+                # do not revive a child whose administrator grant was removed.
+                # A later scoped use fails closed until startup re-allows it.
+                logger.warning(
+                    "dynamic Agent %s uses a disabled Codex config profile",
+                    agent_id,
+                )
+                continue
+            desired = self._named_profile(
+                agent_id,
+                template,
+                codex_config_profile=config_profile,
+            )
             desired_version = int(desired.profile_version)
             if desired_version > int(version):
                 register_profile = getattr(self.registry, "register_profile", None)
@@ -2149,11 +2437,21 @@ class TaskManager:
                 )
             self.registry.register(
                 agent_id,
-                _NamedAgentRuntime(agent_id, runtime),
+                _NamedAgentRuntime(
+                    agent_id,
+                    runtime,
+                    codex_config_profile=config_profile,
+                ),
                 profile=profile,
             )
 
-    async def ensure_agent(self, agent_id: str, *, allow_deleted: bool = False) -> bool:
+    async def ensure_agent(
+        self,
+        agent_id: str,
+        *,
+        allow_deleted: bool = False,
+        codex_config_profile: str | None = None,
+    ) -> bool:
         """Ensure a named Agent exists, returning ``True`` when created.
 
         Existing registered Agents are never replaced.  Unknown names are
@@ -2163,6 +2461,11 @@ class TaskManager:
         """
 
         self._assert_loop()
+        requested_config_profile: str | None = None
+        if codex_config_profile is not None:
+            requested_config_profile = self._require_allowed_codex_config_profile(
+                codex_config_profile
+            )
         raw_agent_id = str(agent_id or "").strip()
         # Preserve explicitly registered legacy IDs (some integrations used
         # mixed case or a broader identifier grammar), while all newly
@@ -2186,6 +2489,19 @@ class TaskManager:
         if was_deleted and not allow_deleted:
             raise KeyError(f"Agent was deleted: {selected}")
         if registration is not None and not (was_deleted and allow_deleted):
+            bound_profile = normalize_codex_config_profile(
+                _get(registration.profile, "codex_config_profile", "")
+            )
+            bound_profile = self._require_allowed_codex_config_profile(
+                bound_profile
+            )
+            if (
+                requested_config_profile is not None
+                and requested_config_profile != bound_profile
+            ):
+                raise ValueError(
+                    "Agent is already bound to a different Codex config profile"
+                )
             self.registry.require(selected)
             await self._ensure_selected_process_ready(selected)
             return False
@@ -2216,6 +2532,19 @@ class TaskManager:
             # waiting for the lock.
             registration = self.registry.registration(selected)
             if registration is not None:
+                bound_profile = normalize_codex_config_profile(
+                    _get(registration.profile, "codex_config_profile", "")
+                )
+                bound_profile = self._require_allowed_codex_config_profile(
+                    bound_profile
+                )
+                if (
+                    requested_config_profile is not None
+                    and requested_config_profile != bound_profile
+                ):
+                    raise ValueError(
+                        "Agent is already bound to a different Codex config profile"
+                    )
                 self.registry.require(selected)
                 # Another manager can retire the durable Agent while this
                 # process still has its enabled runtime registration. An
@@ -2237,10 +2566,54 @@ class TaskManager:
                 await self._ensure_selected_process_ready(selected)
                 return False
             runtime, template = self._dynamic_template()
-            profile = self._named_profile(selected, template)
+            retained_profile: AgentProfile | None = None
+            profile_reader = getattr(self.store, "get_profile", None)
+            if profile_reader is not None:
+                candidate = await _call_compatible(profile_reader, selected)
+                if (
+                    isinstance(candidate, AgentProfile)
+                    and str(candidate.summary or "") == _DYNAMIC_AGENT_SUMMARY
+                ):
+                    retained_profile = candidate
+            retained_config_profile = (
+                self._require_allowed_codex_config_profile(
+                    retained_profile.codex_config_profile
+                )
+                if retained_profile is not None
+                else ""
+            )
+            brand_new_profile = retained_profile is None and not was_deleted
+            if (
+                requested_config_profile is not None
+                and retained_profile is not None
+                and requested_config_profile != retained_config_profile
+            ):
+                raise ValueError(
+                    "Agent is already bound to a different Codex config profile"
+                )
+            selected_config_profile = (
+                requested_config_profile
+                if requested_config_profile is not None
+                else retained_config_profile
+            )
+            if selected_config_profile:
+                # Resolve only the authorized expected filename.  Parsing and
+                # credential-bearing values remain inside the Agent child.
+                # Existing live bindings intentionally avoid this probe so an
+                # idempotent switch cannot become a private-file oracle.
+                require_profile_file(selected_config_profile)
+            profile = self._named_profile(
+                selected,
+                template,
+                codex_config_profile=selected_config_profile,
+            )
             self.registry.register(
                 selected,
-                _NamedAgentRuntime(selected, runtime),
+                _NamedAgentRuntime(
+                    selected,
+                    runtime,
+                    codex_config_profile=selected_config_profile,
+                ),
                 profile=profile,
             )
             try:
@@ -2251,40 +2624,35 @@ class TaskManager:
                 reactivator = getattr(self.store, "reactivate_agent", None)
                 if was_deleted and allow_deleted and reactivator is not None:
                     await _call_compatible(reactivator, profile)
-                # Persist immutable FK targets even when an embedding calls
-                # ``ensure_agent`` before ``TaskManager.start``.  SQLite's
-                # store lazily initializes, and startup repeats this operation
-                # idempotently for compatibility stores.
-                await self._persist_registry_definitions(
-                    only_agent_ids=(selected,)
-                )
                 if self._started:
-                    # Process-backed aliases start a distinct child here;
-                    # production then proves its PID is live and unique before
-                    # the Agent becomes usable for routing.
+                    # A brand-new alias is provisional until its isolated
+                    # child has started and passed the process-readiness
+                    # proof.  Starting it before publishing the immutable
+                    # Profile prevents a transient child/capacity failure
+                    # from leaving an enabled durable alias that
+                    # `_restore_dynamic_agents()` would revive on every later
+                    # supervisor restart.  Recreated aliases are already
+                    # protected by their retained tombstone until the route
+                    # commit below.
                     await self.registry.start()
                     await self._ensure_selected_process_ready(selected)
+                if not self._started and brand_new_profile:
+                    # Pre-start aliases stay process-local.  `start()` first
+                    # proves all registered children, then publishes these
+                    # definitions before any worker can reference them.
+                    self._provisional_dynamic_agent_ids.add(selected)
+                else:
+                    await self._persist_registry_definitions(
+                        only_agent_ids=(selected,)
+                    )
             except BaseException as startup_error:
-                # Registry startup performs its own rollback, but an
-                # interrupted/failed process cleanup must never be followed by
-                # unregistering the only proxy that can retry reaping that
-                # child.  Make one explicit idempotent stop attempt here and
-                # preserve the registration whenever shutdown remains
-                # uncertain.  Immutable durable profile rows can be reused by
-                # a later retry after cleanup is proven.
-                current = self.registry.registration(selected)
-                if current is not None:
-                    try:
-                        await current.runtime.stop()
-                    except BaseException as cleanup_error:
-                        raise cleanup_error from startup_error
                 try:
-                    # The explicit successful stop above is the proof needed
-                    # to clear a conservative `_started` marker retained by
-                    # AgentRegistry after an earlier failed cleanup attempt.
-                    self.registry.unregister(selected, allow_started=True)
-                except Exception:
-                    logger.debug("could not roll back named Agent registration", exc_info=True)
+                    await self._rollback_uncommitted_dynamic_agent(
+                        selected,
+                        retire_durable_profile=brand_new_profile,
+                    )
+                except BaseException as cleanup_error:
+                    raise cleanup_error from startup_error
                 raise
             return True
 
@@ -2403,10 +2771,91 @@ class TaskManager:
             await self.ensure_agent(resolved)
         return resolved
 
+    async def _commit_active_agent_route_locked(
+        self,
+        agent_id: str,
+        *,
+        was_deleted: bool,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str,
+    ) -> Any:
+        """Commit one already-ensured route while lifecycle lock is held."""
+
+        deleted_reader = getattr(self.store, "is_agent_deleted", None)
+        # `reactivate_agent` deliberately leaves the tombstone in place until
+        # every immutable definition has published.  Re-read it under the
+        # lifecycle lock to cover a delete that raced the initial observation
+        # or ensure_agent().
+        needs_reactivation_commit = was_deleted or bool(
+            deleted_reader is not None
+            and await _call_compatible(deleted_reader, agent_id)
+        )
+        registration = self.registry.registration(agent_id)
+        profile = registration.profile if registration is not None else None
+        commit_reactivation = getattr(
+            self.store, "commit_agent_reactivation", None
+        )
+        key = (channel, bot_id, external_user_id, session_id)
+        if commit_reactivation is not None:
+            if registration is None:
+                # The Agent was removed after ensure_agent() returned.  Never
+                # fall through to the compatibility sequence, which could
+                # clear that fresh tombstone and route to a disabled Profile.
+                raise RuntimeError(f"Agent changed while switching: {agent_id}")
+            if profile is not None:
+                # Use the guarded transaction for every profile-backed switch,
+                # not only an already-observed recreation.  This linearizes
+                # its route with retirement.
+                result = await _call_compatible(
+                    commit_reactivation,
+                    profile,
+                    channel=channel,
+                    bot_id=bot_id,
+                    external_user_id=external_user_id,
+                    session_id=session_id,
+                )
+                if result is False:
+                    raise RuntimeError("Agent route could not be persisted")
+                self._active_agent[key] = agent_id
+                return result
+            if needs_reactivation_commit:
+                raise RuntimeError(
+                    f"Agent recreation lacks a Profile: {agent_id}"
+                )
+
+        # Compatibility stores without the atomic recreation commit keep the
+        # historical clear-then-route sequence, fenced by the caller's
+        # lifecycle lock.
+        clear_deleted = getattr(self.store, "clear_agent_deleted", None)
+        if clear_deleted is not None:
+            await _call_compatible(clear_deleted, agent_id)
+        method = getattr(self.store, "set_active_agent", None) or getattr(
+            self.store, "set_route", None
+        )
+        if method is not None:
+            result = await _call_compatible(
+                method,
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_id,
+                agent_id=agent_id,
+                active_agent_id=agent_id,
+            )
+            if result is False:
+                raise RuntimeError("Agent route could not be persisted")
+            self._active_agent[key] = agent_id
+            return result
+        self._active_agent[key] = agent_id
+        return agent_id
+
     async def set_active_agent(
         self,
         agent_id: str,
         *,
+        codex_config_profile: str | None = None,
         channel: str = "",
         bot_id: str = "",
         external_user_id: str = "",
@@ -2426,98 +2875,45 @@ class TaskManager:
                 deleted_reader is not None
                 and await _call_compatible(deleted_reader, agent_id)
             )
-            await self.ensure_agent(agent_id, allow_deleted=True)
+            ensure_keywords: dict[str, Any] = {"allow_deleted": True}
+            if codex_config_profile is not None:
+                ensure_keywords["codex_config_profile"] = codex_config_profile
+            profile_reader = getattr(self.store, "get_profile", None)
+            durable_profile_existed = bool(
+                profile_reader is not None
+                and await _call_compatible(profile_reader, agent_id) is not None
+            )
+            created = await self.ensure_agent(agent_id, **ensure_keywords)
             # Serialize the revalidation, durable route commit, and local
             # cache update with delete_agent().  Without this lifecycle lock,
             # retirement could win after a route transaction but before the
             # local cache assignment, making a failed/stale switch appear to
             # succeed in this process.
             async with self._dynamic_agent_lock:
-                # ``reactivate_agent`` deliberately leaves the tombstone in
-                # place until every immutable definition has published.
-                # Re-read it under the lifecycle lock to cover a delete that
-                # raced the initial observation or ensure_agent().
-                needs_reactivation_commit = was_deleted or bool(
-                    deleted_reader is not None
-                    and await _call_compatible(deleted_reader, agent_id)
-                )
-                registration = self.registry.registration(agent_id)
-                profile = (
-                    registration.profile if registration is not None else None
-                )
-                commit_reactivation = getattr(
-                    self.store, "commit_agent_reactivation", None
-                )
-                key = (channel, bot_id, external_user_id, session_id)
-                if commit_reactivation is not None:
-                    if registration is None:
-                        # The Agent was removed after ensure_agent() returned.
-                        # Never fall through to the compatibility sequence,
-                        # which could clear that fresh tombstone and route to a
-                        # disabled Profile.
-                        raise RuntimeError(
-                            f"Agent changed while switching: {agent_id}"
-                        )
-                    if profile is not None:
-                        # Use the guarded transaction for every profile-backed
-                        # switch, not only an already-observed recreation. This
-                        # linearizes its route with retirement: either this
-                        # commit wins and deletion later falls the route back,
-                        # or deletion wins and immutable Profile validation
-                        # rejects this stale switch without clearing its
-                        # tombstone.
-                        result = await _call_compatible(
-                            commit_reactivation,
-                            profile,
-                            channel=channel,
-                            bot_id=bot_id,
-                            external_user_id=external_user_id,
-                            session_id=session_id,
-                        )
-                        if result is False:
-                            raise RuntimeError(
-                                "Agent route could not be persisted"
-                            )
-                        self._active_agent[key] = agent_id
-                        return result
-                    if needs_reactivation_commit:
-                        # Explicitly registered legacy runtimes may have no
-                        # Profile, but a tombstoned registration is never safe
-                        # to revive through an unguarded clear-then-route
-                        # sequence.
-                        raise RuntimeError(
-                            f"Agent recreation lacks a Profile: {agent_id}"
-                        )
-
-                # Compatibility stores without the atomic recreation commit
-                # keep the historical clear-then-route sequence, now fenced
-                # against same-process retirement by the lifecycle lock.
-                clear_deleted = getattr(
-                    self.store, "clear_agent_deleted", None
-                )
-                if clear_deleted is not None:
-                    await _call_compatible(clear_deleted, agent_id)
-                method = getattr(
-                    self.store, "set_active_agent", None
-                ) or getattr(self.store, "set_route", None)
-                if method is not None:
-                    result = await _call_compatible(
-                        method,
+                try:
+                    return await self._commit_active_agent_route_locked(
+                        agent_id,
+                        was_deleted=was_deleted,
                         channel=channel,
                         bot_id=bot_id,
                         external_user_id=external_user_id,
                         session_id=session_id,
-                        agent_id=agent_id,
-                        active_agent_id=agent_id,
                     )
-                    if result is False:
-                        raise RuntimeError(
-                            "Agent route could not be persisted"
+                except BaseException as switch_error:
+                    if (
+                        not created
+                        or durable_profile_existed
+                        or was_deleted
+                    ):
+                        raise
+                    try:
+                        await self._rollback_uncommitted_dynamic_agent(
+                            agent_id,
+                            retire_durable_profile=True,
                         )
-                    self._active_agent[key] = agent_id
-                    return result
-                self._active_agent[key] = agent_id
-                return agent_id
+                    except BaseException as cleanup_error:
+                        raise cleanup_error from switch_error
+                    raise
 
     switch_agent = set_active_agent
     set_agent = set_active_agent
@@ -2592,6 +2988,307 @@ class TaskManager:
             resolved = self._canonical_route_agent(resolved)
             await self.ensure_agent(resolved)
         return resolved
+
+    def _default_execution_workspace(self) -> dict[str, Any] | None:
+        """Return the configured root snapshot after revalidating its identity."""
+
+        if self.workspace_root is None or self._workspace_root_snapshot is None:
+            return None
+        validate_workspace_snapshot(
+            self._workspace_root_snapshot,
+            self.workspace_root,
+        )
+        return dict(self._workspace_root_snapshot)
+
+    def _validate_execution_workspace(
+        self,
+        snapshot: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Validate and detach one trusted task/command workspace snapshot."""
+
+        if not isinstance(snapshot, Mapping):
+            raise WorkspaceError("execution workspace snapshot must be a mapping")
+        pinned_root = self._default_execution_workspace()
+        if self.workspace_root is None or pinned_root is None:
+            raise WorkspaceError("Agent workspace root is not configured")
+        if any(
+            snapshot.get(field) != pinned_root[field]
+            for field in ("version", "root", "root_st_dev", "root_st_ino")
+        ):
+            raise WorkspaceError(
+                "execution workspace does not match the pinned workspace root"
+            )
+        validate_workspace_snapshot(snapshot, self.workspace_root)
+        return dict(snapshot)
+
+    async def _execution_workspace_for_target(
+        self,
+        target: ReplyTarget | Mapping[str, Any] | None,
+        agent_id: str,
+    ) -> dict[str, Any] | None:
+        """Resolve the future-task workspace for one session and Agent.
+
+        The preference stores a root-relative path and directory identity.
+        Both are checked again before every snapshot is accepted, so a deleted
+        or replaced directory cannot silently become a different task cwd.
+        """
+
+        root_snapshot = self._default_execution_workspace()
+        if root_snapshot is None:
+            return None
+        resolved_target = self._coerce_target(target)
+        if not (
+            resolved_target.channel
+            and resolved_target.bot_id
+            and resolved_target.external_user_id
+        ):
+            return root_snapshot
+        getter = getattr(self.store, "get_session_working_directory", None)
+        if getter is None:
+            return root_snapshot
+        value = await _call_compatible(
+            getter,
+            channel=resolved_target.channel,
+            bot_id=resolved_target.bot_id,
+            external_user_id=resolved_target.external_user_id,
+            session_id=resolved_target.session_id or "default",
+            agent_id=agent_id,
+        )
+        if value is None:
+            return root_snapshot
+        relative_path = _get(value, "relative_path", None)
+        expected_device = _get(value, "directory_device", None)
+        expected_inode = _get(value, "directory_inode", None)
+        if (
+            type(relative_path) is not str
+            or not relative_path
+            or type(expected_device) is not int
+            or expected_device < 0
+            or type(expected_inode) is not int
+            or expected_inode < 0
+        ):
+            raise WorkspaceError("stored working directory is invalid")
+        relative = Path(relative_path)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != relative_path
+            or any(part == ".." for part in relative.parts)
+        ):
+            raise WorkspaceError("stored working directory is invalid")
+        snapshot = build_workspace_snapshot(self.workspace_root, relative_path)
+        if (
+            snapshot["target_st_dev"] != expected_device
+            or snapshot["target_st_ino"] != expected_inode
+        ):
+            raise WorkspaceError("stored working directory identity has changed")
+        return self._validate_execution_workspace(snapshot)
+
+    async def get_working_directory(
+        self,
+        *,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        user_id: str = "",
+        session_id: str = "default",
+        agent_id: str | None = None,
+        workspace_snapshot: Mapping[str, Any] | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        """Return the current Agent cwd or validate an accepted command cwd."""
+
+        self._assert_loop()
+        if workspace_snapshot is not None:
+            snapshot = self._validate_execution_workspace(workspace_snapshot)
+            return {
+                "agent_id": str(agent_id or self.default_agent_id),
+                "path": str(snapshot["path"]),
+                EXECUTION_WORKSPACE_KEY: snapshot,
+            }
+
+        external_user_id = str(external_user_id or user_id or "")
+        session_id = str(session_id or "default")
+        async with self._scope_lock(
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+            session_id=session_id,
+        ):
+            active = agent_id or await self.get_active_agent(
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_id,
+            )
+            if self.allow_dynamic_agents:
+                active = self._canonical_route_agent(active)
+                await self.ensure_agent(active)
+            active = str(active or self.default_agent_id).strip()
+            self.registry.require(active)
+            snapshot = await self._execution_workspace_for_target(
+                ReplyTarget(
+                    channel=channel,
+                    bot_id=bot_id,
+                    external_user_id=external_user_id,
+                    session_id=session_id,
+                ),
+                active,
+            )
+            if snapshot is None:
+                raise WorkspaceError("Agent workspace root is not configured")
+            return {
+                "agent_id": active,
+                "path": str(snapshot["path"]),
+                EXECUTION_WORKSPACE_KEY: snapshot,
+            }
+
+    async def set_working_directory(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        user_id: str = "",
+        session_id: str = "default",
+        agent_id: str | None = None,
+        actor: str = "",
+        command_id: str | None = None,
+        workspace_snapshot: Mapping[str, Any] | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        """Persist a root-confined cwd for future tasks of the current Agent."""
+
+        self._assert_loop()
+        if self.workspace_root is None:
+            raise WorkspaceError("Agent workspace root is not configured")
+        try:
+            requested_path = os.fspath(path)
+        except TypeError as exc:
+            raise WorkspaceError("working directory must be a filesystem path") from exc
+        if not isinstance(requested_path, str) or not requested_path or "\x00" in requested_path:
+            raise WorkspaceError("working directory path is invalid")
+        external_user_id = str(external_user_id or user_id or "")
+        session_id = str(session_id or "default")
+        receipt_id = str(command_id or "").strip()
+        async with self._scope_lock(
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+            session_id=session_id,
+        ):
+            active = agent_id or await self.get_active_agent(
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_id,
+            )
+            if self.allow_dynamic_agents:
+                active = self._canonical_route_agent(active)
+                await self.ensure_agent(active)
+            active = str(active or self.default_agent_id).strip()
+            self.registry.require(active)
+            if self._default_execution_workspace() is None:
+                raise WorkspaceError("Agent workspace root is not configured")
+            candidate = Path(requested_path).expanduser()
+            if not candidate.is_absolute():
+                if workspace_snapshot is None:
+                    base_snapshot = await self._execution_workspace_for_target(
+                        ReplyTarget(
+                            channel=channel,
+                            bot_id=bot_id,
+                            external_user_id=external_user_id,
+                            session_id=session_id,
+                        ),
+                        active,
+                    )
+                    if base_snapshot is None:
+                        raise WorkspaceError(
+                            "Agent workspace root is not configured"
+                        )
+                else:
+                    base_snapshot = self._validate_execution_workspace(
+                        workspace_snapshot
+                    )
+                candidate = Path(str(base_snapshot["path"])) / candidate
+            snapshot = build_workspace_snapshot(self.workspace_root, candidate)
+            snapshot = self._validate_execution_workspace(snapshot)
+            relative_path = Path(str(snapshot["path"])).relative_to(
+                Path(self.workspace_root)
+            ).as_posix()
+            relative_path = relative_path or "."
+
+            setter = getattr(self.store, "set_session_working_directory", None)
+            if setter is None:
+                raise AttributeError(
+                    "store does not support Agent working directories"
+                )
+            if receipt_id:
+                try:
+                    parameters = inspect.signature(setter).parameters
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "store atomic working-directory support cannot be verified"
+                    ) from exc
+                if "command_id" not in parameters and not any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                ):
+                    raise RuntimeError(
+                        "store does not support atomic working-directory receipts"
+                    )
+            value = await _call_compatible(
+                setter,
+                relative_path,
+                absolute_path=str(snapshot["path"]),
+                directory_device=int(snapshot["target_st_dev"]),
+                directory_inode=int(snapshot["target_st_ino"]),
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_id,
+                agent_id=active,
+                updated_by=str(actor or external_user_id),
+                command_id=receipt_id or None,
+            )
+            if not isinstance(value, Mapping):
+                raise RuntimeError(
+                    "store returned an invalid working-directory preference"
+                )
+            if (
+                str(value.get("relative_path", "")) != relative_path
+                or value.get("directory_device")
+                != int(snapshot["target_st_dev"])
+                or value.get("directory_inode")
+                != int(snapshot["target_st_ino"])
+            ):
+                raise RuntimeError(
+                    "store returned a conflicting working-directory preference"
+                )
+            response = format_working_directory_response(snapshot["path"])
+            result = {
+                **dict(value),
+                "agent_id": active,
+                "path": str(snapshot["path"]),
+                EXECUTION_WORKSPACE_KEY: snapshot,
+            }
+            if result.get("command_response") != response:
+                raise RuntimeError(
+                    "store returned an invalid working-directory response"
+                )
+            if receipt_id:
+                receipt = result.get("command_receipt")
+                if (
+                    not isinstance(receipt, Mapping)
+                    or str(receipt.get("command_id", "")) != receipt_id
+                    or str(receipt.get("state", "")) != "completed"
+                    or str(receipt.get("response_text", "")) != response
+                    or str(receipt.get("response_agent_id", "")) != active
+                ):
+                    raise RuntimeError(
+                        "store returned an invalid atomic working-directory receipt"
+                    )
+            return result
 
     async def _session_role_for_target(
         self, target: ReplyTarget, agent_id: str
@@ -3041,6 +3738,38 @@ class TaskManager:
             None,
         )
 
+    async def _update_runtime_model_compatibility(
+        self,
+        runtime: Any,
+        *,
+        conversation_id: str,
+        agent_id: str,
+        model_id: str,
+        reasoning_effort: str,
+    ) -> None:
+        """Update optional loop-local caches used by legacy runtimes."""
+
+        for method_name, value in (
+            ("set_model", model_id),
+            ("set_reasoning_effort", reasoning_effort),
+        ):
+            compatibility_method = getattr(runtime, method_name, None)
+            if compatibility_method is None:
+                continue
+            try:
+                await _call_compatible(
+                    compatibility_method,
+                    conversation_id,
+                    value,
+                )
+            except Exception:
+                logger.warning(
+                    "could not update runtime compatibility %s for Agent %s",
+                    method_name,
+                    agent_id,
+                    exc_info=True,
+                )
+
     async def _persist_model_preference(
         self,
         *,
@@ -3049,7 +3778,27 @@ class TaskManager:
         model_id: str,
         reasoning_effort: str,
         conversation_id: str = "",
+        reset_thread: bool = False,
     ) -> dict[str, str]:
+        resolved_conversation = conversation_id or self._conversation_id(
+            target, agent_id
+        )
+        runtime = self.registry.require(agent_id)
+
+        if reset_thread:
+            # The pinned SDK treats an effort override as a persistent thread
+            # setting and omits ``None`` from turn/start.  Consequently an
+            # empty application override cannot clear a prior native
+            # ``ultra`` value.  Update legacy caches first, then forget both
+            # durable and live bindings so no future task can resume the
+            # sticky provider thread.
+            await self._reset_thread_binding_unlocked(
+                resolved_conversation,
+                agent_id,
+                require_runtime_reset=False,
+                compatibility_selection=(model_id, reasoning_effort),
+            )
+
         method = getattr(self.store, "set_session_model_preference", None) or getattr(
             self.store, "set_model_preference", None
         )
@@ -3074,27 +3823,17 @@ class TaskManager:
             agent_id,
         )
         self._session_model_preferences[key] = (model_id, reasoning_effort)
-        resolved_conversation = conversation_id or self._conversation_id(target, agent_id)
-        runtime = self.registry.require(agent_id)
-        # Older interactive adapters also keep loop-local conversation
-        # overrides. They are compatibility caches only: the durable scoped
-        # preference above is authoritative for every new task snapshot.
-        for method_name, value in (
-            ("set_model", model_id),
-            ("set_reasoning_effort", reasoning_effort),
-        ):
-            method = getattr(runtime, method_name, None)
-            if method is None:
-                continue
-            try:
-                await _call_compatible(method, resolved_conversation, value)
-            except Exception:
-                logger.warning(
-                    "could not update runtime compatibility %s for Agent %s",
-                    method_name,
-                    agent_id,
-                    exc_info=True,
-                )
+        if not reset_thread:
+            # Older interactive adapters also keep loop-local conversation
+            # overrides. They are compatibility caches only: the durable
+            # scoped preference above remains authoritative for new tasks.
+            await self._update_runtime_model_compatibility(
+                runtime,
+                conversation_id=resolved_conversation,
+                agent_id=agent_id,
+                model_id=model_id,
+                reasoning_effort=reasoning_effort,
+            )
         return {
             "agent_id": agent_id,
             "model_id": model_id,
@@ -3181,6 +3920,7 @@ class TaskManager:
                 model_id=canonical_model,
                 reasoning_effort=resolved_effort,
                 conversation_id=conversation_id,
+                reset_thread=bool(previous_effort and not resolved_effort),
             )
 
     async def set_reasoning_effort(
@@ -3236,6 +3976,7 @@ class TaskManager:
                     model_id=model_id,
                     reasoning_effort="",
                     conversation_id=conversation_id,
+                    reset_thread=bool(_previous_effort),
                 )
             models = await self.list_models(agent_id=active)
             if not models:
@@ -3280,6 +4021,12 @@ class TaskManager:
         *,
         agent_id: str | None = None,
         refresh: bool = False,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        user_id: str = "",
+        session_id: str = "default",
+        workspace_snapshot: Mapping[str, Any] | None = None,
         **_: Any,
     ) -> list[Any]:
         """Return the trusted skill catalog for the selected Agent."""
@@ -3289,6 +4036,24 @@ class TaskManager:
         if self.allow_dynamic_agents:
             active = self._canonical_route_agent(active)
         runtime = self.registry.require(active)
+        cwd: str | None = None
+        if workspace_snapshot is not None:
+            cwd = str(
+                self._validate_execution_workspace(workspace_snapshot)["path"]
+            )
+        elif self.workspace_root is not None:
+            target = ReplyTarget(
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=str(external_user_id or user_id or ""),
+                session_id=session_id or "default",
+            )
+            execution_workspace = await self._execution_workspace_for_target(
+                target,
+                active,
+            )
+            if execution_workspace is not None:
+                cwd = str(execution_workspace["path"])
         method = getattr(runtime, "list_skills", None)
         if method is None:
             method = getattr(self.registry, "list_skills", None)
@@ -3298,6 +4063,7 @@ class TaskManager:
             method,
             agent_id=active,
             refresh=refresh,
+            cwd=cwd,
         )
         values = list(iter_skill_descriptors(result))
         writer = getattr(self.store, "put_skill", None) or getattr(
@@ -3321,11 +4087,15 @@ class TaskManager:
         *,
         agent_id: str | None = None,
         refresh: bool = False,
-        **_: Any,
+        **kwargs: Any,
     ) -> dict[str, Any] | None:
         """Resolve and snapshot one trusted skill for channel ingress."""
 
-        values = await self.list_skills(agent_id=agent_id, refresh=refresh)
+        values = await self.list_skills(
+            agent_id=agent_id,
+            refresh=refresh,
+            **kwargs,
+        )
         definition = find_skill(values, name, rehash_local_bundles=True)
         return definition.snapshot() if definition is not None else None
 
@@ -3476,6 +4246,258 @@ class TaskManager:
                 return False
         return True
 
+    async def _assert_compaction_idle_unlocked(
+        self,
+        conversation_id: str,
+        agent_id: str,
+    ) -> None:
+        """Fail closed when the exact conversation has active execution."""
+
+        list_tasks = getattr(self.store, "list_tasks", None)
+        if list_tasks is None:
+            raise AttributeError(
+                "store does not support active task lookup for context compaction"
+            )
+        rows = await _call_compatible(
+            list_tasks,
+            states=("claimed", "running", "cancel_requested"),
+            conversation_id=conversation_id,
+            agent_id=agent_id,
+            limit=100,
+        )
+        active_states = {"claimed", "running", "cancel_requested"}
+        for row in rows or ():
+            raw_state = _get(row, "state", _get(row, "status", ""))
+            state = str(getattr(raw_state, "value", raw_state) or "").lower()
+            if (
+                state in active_states
+                and str(_get(row, "conversation_id", conversation_id))
+                == conversation_id
+                and str(_get(row, "agent_id", agent_id)) == agent_id
+            ):
+                raise RuntimeError("cannot compact while a task is running")
+
+    async def compact_session(
+        self,
+        conversation_id: str | None = None,
+        *,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        user_id: str = "",
+        session_id: str = "default",
+        agent_id: str | None = None,
+        actor: str = "",
+        **_: Any,
+    ) -> Any:
+        """Compact the exact durable context selected for one Agent session.
+
+        The control operation is ordered with route, mode, model, role, cwd,
+        and clear mutations through the session lock.  It reconstructs the
+        same immutable policy/role/workspace snapshot as a newly accepted
+        turn and supplies the matching persisted provider thread to the
+        selected Agent runtime.  No empty thread is created as a side effect.
+        """
+
+        self._assert_loop()
+        external_user_id = str(external_user_id or user_id or "")
+        session_id = str(session_id or "default")
+        async with self._scope_lock(
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+            session_id=session_id,
+        ):
+            target = ReplyTarget(
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_id,
+            )
+            active = agent_id or await self.get_active_agent(
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_id,
+            )
+            if self.allow_dynamic_agents:
+                active = self._canonical_route_agent(active)
+                await self.ensure_agent(active)
+            active = str(active or self.default_agent_id).strip()
+            runtime = self.registry.require(active)
+
+            if conversation_id and not conversation_id_matches(
+                conversation_id,
+                channel,
+                bot_id,
+                external_user_id,
+                session_id,
+                active,
+            ):
+                raise ValueError(
+                    "conversation does not match the selected Agent session"
+                )
+            resolved_conversation = str(
+                conversation_id or self._conversation_id(target, active)
+            )
+            await self._assert_compaction_idle_unlocked(
+                resolved_conversation,
+                active,
+            )
+
+            selected_mode = await self._get_mode_for_target(target, active)
+            if selected_mode is None:
+                selected_mode = self._default_mode_selection(active)
+            mode_id, policy_version = selected_mode
+            profile_version = self._default_profile_version(active)
+            session_role = await self._session_role_for_target(target, active)
+            model_id, _reasoning_effort = await self._get_model_for_target(
+                target,
+                active,
+            )
+            metadata = self._policy_snapshot(
+                active,
+                mode_id,
+                profile_version,
+                policy_version,
+                actor=actor or external_user_id,
+                explicit=(
+                    mode_id == "execute"
+                    and self._execute_authorized(
+                        target,
+                        active,
+                        policy_version,
+                    )
+                ),
+            )
+            metadata["session_role"] = session_role
+            execution_workspace = await self._execution_workspace_for_target(
+                target,
+                active,
+            )
+            if execution_workspace is not None:
+                metadata[EXECUTION_WORKSPACE_KEY] = execution_workspace
+
+            get_binding = getattr(
+                self.store, "get_thread_binding", None
+            ) or getattr(self.store, "thread_binding", None)
+            if get_binding is None:
+                raise AttributeError(
+                    "store does not support durable context bindings"
+                )
+            binding = await _call_compatible(
+                get_binding,
+                resolved_conversation,
+                mode_id=mode_id,
+                profile_version=profile_version,
+                policy_version=policy_version,
+                session_role=session_role,
+            )
+            thread_id = str(_get(binding, "thread_id", binding) or "").strip()
+            if not thread_id:
+                raise RuntimeError(
+                    "cannot compact session: no Codex thread is bound"
+                )
+
+            compact = getattr(runtime, "compact_session", None) or getattr(
+                runtime, "compact_conversation", None
+            )
+            if compact is None:
+                raise AttributeError(
+                    "Agent runtime does not support context compaction"
+                )
+            result = compact(
+                resolved_conversation,
+                mode_id=mode_id,
+                profile_version=profile_version,
+                policy_version=policy_version,
+                session_role=session_role,
+                thread_id=thread_id,
+                agent_id=active,
+                model=model_id,
+                metadata=metadata,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+
+    compact_conversation = compact_session
+
+    async def _reset_thread_binding_unlocked(
+        self,
+        conversation_id: str,
+        agent_id: str,
+        *,
+        require_runtime_reset: bool = True,
+        compatibility_selection: tuple[str, str] | None = None,
+    ) -> str:
+        """Forget one durable/live provider binding under its scope lock."""
+
+        resolved_conversation = str(conversation_id)
+        active = str(agent_id).strip()
+        self.registry.require(active)
+
+        # A reset must not mutate a task whose execution may already have
+        # produced external side effects. Queued/terminal snapshots stay
+        # immutable; only an active execution prevents the control action.
+        list_tasks = getattr(self.store, "list_tasks", None)
+        if list_tasks is not None:
+            rows = await _call_compatible(
+                list_tasks,
+                states=("claimed", "running", "cancel_requested"),
+                conversation_id=resolved_conversation,
+                agent_id=active,
+                limit=100,
+            )
+            active_states = {"claimed", "running", "cancel_requested"}
+            active_rows = [
+                row
+                for row in list(rows or ())
+                if str(
+                    getattr(
+                        _get(row, "state", _get(row, "status", "")),
+                        "value",
+                        _get(row, "state", _get(row, "status", "")),
+                    )
+                    or ""
+                ).lower()
+                in active_states
+                and str(_get(row, "conversation_id", resolved_conversation))
+                == resolved_conversation
+                and str(_get(row, "agent_id", active)) == active
+            ]
+            if active_rows:
+                raise RuntimeError("cannot clear while a task is running")
+
+        runtime = self.registry.require(active)
+        if compatibility_selection is not None:
+            model_id, reasoning_effort = compatibility_selection
+            await self._update_runtime_model_compatibility(
+                runtime,
+                conversation_id=resolved_conversation,
+                agent_id=active,
+                model_id=model_id,
+                reasoning_effort=reasoning_effort,
+            )
+
+        clear_binding = getattr(
+            self.store, "clear_thread_bindings", None
+        ) or getattr(self.store, "clear_conversation_threads", None)
+        if clear_binding is not None:
+            await _call_compatible(clear_binding, resolved_conversation)
+
+        reset = getattr(runtime, "reset_session", None) or getattr(
+            runtime, "clear_session", None
+        )
+        if reset is None:
+            if require_runtime_reset:
+                raise AttributeError(
+                    "Agent runtime does not support conversation reset"
+                )
+            return ""
+        result = await _call_compatible(reset, resolved_conversation)
+        return str(result or "")
+
     async def clear_session(
         self,
         conversation_id: str | None = None,
@@ -3525,53 +4547,10 @@ class TaskManager:
             resolved_conversation = str(
                 conversation_id or self._conversation_id(target, active)
             )
-
-            # A reset must not mutate a task whose execution may already have
-            # produced external side effects.  Queued/terminal snapshots stay
-            # immutable; only an active execution prevents the control action.
-            list_tasks = getattr(self.store, "list_tasks", None)
-            if list_tasks is not None:
-                rows = await _call_compatible(
-                    list_tasks,
-                    states=("claimed", "running", "cancel_requested"),
-                    conversation_id=resolved_conversation,
-                    agent_id=active,
-                    limit=100,
-                )
-                active_states = {"claimed", "running", "cancel_requested"}
-                active_rows = [
-                    row
-                    for row in list(rows or ())
-                    if str(
-                        getattr(
-                            _get(row, "state", _get(row, "status", "")),
-                            "value",
-                            _get(row, "state", _get(row, "status", "")),
-                        )
-                        or ""
-                    ).lower()
-                    in active_states
-                    and str(_get(row, "conversation_id", resolved_conversation))
-                    == resolved_conversation
-                    and str(_get(row, "agent_id", active)) == active
-                ]
-                if active_rows:
-                    raise RuntimeError("cannot clear while a task is running")
-
-            clear_binding = getattr(self.store, "clear_thread_bindings", None) or getattr(
-                self.store, "clear_conversation_threads", None
+            return await self._reset_thread_binding_unlocked(
+                resolved_conversation,
+                active,
             )
-            if clear_binding is not None:
-                await _call_compatible(clear_binding, resolved_conversation)
-
-            runtime = self.registry.require(active)
-            reset = getattr(runtime, "reset_session", None) or getattr(
-                runtime, "clear_session", None
-            )
-            if reset is None:
-                raise AttributeError("Agent runtime does not support conversation reset")
-            result = await _call_compatible(reset, resolved_conversation)
-            return str(result or "")
 
     reset_session = clear_session
     clear_conversation = clear_session
@@ -4249,6 +5228,16 @@ class TaskManager:
                 metadata = _get(source_task, "metadata", {}) or {}
                 metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
                 metadata.pop("session_role", None)
+                # Correlated replies retain the originating task's immutable
+                # policy/thread binding, but cwd is destination-scoped mutable
+                # state.  Resolve it when this new mailbox turn is accepted.
+                metadata.pop(EXECUTION_WORKSPACE_KEY, None)
+                response_workspace = await self._execution_workspace_for_target(
+                    target,
+                    destination,
+                )
+                if response_workspace is not None:
+                    metadata[EXECUTION_WORKSPACE_KEY] = response_workspace
                 return {
                     "agent_id": destination,
                     "conversation_id": conversation,
@@ -4299,6 +5288,12 @@ class TaskManager:
             ),
         )
         metadata.pop("session_role", None)
+        execution_workspace = await self._execution_workspace_for_target(
+            target,
+            destination,
+        )
+        if execution_workspace is not None:
+            metadata[EXECUTION_WORKSPACE_KEY] = execution_workspace
         return {
             "agent_id": destination,
             "conversation_id": conversation,
@@ -4729,6 +5724,14 @@ class TaskManager:
             child_metadata = {**dict(child_metadata), "request_type": request_type}
         else:
             child_metadata = {"request_type": request_type}
+        child_workspace: Mapping[str, Any] | None = None
+        if destination == source:
+            parent_metadata = _get(parent, "metadata", {}) or {}
+            if isinstance(parent_metadata, Mapping) and isinstance(
+                parent_metadata.get(EXECUTION_WORKSPACE_KEY),
+                Mapping,
+            ):
+                child_workspace = parent_metadata[EXECUTION_WORKSPACE_KEY]
         try:
             return await self.submit(
                 inputs,
@@ -4740,6 +5743,7 @@ class TaskManager:
                 metadata=child_metadata,
                 _child_parent_id=parent_task_id,
                 _child_max_children=policy.max_children_per_task,
+                _workspace_snapshot_override=child_workspace,
                 **kwargs,
             )
         except Exception:
@@ -5375,6 +6379,7 @@ class TaskManager:
         value: Mapping[str, Any],
         *,
         agent_id: str,
+        cwd: str | None = None,
     ) -> dict[str, Any]:
         """Validate a skill reference against the registered Agent catalog.
 
@@ -5412,6 +6417,7 @@ class TaskManager:
                 snapshot["name"],
                 agent_id=agent_id,
                 refresh=False,
+                cwd=cwd,
             )
             if candidates is not None:
                 break
@@ -5425,6 +6431,7 @@ class TaskManager:
                     lister,
                     agent_id=agent_id,
                     refresh=False,
+                    cwd=cwd,
                 )
                 if candidates is not None:
                     break

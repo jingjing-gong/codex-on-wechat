@@ -6,6 +6,7 @@ import asyncio
 import sqlite3
 from dataclasses import dataclass
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -251,7 +252,7 @@ def test_skill_store_fresh_schema_and_migration(tmp_path):
             columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(skills)")
             }
-        assert version == 32
+        assert version == 35
         assert columns == {
             "agent_id",
             "skill_id",
@@ -575,6 +576,65 @@ def test_gateway_snapshots_valid_skill_and_keeps_unknown_or_malformed_input_out_
 
             tasks = await store.list_tasks(external_user_id="user", limit=20)
             assert [item.task_id for item in tasks] == [valid.task_id]
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_gateway_discovers_and_revalidates_skills_in_the_agents_cwd(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    selected = workspace / "selected"
+    selected.mkdir(parents=True)
+
+    class Runtime(_SkillRuntime):
+        def __init__(self) -> None:
+            self.observed_cwds: list[str | None] = []
+
+        async def list_skills(
+            self,
+            *,
+            refresh: bool = False,
+            cwd: str | None = None,
+        ) -> list[dict[str, object]]:
+            assert refresh is False
+            self.observed_cwds.append(cwd)
+            return _catalog()
+
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime-cwd.sqlite")
+        runtime = Runtime()
+        registry = AgentRegistry()
+        registry.register("codex", runtime, profile=codex_profile())
+        manager = TaskManager(
+            store,
+            registry,
+            worker_count=0,
+            workspace_root=workspace,
+        )
+        await manager.start()
+        try:
+            await manager.set_working_directory(
+                "selected",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+                agent_id="codex",
+            )
+            accepted = await WeChatGateway(manager, bot_id="bot").accept(
+                _message("$alpha inspect this", 41)
+            )
+            assert accepted is not None and accepted.task_id
+            task = await store.get_task(accepted.task_id)
+            assert task is not None
+            assert task.metadata["execution_workspace"]["path"] == str(
+                selected.resolve()
+            )
+            assert runtime.observed_cwds
+            assert set(runtime.observed_cwds) == {str(selected.resolve())}
         finally:
             await manager.stop()
 

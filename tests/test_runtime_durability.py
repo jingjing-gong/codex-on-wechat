@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 
 import pytest
 
 from src.agents.base import AgentEvent, AgentResult, AgentTask
 from src.runtime.media import AttachmentStore
+from src.runtime.models import InboundMessage, ReplyFragmentState
 from src.runtime.sqlite_store import SQLiteStore
 from src.runtime.sqlite_store import StoreError
 from src.runtime.worker import AgentMailboxWorker, TaskWorker
@@ -667,6 +669,1050 @@ def test_worker_fails_a_runtime_result_with_mismatched_identity(
                 for item in await store.list_outbox()
                 if item.task_id == task.task_id
             ] == []
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_worker_projects_one_sanitized_notice_for_runtime_failure(tmp_path):
+    raw_error = (
+        "stream disconnected before completion: error sending request for url "
+        "(http://provider-secret.example/v1/responses)"
+    )
+
+    class Runtime:
+        agent_id = "codex"
+
+        async def run(self, task, _emit):
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="failed",
+                error=raw_error,
+                thread_id="provider-thread",
+                metadata={"diagnostics": {"phase": "terminal"}},
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return False
+
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime-failure-notice.sqlite")
+        await store.initialize()
+        try:
+            task = await store.create_task(_task())
+            worker = TaskWorker(store, runtime=Runtime(), worker_id="worker")
+
+            assert await worker.run_once() is True
+            failed = await store.get_task(task.task_id)
+            assert failed is not None
+            assert failed.state.value == "failed"
+            assert failed.last_error == raw_error
+
+            outbox = [
+                item
+                for item in await store.list_outbox()
+                if item.task_id == task.task_id
+            ]
+            assert len(outbox) == 1
+            notice = outbox[0].content
+            assert task.task_id in notice
+            assert "/tasks" in notice
+            assert "/retry reuses the same context" in notice
+            assert "/clear starts fresh" in notice
+            assert "provider-secret" not in notice
+            assert "/v1/responses" not in notice
+
+            # A second worker pass observes the terminal row and cannot create
+            # another event, aggregate, or outbox delivery.
+            assert await worker.run_once() is False
+            replayed = [
+                item
+                for item in await store.list_outbox()
+                if item.task_id == task.task_id
+            ]
+            assert [item.outbox_id for item in replayed] == [outbox[0].outbox_id]
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_stream_failure_keeps_completed_item_and_adds_one_terminal_notice(
+    tmp_path,
+):
+    raw_error = (
+        "stream disconnected after completion from "
+        "provider-secret.example:8317/v1/responses?token=TOPSECRET"
+    )
+
+    class Runtime:
+        agent_id = "codex"
+
+        async def run(self, task, emit):
+            event = AgentEvent.text_event(
+                task.task_id,
+                "stable answer before disconnect",
+                execution_id=task.execution_id,
+                event_type="agent_message",
+                source_item_type="agentmessage",
+                source_item_ordinal=0,
+            )
+            await emit(event)
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="failed",
+                content=event.content,
+                error=raw_error,
+                events=(event,),
+                thread_id="provider-thread",
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return False
+
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "stable-before-disconnect.sqlite")
+        await store.initialize()
+        try:
+            task = await store.create_task(_task())
+            worker = TaskWorker(store, runtime=Runtime(), worker_id="worker")
+
+            assert await worker.run_once() is True
+            failed = await store.get_task(task.task_id)
+            assert failed is not None
+            assert failed.state.value == "failed"
+            assert failed.last_error == raw_error
+
+            outbox = [
+                item
+                for item in await store.list_outbox()
+                if item.task_id == task.task_id
+            ]
+            assert outbox[0].content == "stable answer before disconnect"
+            notices = [
+                item for item in outbox if item.content.startswith("task failed:")
+            ]
+            assert len(notices) == 1
+            assert all("provider-secret" not in item.content for item in outbox)
+            assert all("TOPSECRET" not in item.content for item in outbox)
+
+            events = await store.list_task_events(task.task_id)
+            assert [event.event_type for event in events] == [
+                "agent_message",
+                "failure_notice",
+                "terminal",
+            ]
+            assert await worker.run_once() is False
+            assert [
+                item.outbox_id
+                for item in await store.list_outbox()
+                if item.task_id == task.task_id
+            ] == [item.outbox_id for item in outbox]
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_timeout_after_many_progress_items_adds_one_terminal_failure_notice(
+    tmp_path,
+):
+    progress = tuple(
+        f"progress checkpoint {ordinal}"
+        for ordinal in (2, 18, 38, 82, 93, 106, 118)
+    )
+
+    class Runtime:
+        agent_id = "codex"
+
+        async def run(self, task, emit):
+            events = []
+            for sequence, (ordinal, content) in enumerate(
+                zip((2, 18, 38, 82, 93, 106, 118), progress)
+            ):
+                event = AgentEvent.text_event(
+                    task.task_id,
+                    content,
+                    sequence=sequence,
+                    execution_id=task.execution_id,
+                    event_type="agent_message",
+                    source_item_id=f"progress-item-{ordinal}",
+                    source_item_type="agentmessage",
+                    source_item_ordinal=ordinal,
+                )
+                await emit(event)
+                events.append(event)
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="failed",
+                content="".join(progress),
+                error="Codex turn timed out at https://provider-secret.example/v1",
+                events=tuple(events),
+                thread_id="provider-thread",
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return False
+
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "progress-timeout.sqlite")
+        await store.initialize()
+        try:
+            task = await store.create_task(_task())
+            worker = TaskWorker(store, runtime=Runtime(), worker_id="worker")
+            assert await worker.run_once() is True
+
+            failed = await store.get_task(task.task_id)
+            assert failed is not None
+            assert failed.state.value == "failed"
+            events = await store.list_task_events(task.task_id)
+            assert [item.event_type for item in events] == [
+                *("agent_message" for _ in progress),
+                "failure_notice",
+                "terminal",
+            ]
+
+            outbox = [
+                item
+                for item in await store.list_outbox()
+                if item.task_id == task.task_id
+            ]
+            wire_text = "\n".join(item.content for item in outbox)
+            for content in progress:
+                assert wire_text.count(content) == 1
+            assert wire_text.count(f"task failed: {task.task_id}") == 1
+            assert wire_text.count("/retry reuses the same context") == 1
+            assert "provider-secret" not in wire_text
+            assert "/v1" not in wire_text
+
+            assert await worker.run_once() is False
+            assert [
+                item.outbox_id
+                for item in await store.list_outbox()
+                if item.task_id == task.task_id
+            ] == [item.outbox_id for item in outbox]
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_failure_notice_bypasses_saturated_progress_quota_and_remains_last(
+    tmp_path,
+):
+    recv_suffix = "\n\nReply /recv to continue."
+    progress_values = [
+        "progress 1:" + "A" * (6_000 - len("progress 1:")),
+        *(
+            f"progress {ordinal}:"
+            + marker * (3_000 - len(f"progress {ordinal}:"))
+            for ordinal, marker in zip(range(2, 9), "BCDEFGH")
+        ),
+    ]
+    aggregate_ten_source_size = 3_000
+    ordinal_ten_body_limit = aggregate_ten_source_size - len(recv_suffix)
+    ninth_size = aggregate_ten_source_size // 2
+    progress_values.extend(
+        (
+            "progress 9:" + "I" * (ninth_size - len("progress 9:")),
+            "progress 10:"
+            + "J"
+            * (
+                aggregate_ten_source_size
+                - ninth_size
+                - 2
+                - len("progress 10:")
+            ),
+        )
+    )
+    progress = tuple(progress_values)
+
+    class Runtime:
+        agent_id = "codex"
+
+        async def run(self, task, emit):
+            events = []
+            for ordinal, content in enumerate(progress):
+                event = AgentEvent.text_event(
+                    task.task_id,
+                    content,
+                    sequence=ordinal,
+                    execution_id=task.execution_id,
+                    event_type="agent_message",
+                    source_item_id=f"quota-progress-{ordinal}",
+                    source_item_type="agentmessage",
+                    source_item_ordinal=ordinal,
+                )
+                await emit(event)
+                events.append(event)
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="failed",
+                content="".join(progress),
+                error="Codex turn timed out at https://provider-secret.example/v1",
+                events=tuple(events),
+                thread_id="provider-thread",
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return False
+
+    async def scenario() -> None:
+        path = tmp_path / "saturated-failure-notice.sqlite"
+        first = SQLiteStore(path)
+        await first.initialize()
+        try:
+            accepted = await first.accept_inbound(
+                InboundMessage(
+                    channel="wechat",
+                    bot_id="bot",
+                    external_user_id="user",
+                    external_message_id="saturated-failure-source",
+                    session_id="default",
+                    text="run a long task",
+                    context_token="saturated-context",
+                ),
+                task={"agent_id": "codex"},
+            )
+            assert accepted.task is not None
+            task = accepted.task
+            assert await TaskWorker(
+                first,
+                runtime=Runtime(),
+                worker_id="saturated-worker",
+            ).run_once() is True
+
+            scope = await first.get_reply_scope_for_inbound(
+                accepted.inbound.message_id
+            )
+            assert scope is not None
+            assert scope.used_slots == scope.capacity == 10
+            immediate = sorted(
+                (
+                    item
+                    for item in await first.list_outbox(limit=100)
+                    if item.task_id == task.task_id
+                ),
+                key=lambda item: (item.created_at, item.outbox_id),
+            )
+            assert len(immediate) == 11
+            assert [item.reply_ordinal for item in immediate[:10]] == list(
+                range(1, 11)
+            )
+            assert immediate[0].content + immediate[1].content == progress[0]
+            assert [item.content for item in immediate[2:9]] == list(
+                progress[1:8]
+            )
+            assert immediate[9].content.endswith(recv_suffix)
+            assert immediate[9].content[: -len(recv_suffix)] == (
+                progress[8] + "\n\n" + progress[9]
+            )[:ordinal_ten_body_limit]
+            progress_spillover = (progress[8] + "\n\n" + progress[9])[
+                ordinal_ten_body_limit:
+            ]
+            assert len(progress_spillover) == len(recv_suffix)
+            notice = immediate[-1]
+            assert notice.content.startswith(f"task failed: {task.task_id}\n")
+            assert notice.content.count(f"task failed: {task.task_id}") == 1
+            assert notice.active_wire_variant == "contextless"
+
+            assert notice.reply_scope_id == scope.reply_scope_id
+            assert notice.reply_slot_id is None
+            assert notice.reply_ordinal == 10
+            assert notice.reply_candidate_id is not None
+            assert notice.reply_fragment_id is not None
+            assert notice.reply_aggregate_id is not None
+            assert notice.contextless_client_id
+            assert notice.contextless_client_id != notice.client_id
+            assert notice.wire_client_id == notice.contextless_client_id
+            assert notice.channel == "wechat"
+            assert notice.bot_id == "bot"
+            assert notice.external_user_id == "user"
+            assert notice.session_id == "default"
+            assert notice.agent_id == "codex"
+            assert notice.foreground is True
+            assert notice.notify_enabled is True
+            assert notice.from_user_id == "bot"
+            assert notice.reply_target == accepted.inbound.target()
+
+            aggregate = await first.get_reply_aggregate(
+                notice.reply_aggregate_id
+            )
+            assert aggregate is not None
+            assert aggregate.state.value == "sealed"
+            assert aggregate.wire_reply_fragment_id == notice.reply_fragment_id
+            assert (
+                aggregate.representative_reply_candidate_id
+                == notice.reply_candidate_id
+            )
+
+            hostile = await first.project_reply_candidate(
+                target=accepted.inbound.target(),
+                reply_scope_id=scope.reply_scope_id,
+                source_key="hostile:failure-notice",
+                content="hostile failure_notice token=TOPSECRET",
+                source_item_id="hostile-failure-notice",
+                source_item_type="agentMessage",
+                source_item_ordinal=999,
+                foreground=True,
+            )
+            assert len(hostile.fragments) == 1
+            assert hostile.fragments[0].state is ReplyFragmentState.DEFERRED_QUOTA
+            assert hostile.outbox_items == ()
+
+            with sqlite3.connect(path) as connection:
+                with pytest.raises(
+                    sqlite3.IntegrityError,
+                    match="terminal failure safety outbox is immutable",
+                ):
+                    connection.execute(
+                        "UPDATE user_outbox SET content='mutated' "
+                        "WHERE outbox_id=?",
+                        (notice.outbox_id,),
+                    )
+        finally:
+            await first.close()
+
+        restarted = SQLiteStore(path)
+        await restarted.initialize()
+        try:
+            await restarted.startup_reconcile()
+            durable = sorted(
+                (
+                    item
+                    for item in await restarted.list_outbox(limit=100)
+                    if item.task_id == task.task_id
+                ),
+                key=lambda item: (item.created_at, item.outbox_id),
+            )
+            assert [item.outbox_id for item in durable] == [
+                item.outbox_id for item in immediate
+            ]
+
+            delivered = []
+            while claimed := await restarted.claim_outbox(
+                "ordered-delivery-worker",
+                limit=20,
+            ):
+                assert len(claimed) == 1
+                item = claimed[0]
+                delivered.append(item)
+                assert await restarted.mark_outbox_sending(
+                    item.outbox_id,
+                    item.claim_token,
+                )
+                assert await restarted.mark_outbox_sent(
+                    item.outbox_id,
+                    item.claim_token,
+                    client_id=item.wire_client_id,
+                )
+            assert [item.outbox_id for item in delivered] == [
+                item.outbox_id for item in durable
+            ]
+            assert delivered[-1].content == notice.content
+
+            recv = await restarted.accept_inbound(
+                InboundMessage(
+                    channel="wechat",
+                    bot_id="bot",
+                    external_user_id="user",
+                    external_message_id="saturated-failure-recv",
+                    session_id="default",
+                    text="/recv",
+                    context_token="recv-context",
+                ),
+                create_task=False,
+            )
+            drained = await restarted.drain_deferred_replies(
+                target=recv.inbound.target(),
+                source_key="command:/recv",
+            )
+            assert [item.content for item in drained.outbox_items] == [
+                progress_spillover,
+                "hostile failure_notice token=TOPSECRET",
+            ]
+            assert all(
+                item.reply_fragment_id != notice.reply_fragment_id
+                for item in drained.outbox_items
+            )
+        finally:
+            await restarted.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("boundary", "recovered_state", "claimable_after_restart"),
+    (
+        ("pending", "pending", True),
+        ("sending", "delivery_unknown", False),
+        ("sent", "sent", False),
+    ),
+)
+def test_saturated_failure_notice_restart_boundaries_are_exactly_once(
+    tmp_path,
+    boundary: str,
+    recovered_state: str,
+    claimable_after_restart: bool,
+):
+    class Runtime:
+        agent_id = "codex"
+
+        async def run(self, task, _emit):
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="failed",
+                error="private provider failure",
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return False
+
+    async def scenario() -> None:
+        path = tmp_path / f"saturated-failure-{boundary}.sqlite"
+        first = SQLiteStore(path)
+        await first.initialize()
+        try:
+            accepted = await first.accept_inbound(
+                InboundMessage(
+                    channel="wechat",
+                    bot_id="bot",
+                    external_user_id="user",
+                    external_message_id=f"saturated-boundary-{boundary}",
+                    session_id="default",
+                    text="run",
+                    context_token=f"context-{boundary}",
+                ),
+                task={"agent_id": "codex"},
+            )
+            assert accepted.task is not None
+            task = accepted.task
+            scope = await first.get_reply_scope_for_inbound(
+                accepted.inbound.message_id
+            )
+            assert scope is not None
+            for ordinal in range(1, 11):
+                projection = await first.project_reply_candidate(
+                    target=accepted.inbound.target(),
+                    reply_scope_id=scope.reply_scope_id,
+                    source_key=f"boundary-progress:{ordinal}",
+                    content=f"boundary progress {ordinal}",
+                    source_item_id=f"boundary-progress-{ordinal}",
+                    source_item_type="agentMessage",
+                    source_item_ordinal=ordinal,
+                    foreground=True,
+                )
+                assert projection.slots[0].reply_ordinal == ordinal
+
+            assert await TaskWorker(
+                first,
+                runtime=Runtime(),
+                worker_id=f"boundary-worker-{boundary}",
+            ).run_once() is True
+            task_outbox = [
+                item
+                for item in await first.list_outbox(limit=100)
+                if item.task_id == task.task_id
+            ]
+            assert len(task_outbox) == 1
+            notice = task_outbox[0]
+            assert notice.active_wire_variant == "contextless"
+            original_identity = (
+                notice.outbox_id,
+                notice.client_id,
+                notice.contextless_client_id,
+                notice.reply_candidate_id,
+                notice.reply_fragment_id,
+                notice.reply_aggregate_id,
+            )
+
+            for ordinal in range(1, 11):
+                claimed = await first.claim_outbox(
+                    f"progress-delivery-{boundary}",
+                    limit=20,
+                )
+                assert len(claimed) == 1
+                assert claimed[0].outbox_id != notice.outbox_id
+                assert claimed[0].reply_ordinal == ordinal
+                assert await first.mark_outbox_sending(
+                    claimed[0].outbox_id,
+                    claimed[0].claim_token,
+                )
+                assert await first.mark_outbox_sent(
+                    claimed[0].outbox_id,
+                    claimed[0].claim_token,
+                    client_id=claimed[0].wire_client_id,
+                )
+
+            if boundary in {"sending", "sent"}:
+                notice_claim = await first.claim_outbox(
+                    f"notice-delivery-{boundary}",
+                    limit=20,
+                )
+                assert [item.outbox_id for item in notice_claim] == [
+                    notice.outbox_id
+                ]
+                assert await first.mark_outbox_sending(
+                    notice.outbox_id,
+                    notice_claim[0].claim_token,
+                )
+                if boundary == "sent":
+                    assert await first.mark_outbox_sent(
+                        notice.outbox_id,
+                        notice_claim[0].claim_token,
+                        client_id=notice.wire_client_id,
+                    )
+        finally:
+            await first.close()
+
+        restarted = SQLiteStore(path)
+        await restarted.initialize()
+        try:
+            await restarted.startup_reconcile()
+            recovered = await restarted.get_outbox_item(notice.outbox_id)
+            assert recovered is not None
+            assert recovered.state.value == recovered_state
+            assert (
+                recovered.outbox_id,
+                recovered.client_id,
+                recovered.contextless_client_id,
+                recovered.reply_candidate_id,
+                recovered.reply_fragment_id,
+                recovered.reply_aggregate_id,
+            ) == original_identity
+            assert recovered.active_wire_variant == "contextless"
+
+            claims = await restarted.claim_outbox(
+                f"restart-delivery-{boundary}",
+                limit=20,
+            )
+            if claimable_after_restart:
+                assert [item.outbox_id for item in claims] == [notice.outbox_id]
+                assert await restarted.mark_outbox_sending(
+                    notice.outbox_id,
+                    claims[0].claim_token,
+                )
+                assert await restarted.mark_outbox_sent(
+                    notice.outbox_id,
+                    claims[0].claim_token,
+                    client_id=recovered.wire_client_id,
+                )
+                assert await restarted.claim_outbox(
+                    f"second-restart-delivery-{boundary}",
+                    limit=20,
+                ) == []
+            else:
+                assert claims == []
+        finally:
+            await restarted.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("notice_as_event", (False, True))
+def test_intended_public_failure_notice_is_delivered_once(
+    tmp_path,
+    notice_as_event: bool,
+):
+    class Runtime:
+        agent_id = "codex"
+
+        async def run(self, task, _emit):
+            notice = (
+                f"task failed: {task.task_id}\n"
+                "check /tasks before retrying. /retry reuses the same context; "
+                "/clear starts fresh."
+            )
+            events = (
+                (
+                    AgentEvent.text_event(
+                        task.task_id,
+                        notice,
+                        execution_id=task.execution_id,
+                        event_type="failure_notice",
+                    ),
+                )
+                if notice_as_event
+                else ()
+            )
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="failed",
+                content=notice,
+                error="private provider diagnostic",
+                events=events,
+                thread_id="provider-thread",
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return False
+
+    async def scenario() -> None:
+        store = SQLiteStore(
+            tmp_path / f"intended-notice-{int(notice_as_event)}.sqlite"
+        )
+        await store.initialize()
+        try:
+            task = await store.create_task(_task())
+            assert await TaskWorker(
+                store,
+                runtime=Runtime(),
+                worker_id="worker",
+            ).run_once() is True
+
+            outbox = [
+                item
+                for item in await store.list_outbox()
+                if item.task_id == task.task_id
+            ]
+            assert len(outbox) == 1
+            assert outbox[0].content.count(f"task failed: {task.task_id}") == 1
+            events = await store.list_task_events(task.task_id)
+            assert [item.event_type for item in events].count("failure_notice") == 1
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_hostile_runtime_failure_events_cannot_replace_sanitized_notice(
+    tmp_path,
+):
+    hostile_events = (
+        ("error", "request failed at https://provider-secret.example/v1"),
+        ("failed", "Authorization: Bearer private-token"),
+        ("failure_notice", "token=TOPSECRET host=provider-secret.example"),
+    )
+
+    class Runtime:
+        agent_id = "codex"
+
+        async def run(self, task, emit):
+            events = []
+            for sequence, (event_type, content) in enumerate(hostile_events):
+                event = AgentEvent.text_event(
+                    task.task_id,
+                    content,
+                    sequence=sequence,
+                    execution_id=task.execution_id,
+                    event_type=event_type,
+                )
+                await emit(event)
+                events.append(event)
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="failed",
+                content="".join(content for _kind, content in hostile_events),
+                error="provider transport failed",
+                events=tuple(events),
+                thread_id="provider-thread",
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return False
+
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "hostile-failure-events.sqlite")
+        await store.initialize()
+        try:
+            task = await store.create_task(_task())
+            assert await TaskWorker(
+                store,
+                runtime=Runtime(),
+                worker_id="worker",
+            ).run_once() is True
+
+            outbox = [
+                item
+                for item in await store.list_outbox()
+                if item.task_id == task.task_id
+            ]
+            assert len(outbox) == 1
+            assert outbox[0].content.startswith(f"task failed: {task.task_id}\n")
+            assert "provider-secret" not in outbox[0].content
+            assert "private-token" not in outbox[0].content
+            assert "TOPSECRET" not in outbox[0].content
+            events = await store.list_task_events(task.task_id)
+            assert [item.event_type for item in events] == [
+                "error",
+                "failed",
+                "failure_notice",
+                "failure_notice",
+                "terminal",
+            ]
+            assert sum(
+                item.content.startswith(f"task failed: {task.task_id}\n")
+                for item in events
+            ) == 1
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_failure_notice_event_type_lookalike_cannot_break_saturated_delivery(
+    tmp_path,
+):
+    class Runtime:
+        agent_id = "codex"
+
+        async def run(self, task, _emit):
+            notice = (
+                f"task failed: {task.task_id}\n"
+                "check /tasks before retrying or sending a new prompt."
+            )
+            lookalike = AgentEvent.text_event(
+                task.task_id,
+                notice,
+                execution_id=task.execution_id,
+                event_type="failure-notice",
+            )
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="failed",
+                content=notice,
+                error="private provider diagnostic",
+                events=(lookalike,),
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return False
+
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "failure-notice-type-lookalike.sqlite")
+        await store.initialize()
+        try:
+            accepted = await store.accept_inbound(
+                InboundMessage(
+                    channel="wechat",
+                    bot_id="bot",
+                    external_user_id="user",
+                    external_message_id="failure-notice-type-lookalike",
+                    session_id="default",
+                    text="run",
+                    context_token="lookalike-context",
+                ),
+                task={"agent_id": "codex"},
+            )
+            assert accepted.task is not None
+            task = accepted.task
+            scope = await store.get_reply_scope_for_inbound(
+                accepted.inbound.message_id
+            )
+            assert scope is not None
+            for ordinal in range(1, 11):
+                projection = await store.project_reply_candidate(
+                    target=accepted.inbound.target(),
+                    reply_scope_id=scope.reply_scope_id,
+                    source_key=f"lookalike-prefill:{ordinal}",
+                    content=f"prefill {ordinal}",
+                    source_item_id=f"lookalike-prefill-{ordinal}",
+                    source_item_type="agentMessage",
+                    source_item_ordinal=ordinal,
+                    foreground=True,
+                )
+                assert projection.slots[0].reply_ordinal == ordinal
+
+            assert await TaskWorker(
+                store,
+                runtime=Runtime(),
+                worker_id="lookalike-worker",
+            ).run_once() is True
+
+            failed = await store.get_task(task.task_id)
+            assert failed is not None
+            assert failed.state.value == "failed"
+            task_outbox = [
+                item
+                for item in await store.list_outbox(limit=100)
+                if item.task_id == task.task_id
+            ]
+            assert len(task_outbox) == 1
+            assert task_outbox[0].active_wire_variant == "contextless"
+            assert task_outbox[0].content == (
+                f"task failed: {task.task_id}\n"
+                "check /tasks before retrying or sending a new prompt."
+            )
+            events = await store.list_task_events(task.task_id)
+            assert [item.event_type for item in events].count("failure_notice") == 1
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_failure_notice_uses_durable_task_thread_when_result_omits_it():
+    task = AgentTask(
+        task_id="thread-bound-failure",
+        thread_id="durable-provider-thread",
+    )
+    result = AgentResult(
+        task_id=task.task_id,
+        status="failed",
+        error="sanitized internally",
+    )
+
+    noticed = TaskWorker._with_failure_notice(task, result)
+
+    assert "/retry reuses the same context" in noticed.content
+    assert "/clear starts fresh" in noticed.content
+
+
+def test_failure_notice_restart_recovery_never_resends_a_sent_row(tmp_path):
+    class FailingRuntime:
+        agent_id = "codex"
+
+        async def run(self, task, _emit):
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="failed",
+                error="provider-secret.example:8317/v1 token=TOPSECRET",
+                thread_id="provider-thread",
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return False
+
+    class NeverRuntime:
+        agent_id = "codex"
+
+        async def run(self, _task, _emit):
+            raise AssertionError("terminal task must not execute after restart")
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return False
+
+    async def scenario() -> None:
+        path = tmp_path / "failure-notice-restart.sqlite"
+        first = SQLiteStore(path)
+        await first.initialize()
+        try:
+            task = await first.create_task(_task())
+            worker = TaskWorker(
+                first,
+                runtime=FailingRuntime(),
+                worker_id="first-worker",
+            )
+            assert await worker.run_once() is True
+            initial = [
+                item
+                for item in await first.list_outbox()
+                if item.task_id == task.task_id
+            ]
+            assert len(initial) == 1
+            assert initial[0].state.value == "pending"
+            notice_id = initial[0].outbox_id
+        finally:
+            await first.close()
+
+        restarted = SQLiteStore(path)
+        await restarted.initialize()
+        try:
+            await restarted.startup_reconcile()
+            worker = TaskWorker(
+                restarted,
+                runtime=NeverRuntime(),
+                worker_id="restart-worker",
+            )
+            assert await worker.run_once() is False
+            pending = [
+                item
+                for item in await restarted.list_outbox()
+                if item.task_id == task.task_id
+            ]
+            assert [item.outbox_id for item in pending] == [notice_id]
+            claims = await restarted.claim_outbox(
+                "delivery-worker",
+                automatic=False,
+            )
+            claim = next(item for item in claims if item.outbox_id == notice_id)
+            assert await restarted.mark_outbox_sending(
+                notice_id,
+                claim_token=claim.claim_token,
+            )
+            assert await restarted.mark_outbox_sent(
+                notice_id,
+                claim_token=claim.claim_token,
+            )
+        finally:
+            await restarted.close()
+
+        after_send = SQLiteStore(path)
+        await after_send.initialize()
+        try:
+            await after_send.startup_reconcile()
+            persisted = [
+                item
+                for item in await after_send.list_outbox()
+                if item.task_id == task.task_id
+            ]
+            assert len(persisted) == 1
+            assert persisted[0].outbox_id == notice_id
+            assert persisted[0].state.value == "sent"
+            assert await after_send.claim_outbox(
+                "another-delivery-worker",
+                automatic=False,
+            ) == []
+            assert await TaskWorker(
+                after_send,
+                runtime=NeverRuntime(),
+                worker_id="final-worker",
+            ).run_once() is False
+        finally:
+            await after_send.close()
+
+    asyncio.run(scenario())
+
+
+def test_execution_uncertain_runtime_loss_is_orphaned_without_delivery(tmp_path):
+    class ExecutionUncertainError(RuntimeError):
+        execution_uncertain = True
+
+    class Runtime:
+        agent_id = "codex"
+
+        async def run(self, _task, _emit):
+            raise ExecutionUncertainError(
+                "child lost after assignment http://provider-secret.example/v1"
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return False
+
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "uncertain-runtime-loss.sqlite")
+        await store.initialize()
+        try:
+            task = await store.create_task(_task())
+            worker = TaskWorker(store, runtime=Runtime(), worker_id="worker")
+
+            assert await worker.run_once() is True
+            orphaned = await store.get_task(task.task_id)
+            assert orphaned is not None
+            assert orphaned.state.value == "orphaned"
+
+            executions = await store.list_task_executions(task.task_id)
+            assert len(executions) == 1
+            assert executions[0].state.value == "orphaned"
+            assert [
+                item
+                for item in await store.list_outbox()
+                if item.task_id == task.task_id
+            ] == []
+            events = await store.list_task_events(task.task_id)
+            assert [(item.event_type, item.visibility.value) for item in events] == [
+                ("terminal", "internal")
+            ]
         finally:
             await store.close()
 
