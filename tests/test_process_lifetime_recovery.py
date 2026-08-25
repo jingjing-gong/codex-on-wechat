@@ -24,6 +24,12 @@ from src.runtime.process_lifetime import (
 )
 
 
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="tests the disconnected Linux process-lifetime foundation",
+)
+
+
 IDENTITY = AgentProcessIdentity(
     supervisor_epoch=91,
     agent_id="lifetime-recovery",

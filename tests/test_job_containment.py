@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from typing import Sequence
 
@@ -28,6 +29,12 @@ from src.runtime.job_containment import (
     parse_cgroup_events,
     probe_cgroup_v2_containment,
     reopen_cgroup_job,
+)
+
+
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="tests the disconnected Linux cgroup-v2 foundation",
 )
 
 

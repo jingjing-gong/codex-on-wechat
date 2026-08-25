@@ -1,7 +1,7 @@
 # codex-on-wechat
 
 `codex-on-wechat` connects a WeChat account to Codex. Each Agent runs in its
-own Linux process, tasks survive restarts in SQLite, and different Agents can
+own OS process, tasks survive restarts in SQLite, and different Agents can
 work concurrently.
 
 The WeChat integration uses the unofficial iLink protocol. Use it only for
@@ -9,8 +9,8 @@ personal or educational purposes and only with trusted WeChat users.
 
 ## Quick start
 
-You need Linux, Python 3.10 or newer, internet access, a WeChat account, and a
-working Codex login.
+You need Linux or macOS, Python 3.10 or newer, internet access, a WeChat
+account, and a working Codex login.
 
 From the repository root:
 
@@ -212,15 +212,27 @@ Export configuration before starting `./cow`; this repository does not load a
 | `CODEX_WECHAT_LOG_LEVEL` | `INFO` | Persistent and console logging level. |
 | `CODEX_WECHAT_LOG_MAX_BYTES` | `20971520` | Maximum size of the active log before rotation. |
 | `CODEX_WECHAT_LOG_BACKUPS` | `5` | Number of rotated log files retained. |
+| `CODEX_WECHAT_ALLOWED_CONFIG_PROFILES` | `qwen` | Comma-separated Codex config profile names that `/agent` may select. `*` enables every safe profile name. |
 | `CODEX_WECHAT_MAX_AGENT_PROCESSES` | `16` | Maximum independent Agent processes. |
 | `CODEX_WECHAT_TURN_TIMEOUT` | unset | Optional Codex turn timeout in seconds. |
-| `CODEX_WECHAT_SKILL_ROOTS` | unset | Colon-separated trusted skill directories on Linux. |
+| `CODEX_WECHAT_SKILL_ROOTS` | unset | Colon-separated trusted skill directories. |
 
 Example:
 
 ```bash
 CODEX_WECHAT_WORKSPACE=/absolute/path/to/workspace ./cow
 ```
+
+`CODEX_WECHAT_ALLOWED_CONFIG_PROFILES` names the Codex config layers that
+`/agent <id> <profile>` may select. Each named profile is a standalone file
+at `$CODEX_HOME/<profile>.config.toml` (for example `~/.codex/spark.config.toml`);
+`[profiles.*]` sections in the base `config.toml` are not read. Selecting a
+profile authorizes the name only: the file must still exist, be valid TOML,
+and contain a `model`, `model_provider`, and matching `model_providers`
+entry. Setting the value to `*` accepts any profile name that passes the
+safe-name check (one `A-Za-z0-9` character start, then letters, digits, `_`,
+or `-`; at most 64 characters); unsafe names are still rejected and the file
+existence check still applies.
 
 `CODEX_WECHAT_WORKERS` is deprecated and ignored.
 
@@ -246,6 +258,10 @@ CODEX_WECHAT_WORKSPACE=/absolute/path/to/workspace ./cow
 uv sync --extra test
 uv run pytest -q
 ```
+
+On macOS, pytest skips the disconnected Linux pidfd/cgroup hardening
+foundations; the active process-per-Agent runtime and launcher suites run on
+both supported platforms.
 
 See [architecture.md](architecture.md) for the implemented process and data
 flow, and [plan.md](plan.md) for the complete behavior and invariants.

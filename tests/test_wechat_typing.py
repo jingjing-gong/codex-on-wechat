@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -245,3 +246,26 @@ def test_duplicate_delivery_refreshes_typing_without_spending_reply_quota(
             await store.close()
 
     asyncio.run(scenario())
+
+
+def test_monitor_bridge_normalizes_system_exit_as_durable_failure(caplog) -> None:
+    class ExitingRuntime:
+        async def accept_inbound(self, _envelope: Any, **_kwargs: Any) -> Any:
+            raise SystemExit(3)
+
+    async def scenario() -> None:
+        gateway = WeChatGateway(ExitingRuntime(), bot_id="bot")
+        handler = gateway.monitor_handler(asyncio.get_running_loop())
+
+        with caplog.at_level(logging.ERROR, logger="src.channels.wechat"):
+            outcome = await asyncio.to_thread(
+                handler,
+                _TypingClient([]),
+                _text_message("fail durably"),
+            )
+
+        assert outcome is False
+
+    asyncio.run(scenario())
+    assert "durable monitor callback failed" in caplog.text
+    assert "SystemExit: 3" in caplog.text

@@ -484,3 +484,175 @@ def test_opaque_runtime_default_requires_every_model_to_support_ultra(
             await all_ultra.stop()
 
     asyncio.run(scenario())
+
+
+def test_unreported_efforts_model_accepts_explicit_effort(tmp_path) -> None:
+    async def scenario() -> None:
+        catalog = (
+            {
+                "id": "qwen3.8-27b",
+                "displayName": "Qwen 3.8 27B",
+                "isDefault": True,
+                "supportedReasoningEfforts": [],
+            },
+            {
+                "id": "gpt-5.6-luna",
+                "displayName": "GPT-5.6 Luna",
+                "isDefault": False,
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": effort}
+                    for effort in ("low", "medium", "high", "xhigh", "max")
+                ],
+            },
+        )
+        manager, runtime = _manager_for(tmp_path / "runtime.sqlite", catalog)
+        await manager.start()
+        try:
+            router = MVPCommandRouter(manager)
+            result = await _route(router, "/model qwen3.8-27b xhigh")
+            assert "- **Model:** `qwen3.8-27b`" in result
+            assert "- **Reasoning effort:** `xhigh` (override)" in result
+            assert (await _selection(manager))["reasoning_effort"] == "xhigh"
+            assert runtime.compatibility_calls[-1] == (
+                "effort",
+                "wechat:bot:user:default:codex",
+                "xhigh",
+            )
+
+            effort_result = await _route(router, "/model effort ultra")
+            assert "- **Reasoning effort:** `ultra` (override)" in effort_result
+            assert (await _selection(manager))["reasoning_effort"] == "ultra"
+
+            rejection = await _route(router, "/model gpt-5.6-luna ultra")
+            assert rejection == (
+                "cannot set model: model gpt-5.6-luna does not support "
+                "reasoning effort: ultra"
+            )
+            assert (await _selection(manager))["reasoning_effort"] == "ultra"
+
+            await manager.set_model(
+                "gpt-5.6-luna",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+                agent_id="codex",
+            )
+            assert (await _selection(manager))["reasoning_effort"] == ""
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_unreported_efforts_model_keeps_previous_override(tmp_path) -> None:
+    async def scenario() -> None:
+        catalog = (
+            {
+                "id": "gpt-5.6-sol",
+                "displayName": "GPT-5.6 Sol",
+                "isDefault": True,
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": effort}
+                    for effort in ("low", "medium", "high", "xhigh", "max", "ultra")
+                ],
+            },
+            {
+                "id": "qwen3.8-27b",
+                "displayName": "Qwen 3.8 27B",
+                "isDefault": False,
+                "supportedReasoningEfforts": [],
+            },
+        )
+        manager, _runtime = _manager_for(tmp_path / "runtime.sqlite", catalog)
+        await manager.start()
+        try:
+            router = MVPCommandRouter(manager)
+            await _route(router, "/model gpt-5.6-sol ultra")
+            await manager.set_model(
+                "qwen3.8-27b",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+                agent_id="codex",
+            )
+            assert await _selection(manager) == {
+                "agent_id": "codex",
+                "model_id": "qwen3.8-27b",
+                "reasoning_effort": "ultra",
+                "conversation_id": "wechat:bot:user:default:codex",
+            }
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_opaque_default_accepts_effort_when_no_entry_reports_efforts(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        catalog = (
+            {
+                "id": "provider-a",
+                "displayName": "Provider A",
+                "isDefault": False,
+                "supportedReasoningEfforts": [],
+            },
+            {
+                "id": "provider-b",
+                "displayName": "Provider B",
+                "isDefault": False,
+                "supportedReasoningEfforts": [],
+            },
+        )
+        manager, _runtime = _manager_for(tmp_path / "runtime.sqlite", catalog)
+        await manager.start()
+        try:
+            router = MVPCommandRouter(manager)
+            result = await _route(router, "/model effort xhigh")
+            assert "- **Reasoning effort:** `xhigh` (override)" in result
+            assert (await _selection(manager))["reasoning_effort"] == "xhigh"
+
+            mixed = (
+                {
+                    "id": "gpt-a",
+                    "displayName": "A",
+                    "isDefault": False,
+                    "supportedReasoningEfforts": ["low", "high"],
+                },
+                {
+                    "id": "provider-b",
+                    "displayName": "B",
+                    "isDefault": False,
+                    "supportedReasoningEfforts": [],
+                },
+            )
+            database = tmp_path / "mixed.sqlite"
+            second, _second_runtime = _manager_for(database, mixed)
+            await second.start()
+            try:
+                second_router = MVPCommandRouter(second)
+                rejection = await _route(second_router, "/model effort ultra")
+                assert rejection == (
+                    "cannot set model: current runtime-default model cannot "
+                    "be proven to support reasoning effort: ultra"
+                )
+                await _route(second_router, "/model effort high")
+                assert (
+                    await second.get_model_selection(
+                        channel="wechat",
+                        bot_id="bot",
+                        external_user_id="user",
+                        session_id="default",
+                        agent_id="codex",
+                    )
+                )["reasoning_effort"] == "high"
+            finally:
+                await second.stop()
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())

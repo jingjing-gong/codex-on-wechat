@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import logging
 import threading
 from types import SimpleNamespace
 
@@ -259,6 +260,160 @@ def test_monitor_backs_off_repeated_durable_acceptance_failures(monkeypatch):
     assert stop.waits == [1.0, 2.0]
     assert client.cursors == ["", ""]
     assert handled == [1, 1]
+
+
+def test_system_exit_in_durable_handler_is_logged_and_contained(
+    monkeypatch, caplog
+):
+    class StopAfterOneWait:
+        def __init__(self) -> None:
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            return bool(self.waits)
+
+        def wait(self, timeout: float) -> bool:
+            self.waits.append(timeout)
+            return False
+
+    class Client:
+        bot_id = "bot"
+
+        def get_updates(self, cursor: str):
+            return SimpleNamespace(
+                ret=0,
+                errcode=0,
+                errmsg="",
+                msgs=[_message(1)],
+                get_updates_buf="must-not-advance",
+            )
+
+    def exit_handler(_client, _message: WeixinMessage) -> bool:
+        raise SystemExit(1)
+
+    monkeypatch.setattr(Monitor, "_load_buf", lambda self: None)
+    monkeypatch.setattr("wechat_ilink.monitor.INITIAL_BACKOFF", 0.0)
+    stop = StopAfterOneWait()
+    monitor = Monitor(
+        Client(),
+        exit_handler,
+        max_workers=1,
+        durable_acceptance=True,
+        initial_cursor="",
+    )
+    with caplog.at_level(logging.ERROR, logger="wechat_ilink.monitor"):
+        try:
+            monitor.run(stop)
+        finally:
+            monitor.close()
+
+    assert stop.waits == [0.0]
+    assert "message handler raised an exception" in caplog.text
+    assert "SystemExit: 1" in caplog.text
+
+
+def test_system_exit_in_durable_cursor_callback_is_logged_and_contained(
+    monkeypatch, caplog
+):
+    class StopAfterOneWait:
+        def __init__(self) -> None:
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            return bool(self.waits)
+
+        def wait(self, timeout: float) -> bool:
+            self.waits.append(timeout)
+            return False
+
+    class Client:
+        bot_id = "bot"
+
+        def get_updates(self, cursor: str):
+            return SimpleNamespace(
+                ret=0,
+                errcode=0,
+                errmsg="",
+                msgs=[],
+                get_updates_buf="must-not-advance",
+            )
+
+    def exit_cursor(_cursor: str) -> bool:
+        raise SystemExit(2)
+
+    monkeypatch.setattr(Monitor, "_load_buf", lambda self: None)
+    monkeypatch.setattr("wechat_ilink.monitor.INITIAL_BACKOFF", 0.0)
+    stop = StopAfterOneWait()
+    monitor = Monitor(
+        Client(),
+        lambda *_args: True,
+        max_workers=1,
+        durable_acceptance=True,
+        durable_cursor_callback=exit_cursor,
+        initial_cursor="",
+    )
+    with caplog.at_level(logging.ERROR, logger="wechat_ilink.monitor"):
+        try:
+            monitor.run(stop)
+        finally:
+            monitor.close()
+
+    assert stop.waits == [0.0]
+    assert monitor._get_updates_buf == ""
+    assert "durable cursor persistence failed" in caplog.text
+    assert "SystemExit: 2" in caplog.text
+
+
+def test_system_exit_in_durable_cursor_reset_is_logged_and_contained(
+    monkeypatch, caplog
+):
+    class StopAfterOneWait:
+        def __init__(self) -> None:
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            return bool(self.waits)
+
+        def wait(self, timeout: float) -> bool:
+            self.waits.append(timeout)
+            return False
+
+    class Client:
+        bot_id = "bot"
+
+        def get_updates(self, cursor: str):
+            return SimpleNamespace(
+                ret=0,
+                errcode=-14,
+                errmsg="session expired",
+                msgs=[],
+                get_updates_buf="",
+            )
+
+    def exit_reset() -> bool:
+        raise SystemExit(4)
+
+    monkeypatch.setattr(Monitor, "_load_buf", lambda self: None)
+    monkeypatch.setattr("wechat_ilink.monitor.SESSION_EXPIRED_BACKOFF", 0.0)
+    stop = StopAfterOneWait()
+    monitor = Monitor(
+        Client(),
+        lambda *_args: True,
+        max_workers=1,
+        durable_acceptance=True,
+        durable_cursor_reset_callback=exit_reset,
+        initial_cursor="existing-cursor",
+    )
+    with caplog.at_level(logging.ERROR, logger="wechat_ilink.monitor"):
+        try:
+            monitor.run(stop)
+        finally:
+            monitor.close()
+
+    assert stop.waits == [0.0]
+    assert monitor._get_updates_buf == "existing-cursor"
+    assert "durable cursor reset failed" in caplog.text
+    assert "SystemExit: 4" in caplog.text
 
 
 def test_monitor_close_releases_executor_and_is_idempotent(monkeypatch):

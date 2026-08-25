@@ -523,6 +523,11 @@ class Acceptance:
         return "accepted" if self.accepted else "rejected"
 
 
+@dataclass(frozen=True, slots=True)
+class _MonitorCallbackFailure:
+    exception: BaseException
+
+
 class CommandResponse(str):
     """String-compatible command result carrying projection metadata."""
 
@@ -5756,7 +5761,7 @@ class WeChatGateway:
 
     def monitor_handler(
         self, loop: asyncio.AbstractEventLoop, *, timeout: float | None = 15.0
-    ) -> Callable[[Any, WeixinMessage], Acceptance | None]:
+    ) -> Callable[[Any, WeixinMessage], Acceptance | bool | None]:
         """Return a blocking callback suitable for ``wechat_ilink.Monitor``.
 
         ``Monitor`` invokes handlers from worker threads while the runtime is
@@ -5765,13 +5770,35 @@ class WeChatGateway:
         runtime dictionaries from the worker thread.
         """
 
-        def handle(client: Any, message: WeixinMessage) -> Acceptance | None:
+        def handle(client: Any, message: WeixinMessage) -> Acceptance | bool | None:
             # The Monitor invokes this callback on a contact worker thread.
             # Complete the bounded best-effort typing attempt before command,
             # media-promotion, or task work reaches the runtime loop.  This is
             # deliberately outside the durable allocator and a redelivery may
             # refresh the transient state.
             send_inbound_typing_state(client, message)
+
+            async def invoke_handler() -> Acceptance | None | _MonitorCallbackFailure:
+                try:
+                    return await self.handle_message(client, message)
+                except BaseException as exc:
+                    # asyncio tasks re-raise SystemExit and KeyboardInterrupt
+                    # into their owner loop. Normalize them before they cross
+                    # that task boundary so one callback cannot stop the loop.
+                    return _MonitorCallbackFailure(exc)
+
+            def normalize_result(
+                result: Acceptance | None | _MonitorCallbackFailure,
+            ) -> Acceptance | bool | None:
+                if not isinstance(result, _MonitorCallbackFailure):
+                    return result
+                exc = result.exception
+                logger.error(
+                    "durable monitor callback failed; retaining sync cursor",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                return False
+
             # Useful for deterministic unit tests and single-threaded tools
             # that have not started their loop yet.
             if not loop.is_running():
@@ -5786,7 +5813,7 @@ class WeChatGateway:
                     raise RuntimeError(
                         "monitor handler runtime owner loop is not running"
                     )
-                return asyncio.run(self.handle_message(client, message))
+                return normalize_result(asyncio.run(invoke_handler()))
             try:
                 running = asyncio.get_running_loop()
             except RuntimeError:
@@ -5794,9 +5821,9 @@ class WeChatGateway:
             if running is loop:
                 raise RuntimeError("monitor handler cannot block its owning asyncio loop")
             settled = threading.Event()
-            coroutine = self.handle_message(client, message)
+            coroutine = invoke_handler()
 
-            async def invoke() -> Acceptance | None:
+            async def invoke() -> Acceptance | None | _MonitorCallbackFailure:
                 try:
                     return await coroutine
                 finally:
@@ -5815,7 +5842,7 @@ class WeChatGateway:
                     coroutine.close()
                 raise
             try:
-                return future.result(timeout=timeout)
+                return normalize_result(future.result(timeout=timeout))
             except FutureTimeoutError:
                 # A monitor callback timeout must not leave the acceptance
                 # coroutine running after the cursor worker has moved on.
@@ -5824,13 +5851,19 @@ class WeChatGateway:
                 # coroutine's ``finally`` blocks a short, bounded chance to
                 # drain; loop shutdown performs a final all-task drain.
                 settled.wait(0.5)
-                raise
+                logger.exception(
+                    "durable monitor callback timed out; retaining sync cursor"
+                )
+                return False
             except BaseException:
                 if not future.done():
                     future.cancel()
                 if future.cancelled():
                     settled.wait(0.5)
-                raise
+                logger.exception(
+                    "durable monitor callback failed; retaining sync cursor"
+                )
+                return False
 
         return handle
 
@@ -5840,7 +5873,7 @@ def make_monitor_handler(
     loop: asyncio.AbstractEventLoop,
     *,
     timeout: float | None = 15.0,
-) -> Callable[[Any, WeixinMessage], Acceptance | None]:
+) -> Callable[[Any, WeixinMessage], Acceptance | bool | None]:
     """Functional form of :meth:`WeChatGateway.monitor_handler`."""
 
     return gateway.monitor_handler(loop, timeout=timeout)

@@ -437,11 +437,21 @@ class TaskManager:
         # they may contain provider credentials, MCP servers, hooks, and other
         # capabilities.  Dynamic Agent creation therefore defaults to denying
         # every non-empty selector even when a matching private file exists.
+        # A literal "*" entry is a wildcard grant: any selector that still
+        # passes the safe-name check is authorized, while the matching
+        # private config file must still exist.  The token is recognized
+        # before normalization (which rejects it) and never enters the name
+        # vocabulary itself.
+        self._codex_config_profile_wildcard = any(
+            isinstance(value, str) and value.strip() == "*"
+            for value in configured_profiles
+        )
         self.allowed_codex_config_profiles = frozenset(
             normalized
             for normalized in (
                 normalize_codex_config_profile(value)
                 for value in configured_profiles
+                if not (isinstance(value, str) and value.strip() == "*")
             )
             if normalized
         )
@@ -2269,11 +2279,18 @@ class TaskManager:
         )
 
     def _require_allowed_codex_config_profile(self, value: Any) -> str:
-        """Authorize one selector without revealing private file existence."""
+        """Authorize one selector without revealing private file existence.
+
+        A "*" entry in the administrator allow-list is a wildcard grant: any
+        selector that passes the safe-name check below is accepted.  Unsafe
+        names still raise before the allow-list is consulted, and the caller
+        must still prove that the matching config file exists.
+        """
 
         normalized = normalize_codex_config_profile(value)
         if (
             normalized
+            and not self._codex_config_profile_wildcard
             and normalized not in self.allowed_codex_config_profiles
         ):
             raise PermissionError("Codex config profile is not enabled")
@@ -3738,6 +3755,33 @@ class TaskManager:
             None,
         )
 
+    @staticmethod
+    def _effort_compatible(model: Any, effort: str) -> bool:
+        """Whether the model's declared efforts permit the effort.
+
+        A catalog entry that reports no supported efforts is unknown rather
+        than incapable, so it never fails this check.
+        """
+        if not _model_reasoning_efforts(model):
+            return True
+        return TaskManager._matching_reasoning_effort(model, effort) is not None
+
+    @staticmethod
+    def _resolve_reasoning_effort(model: Any, effort: str, model_label: str) -> str:
+        """Normalize an explicit effort for persistence or reject it.
+
+        Models whose catalog entry reports no supported efforts accept the
+        normalized request verbatim because their capabilities are unknown.
+        """
+        matched = TaskManager._matching_reasoning_effort(model, effort)
+        if matched is not None:
+            return matched
+        if _model_reasoning_efforts(model):
+            raise ValueError(
+                f"model {model_label} does not support reasoning effort: {effort}"
+            )
+        return str(effort).strip().lower()
+
     async def _update_runtime_model_compatibility(
         self,
         runtime: Any,
@@ -3899,19 +3943,16 @@ class TaskManager:
             requested_effort = reasoning_effort if reasoning_effort is not None else effort
             if requested_effort is None:
                 resolved_effort = previous_effort
-                if selected is not None and resolved_effort and not self._matching_reasoning_effort(
+                if selected is not None and resolved_effort and not self._effort_compatible(
                     selected, resolved_effort
                 ):
                     resolved_effort = ""
             elif str(requested_effort).strip().lower() == "default":
                 resolved_effort = ""
             elif selected is not None:
-                matched = self._matching_reasoning_effort(selected, str(requested_effort))
-                if matched is None:
-                    raise ValueError(
-                        f"model {canonical_model} does not support reasoning effort: {requested_effort}"
-                    )
-                resolved_effort = matched
+                resolved_effort = self._resolve_reasoning_effort(
+                    selected, str(requested_effort), canonical_model
+                )
             else:
                 resolved_effort = str(requested_effort).strip()
             return await self._persist_model_preference(
@@ -3987,19 +4028,20 @@ class TaskManager:
                 else next((model for model in models if _model_is_default(model)), None)
             )
             if selected is not None:
-                matched = self._matching_reasoning_effort(selected, requested)
-                if matched is None:
-                    raise ValueError(
-                        f"model {_model_identifier(selected)} does not support reasoning effort: {requested}"
-                    )
-                resolved_effort = matched
+                resolved_effort = self._resolve_reasoning_effort(
+                    selected, requested, _model_identifier(selected)
+                )
             else:
                 # The runtime can expose a catalog without identifying which
                 # entry is its opaque default.  An effort supported by every
-                # candidate is safe regardless of that hidden selection;
-                # anything narrower would risk persisting an invalid pair.
+                # candidate that declares efforts is safe regardless of that
+                # hidden selection; anything narrower would risk persisting
+                # an invalid pair.  Entries that report no efforts are
+                # unknown, so they neither prove nor block a request.
                 supported_by_all: list[str] = []
                 for model in models:
+                    if not _model_reasoning_efforts(model):
+                        continue
                     matched = self._matching_reasoning_effort(model, requested)
                     if matched is None:
                         raise ValueError(
@@ -4007,7 +4049,10 @@ class TaskManager:
                             f"support reasoning effort: {requested}"
                         )
                     supported_by_all.append(matched)
-                resolved_effort = supported_by_all[0]
+                if supported_by_all:
+                    resolved_effort = supported_by_all[0]
+                else:
+                    resolved_effort = str(requested).strip().lower()
             return await self._persist_model_preference(
                 target=target,
                 agent_id=active,

@@ -1443,8 +1443,7 @@ def test_monitor_timeout_interrupts_owned_command_receipt_before_returning(
             )
         )
         try:
-            with pytest.raises(asyncio.TimeoutError):
-                await timed_out
+            assert await timed_out is False
 
             receipt = await store.get_command_receipt(
                 "command:wechat:bot:user:default:17"

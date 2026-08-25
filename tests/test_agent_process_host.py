@@ -48,6 +48,12 @@ from src.runtime.process_lifetime import (
 )
 
 
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="tests the disconnected Linux pidfd/lifetime host",
+)
+
+
 IDENTITY = AgentProcessIdentity(
     supervisor_epoch=41,
     agent_id="bootstrap-test",

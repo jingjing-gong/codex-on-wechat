@@ -198,7 +198,7 @@ class Monitor:
                             reset_result = asyncio.run(reset_result)
                         if reset_result is False:
                             raise RuntimeError("durable cursor reset callback rejected reset")
-                    except Exception:
+                    except BaseException:
                         reset_ok = False
                         logger.exception(
                             "durable cursor reset failed; retaining sync cursor"
@@ -268,7 +268,7 @@ class Monitor:
                                 # Do not let a later mutation overtake the
                                 # first message whose durable outcome failed.
                                 return False
-                        except Exception:
+                        except BaseException:
                             logger.exception(
                                 "durable message acceptance failed in contact group"
                             )
@@ -288,7 +288,7 @@ class Monitor:
                     try:
                         if not future.result():
                             accepted = False
-                    except Exception:
+                    except BaseException:
                         logger.exception("durable message acceptance future failed")
                         accepted = False
                 if not accepted:
@@ -320,7 +320,7 @@ class Monitor:
                             cursor_result = asyncio.run(cursor_result)
                         if cursor_result is False:
                             raise RuntimeError("durable cursor callback rejected cursor")
-                    except Exception:
+                    except BaseException:
                         self._failures += 1
                         backoff = self._calc_backoff()
                         logger.exception(
@@ -389,7 +389,7 @@ class Monitor:
             try:
                 result = invoke_handler()
                 return accepted_result(result)
-            except Exception:
+            except BaseException:
                 logger.exception("message handler raised an exception")
             return False
 
@@ -399,7 +399,7 @@ class Monitor:
             try:
                 result = invoke_handler()
                 return accepted_result(result)
-            except Exception:
+            except BaseException:
                 logger.exception("message handler raised an exception")
                 return False
 

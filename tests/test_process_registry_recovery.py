@@ -37,6 +37,12 @@ from src.runtime.process_registry import (
 from src.runtime.sqlite_store import SQLiteStore
 
 
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="tests recovery for the disconnected Linux process host",
+)
+
+
 NOW = datetime(2026, 8, 15, 3, 0, tzinfo=timezone.utc)
 
 
@@ -184,7 +190,15 @@ def _spawn_leader(lock: InheritedLifetimeLock, code: str) -> subprocess.Popen[An
     )
 
 
-def _kill_test_group(process_group_id: int) -> None:
+def _kill_test_group(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process_group_id = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return
+    if process_group_id != process.pid:
+        raise AssertionError("test process is no longer its process-group leader")
     with contextlib.suppress(ProcessLookupError):
         os.killpg(process_group_id, signal.SIGKILL)
 
@@ -236,7 +250,7 @@ def test_store_failure_retains_exact_proof_for_idempotent_retry(
             assert await owner.retry() == stopped
             assert len(store.calls) == 2
         finally:
-            _kill_test_group(process.pid)
+            _kill_test_group(process)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=1)
             owner.close()
@@ -518,7 +532,7 @@ def test_replacement_finishes_unlink_after_commit_ack_crash(
             finally:
                 replacement.close()
         finally:
-            _kill_test_group(process.pid)
+            _kill_test_group(process)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=1)
             owner.close()
@@ -589,7 +603,7 @@ def test_leader_missing_nonempty_numeric_group_fails_closed_without_signal(
             finally:
                 owner.close()
         finally:
-            _kill_test_group(leader.pid)
+            _kill_test_group(leader)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 leader.wait(timeout=1)
             for _ in range(200):
@@ -639,7 +653,7 @@ def test_birth_mismatch_fails_closed_without_signalling(
             assert caught.value.recovery_owner.lifetime_lock is not None
         finally:
             owner.close()
-            _kill_test_group(process.pid)
+            _kill_test_group(process)
             process.wait(timeout=3)
             recovered = RecoveredLifetimeLock.reopen(lock_root, lock.identity)
             assert recovered.try_prove_released()
@@ -752,7 +766,7 @@ def test_recovery_proof_commits_through_sqlite_generation_fences(
         finally:
             with contextlib.suppress(Exception):
                 await first.close()
-            _kill_test_group(process.pid)
+            _kill_test_group(process)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=1)
             if Path(lock.path).exists():

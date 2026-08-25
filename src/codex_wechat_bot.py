@@ -1095,9 +1095,15 @@ def _serve_legacy(
                                     f": {default_effort}" if default_effort else ""
                                 )
                             else:
-                                effort = _matching_reasoning_effort(
-                                    selected_model, requested_effort
-                                )
+                                if _reasoning_efforts(selected_model):
+                                    effort = (
+                                        _matching_reasoning_effort(
+                                            selected_model, requested_effort
+                                        )
+                                        or ""
+                                    )
+                                else:
+                                    effort = requested_effort.strip().lower()
                                 if not selected_model:
                                     reply = (
                                         "current model is not available; use /models"
@@ -1135,12 +1141,15 @@ def _serve_legacy(
                             else:
                                 effort = ""
                                 if requested_effort.lower() != "default":
-                                    effort = (
-                                        _matching_reasoning_effort(
-                                            model, requested_effort
+                                    if _reasoning_efforts(model):
+                                        effort = (
+                                            _matching_reasoning_effort(
+                                                model, requested_effort
+                                            )
+                                            or ""
                                         )
-                                        or ""
-                                    )
+                                    else:
+                                        effort = requested_effort.strip().lower()
                                     if not effort:
                                         available = (
                                             ", ".join(_reasoning_efforts(model))
@@ -1588,6 +1597,8 @@ def _run_owned_durable(
         for value in os.environ.get("CODEX_WECHAT_SKILL_ROOTS", "").split(os.pathsep)
         if value.strip()
     )
+    # A "*" entry grants every safe profile name (each request still passes
+    # the safe-name check and the profile file must exist in $CODEX_HOME).
     allowed_codex_config_profiles = tuple(
         value.strip()
         for value in os.environ.get(
@@ -1969,12 +1980,40 @@ def _run_owned_durable(
         raise
 
     stop_event = threading.Event()
+    monitor_exit: BaseException | None = None
     try:
         try:
             monitor.run(stop_event)
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as exc:
+            monitor_exit = exc
             pass
+        except BaseException as exc:
+            monitor_exit = exc
+            raise
     finally:
+        if isinstance(monitor_exit, KeyboardInterrupt):
+            logger.error(
+                "durable monitor interrupted; beginning runtime shutdown",
+                exc_info=(
+                    type(monitor_exit),
+                    monitor_exit,
+                    monitor_exit.__traceback__,
+                ),
+            )
+        elif monitor_exit is not None:
+            logger.error(
+                "durable monitor raised %s; beginning runtime shutdown",
+                type(monitor_exit).__name__,
+                exc_info=(
+                    type(monitor_exit),
+                    monitor_exit,
+                    monitor_exit.__traceback__,
+                ),
+            )
+        else:
+            logger.info(
+                "durable monitor loop returned; beginning runtime shutdown"
+            )
         shutdown_errors: list[BaseException] = []
         stop_event.set()
         assert monitor is not None
@@ -2067,7 +2106,15 @@ def main() -> None:
         # router that lacks durable tasks, dynamic Agents, and current command
         # semantics. The flag is now only a deprecated durable-runtime alias.
         logger.warning("--legacy is deprecated; starting the durable runtime")
-    _durable_main()
+    try:
+        _durable_main()
+    except BaseException as exc:
+        logger.exception(
+            "fatal durable runtime failure: type=%s code=%r",
+            type(exc).__name__,
+            getattr(exc, "code", None),
+        )
+        raise
 
 
 if __name__ == "__main__":

@@ -51,9 +51,14 @@ async def _wait_for_path(path: Path, *, timeout: float = 5.0) -> None:
 
 
 async def _wait_for_process_exit(pid: int, *, timeout: float = 5.0) -> None:
-    proc = Path(f"/proc/{pid}")
     deadline = time.monotonic() + timeout
-    while proc.exists():
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
         if time.monotonic() >= deadline:
             raise AssertionError(f"Agent child PID {pid} was not reaped")
         await asyncio.sleep(0.01)
@@ -93,6 +98,24 @@ def _runtime(agent_id: str, tmp_path: Path) -> ProcessAgentRuntime:
         stop_timeout=5,
         event_ack_timeout=5,
     )
+
+
+def _kill_runtime_generation(
+    runtime: ProcessAgentRuntime,
+    *,
+    pid: int,
+    generation: int,
+) -> None:
+    process = runtime._process
+    if (
+        process is None
+        or process.exitcode is not None
+        or runtime.pid != pid
+        or runtime.generation != generation
+        or runtime.process_group_id != pid
+    ):
+        raise AssertionError("runtime process generation changed before signal")
+    process.kill()
 
 
 def test_distinct_agents_execute_in_distinct_child_pids_and_overlap(
@@ -156,6 +179,49 @@ def test_distinct_agents_execute_in_distinct_child_pids_and_overlap(
             assert beta_result.content == f"beta:{beta_pid}"
             assert [event.content for event in alpha_events] == [f"alpha:{alpha_pid}"]
             assert [event.content for event in beta_events] == [f"beta:{beta_pid}"]
+        finally:
+            await asyncio.gather(alpha.stop(), beta.stop(), return_exceptions=True)
+        assert alpha_pid is not None and beta_pid is not None
+        await asyncio.gather(
+            _wait_for_process_exit(alpha_pid),
+            _wait_for_process_exit(beta_pid),
+        )
+
+    asyncio.run(scenario())
+
+
+def test_parent_lifetime_pipe_loss_kills_only_its_agent_group(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        alpha = _runtime("alpha", tmp_path)
+        beta = _runtime("beta", tmp_path)
+        alpha_pid: int | None = None
+        beta_pid: int | None = None
+        try:
+            await asyncio.gather(alpha.start(), beta.start())
+            alpha_pid = alpha.pid
+            beta_pid = beta.pid
+            assert isinstance(alpha_pid, int) and alpha_pid > 0
+            assert isinstance(beta_pid, int) and beta_pid > 0
+
+            # The parent deliberately never writes to this generation-specific
+            # endpoint. Closing it simulates abrupt supervisor loss. If the
+            # child inherited another write end during spawn, EOF would never
+            # arrive and this test would time out.
+            lifetime = alpha._parent_liveness_connection
+            assert lifetime is not None
+            assert os.get_inheritable(lifetime.fileno()) is False
+            lifetime.close()
+
+            deadline = time.monotonic() + 5
+            while alpha.health != "lost":
+                if time.monotonic() >= deadline:
+                    raise AssertionError("Agent did not detect parent lifetime loss")
+                await asyncio.sleep(0.01)
+
+            await _wait_for_process_exit(alpha_pid)
+            assert alpha._parent_liveness_connection is None
+            assert beta.pid == beta_pid
+            assert beta.health == "ready"
         finally:
             await asyncio.gather(alpha.stop(), beta.stop(), return_exceptions=True)
         assert alpha_pid is not None and beta_pid is not None
@@ -466,7 +532,11 @@ def test_child_crash_is_uncertain_and_restart_uses_new_pid_and_generation(
                 _wait_for_path(root / "crash.entered.json"),
                 _wait_for_path(root / "peer-survives.entered.json"),
             )
-            os.kill(old_pid, signal.SIGKILL)
+            _kill_runtime_generation(
+                runtime,
+                pid=old_pid,
+                generation=old_generation,
+            )
 
             with pytest.raises(ProcessAgentLostError) as raised:
                 await asyncio.wait_for(running, timeout=5)

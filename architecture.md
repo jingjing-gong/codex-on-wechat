@@ -612,10 +612,12 @@ The process architecture materially isolates runtime lifecycle and failure:
 It is not a hostile-code confidentiality boundary. Children normally share a
 Unix UID and configured workspace root, and current modes allow network/commands.
 Every selected cwd is canonically confined to that root, but same-UID processes
-can still reach overlapping files. The leader
-arms Linux parent-death `SIGKILL`, and normal/lost-child cleanup kills its
-process group. Arbitrary descendants that deliberately escape that group are
-not guaranteed to die if the supervisor itself receives `SIGKILL`.
+can still reach overlapping files. Every child has a generation-specific
+supervisor-lifetime pipe watched outside its event loop; losing the supervisor
+kills the child's process group. Linux additionally arms a parent-death signal.
+Normal and lost-child cleanup also kills and proves empty the process group.
+Arbitrary descendants that deliberately escape that group are not guaranteed
+to die if the supervisor itself receives `SIGKILL`.
 
 Non-escapable descendant cleanup requires a real delegated cgroup-v2,
 container, namespace, or brokered-tool boundary. `job_containment.py` currently

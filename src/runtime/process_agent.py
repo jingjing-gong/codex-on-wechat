@@ -489,7 +489,7 @@ async def _recv_bytes(connection: Any) -> bytes:
 
     try:
         loop.add_reader(descriptor, ready)
-    except (AttributeError, NotImplementedError):  # pragma: no cover - Linux target
+    except (AttributeError, NotImplementedError):  # pragma: no cover - POSIX target
         return await asyncio.to_thread(connection.recv_bytes)
     try:
         return await future
@@ -608,6 +608,29 @@ def _arm_linux_parent_death(parent_pid: int, parent_start_time: int) -> None:
         raise RuntimeError("Agent supervisor exited during spawn")
     if _linux_process_start_time(parent_pid) != parent_start_time:
         raise RuntimeError("Agent supervisor process identity changed")
+
+
+def _watch_parent_liveness(connection: Any, process_group_id: int) -> None:
+    """Kill the Agent process group when its supervisor lifetime ends.
+
+    The parent owns the only write end of a generation-specific, one-way pipe
+    and deliberately never writes to it.  EOF therefore proves that the
+    supervisor no longer owns this child generation.  A dedicated thread keeps
+    this proof live even while the Agent event loop is blocked in SDK or tool
+    work.  Treat unexpected data or a pipe error as loss of the same contract.
+    """
+
+    try:
+        connection.recv_bytes()
+    except (EOFError, OSError):
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            connection.close()
+
+    with contextlib.suppress(BaseException):
+        os.killpg(process_group_id, signal.SIGKILL)
+    os._exit(128 + int(signal.SIGKILL))
 
 
 def _install_child_import_boundary() -> None:
@@ -1173,22 +1196,40 @@ class _ChildSession:
         )
 
 
-async def _run_child(connection: Any, config: Mapping[str, Any]) -> int:
+async def _run_child(
+    connection: Any,
+    parent_liveness_connection: Any,
+    config: Mapping[str, Any],
+) -> int:
     parent_pid = int(config["parent_pid"])
-    parent_start_time = int(config["parent_start_time"])
     os.setsid()
+    process_group_id = os.getpgrp()
+    if process_group_id != os.getpid():
+        raise RuntimeError("Agent child did not acquire a dedicated process group")
+    os.set_inheritable(parent_liveness_connection.fileno(), False)
+
+    liveness_thread = threading.Thread(
+        target=_watch_parent_liveness,
+        args=(parent_liveness_connection, process_group_id),
+        name="cow-agent-parent-liveness",
+        daemon=True,
+    )
+    liveness_thread.start()
 
     def parent_died(_signum: int, _frame: Any) -> None:
         # The Agent leader owns a dedicated session/process group.  Escalate
-        # the Linux parent-death notification to that whole group so an SDK or
-        # tool descendant cannot outlive both the supervisor and its Agent.
+        # a termination request to that whole group so an SDK or tool
+        # descendant cannot outlive its Agent leader.
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         with contextlib.suppress(BaseException):
             os.killpg(os.getpgrp(), signal.SIGKILL)
         os._exit(128 + int(signal.SIGTERM))
 
     signal.signal(signal.SIGTERM, parent_died)
-    _arm_linux_parent_death(parent_pid, parent_start_time)
+    if sys.platform.startswith("linux"):
+        _arm_linux_parent_death(parent_pid, int(config["parent_start_time"]))
+    elif os.getppid() != parent_pid:
+        raise RuntimeError("Agent supervisor exited during spawn")
     session = _ChildSession(connection, config)
     try:
         return await session.run()
@@ -1209,11 +1250,17 @@ async def _run_child(connection: Any, config: Mapping[str, Any]) -> int:
             connection.close()
 
 
-def _child_process_main(connection: Any, config: Mapping[str, Any]) -> None:
+def _child_process_main(
+    connection: Any,
+    parent_liveness_connection: Any,
+    config: Mapping[str, Any],
+) -> None:
     """Spawn target.  It must remain importable as top-level ``process_agent``."""
 
     try:
-        returncode = asyncio.run(_run_child(connection, config))
+        returncode = asyncio.run(
+            _run_child(connection, parent_liveness_connection, config)
+        )
     except BaseException:
         returncode = 70
     raise SystemExit(returncode)
@@ -1339,6 +1386,7 @@ class ProcessAgentRuntime:
         self._process: Any | None = None
         self._process_group_id: int | None = None
         self._connection: Any | None = None
+        self._parent_liveness_connection: Any | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._ready_future: asyncio.Future[dict[str, Any]] | None = None
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
@@ -1450,14 +1498,20 @@ class ProcessAgentRuntime:
             self._lost_error = None
 
             parent_connection = child_connection = None
+            child_liveness_connection = parent_liveness_connection = None
             inserted_path = False
             try:
                 parent_connection, child_connection = self._mp_context.Pipe(duplex=True)
+                (
+                    child_liveness_connection,
+                    parent_liveness_connection,
+                ) = self._mp_context.Pipe(duplex=False)
+                os.set_inheritable(parent_liveness_connection.fileno(), False)
                 config = self._child_config(generation)
                 target, module_directory, inserted_path = self._spawn_target()
                 process = self._mp_context.Process(
                     target=target,
-                    args=(child_connection, config),
+                    args=(child_connection, child_liveness_connection, config),
                     name=f"cow-agent-{self.agent_id}-g{generation}",
                     daemon=False,
                 )
@@ -1484,8 +1538,12 @@ class ProcessAgentRuntime:
                     finally:
                         main_module.__spec__ = original_spec
                 self._process = process
+                self._parent_liveness_connection = parent_liveness_connection
+                parent_liveness_connection = None
                 child_connection.close()
                 child_connection = None
+                child_liveness_connection.close()
+                child_liveness_connection = None
                 self._connection = parent_connection
                 parent_connection = None
                 self._ready_future = asyncio.get_running_loop().create_future()
@@ -1523,6 +1581,10 @@ class ProcessAgentRuntime:
                     parent_connection.close()
                 if child_connection is not None:
                     child_connection.close()
+                if child_liveness_connection is not None:
+                    child_liveness_connection.close()
+                if parent_liveness_connection is not None:
+                    parent_liveness_connection.close()
 
     def _spawn_target(self) -> tuple[Callable[..., Any], str, bool]:
         """Load this file by a package-free name for the spawn target."""
@@ -1541,11 +1603,15 @@ class ProcessAgentRuntime:
 
     def _child_config(self, generation: int) -> dict[str, Any]:
         parent_pid = os.getpid()
-        if not sys.platform.startswith("linux"):
+        if (
+            os.name != "posix"
+            or not hasattr(os, "setsid")
+            or not hasattr(os, "killpg")
+        ):
             raise ProcessAgentConfigurationError(
-                "process-isolated Agents currently require Linux"
+                "process-isolated Agents require POSIX process-group support"
             )
-        return {
+        config = {
             "agent_id": self.agent_id,
             "generation": generation,
             "model": self.model,
@@ -1560,8 +1626,10 @@ class ProcessAgentRuntime:
             "event_ack_timeout": self.event_ack_timeout,
             "max_message_bytes": self.max_message_bytes,
             "parent_pid": parent_pid,
-            "parent_start_time": _linux_process_start_time(parent_pid),
         }
+        if sys.platform.startswith("linux"):
+            config["parent_start_time"] = _linux_process_start_time(parent_pid)
+        return config
 
     async def run(self, task: Any, emit: Callable[[Any], Any] | None = None) -> Any:
         """Execute one immutable task in this Agent's persistent child.
@@ -1742,6 +1810,7 @@ class ProcessAgentRuntime:
         self._assert_loop()
         async with self._lifecycle_lock:
             if self._process is None:
+                self._close_parent_liveness_connection()
                 self._health = ProcessAgentHealth.STOPPED
                 self._release_budget()
                 return
@@ -1770,6 +1839,7 @@ class ProcessAgentRuntime:
                 raise ProcessAgentError(
                     f"Agent {self.agent_id} did not stop cleanly"
                 ) from exc
+            self._close_parent_liveness_connection()
             await self._close_parent_connection()
             reader = self._reader_task
             if reader is not None and reader is not asyncio.current_task():
@@ -2039,6 +2109,7 @@ class ProcessAgentRuntime:
             # timeouts after STOPPED had already arrived.
             return
         if cleanup_error is None:
+            self._close_parent_liveness_connection()
             self._release_budget()
         error = self._lost_exception(
             "Agent child process was lost"
@@ -2080,13 +2151,29 @@ class ProcessAgentRuntime:
                 loop.remove_reader(descriptor)
 
     @staticmethod
-    def _signal_group(group_id: int, signal_value: int) -> bool:
+    def _signal_group(
+        group_id: int,
+        signal_value: int,
+        *,
+        allow_darwin_zombie_leader: bool = False,
+    ) -> bool:
         try:
             os.killpg(group_id, signal_value)
             return True
         except ProcessLookupError:
             return False
-        except (PermissionError, OSError) as exc:
+        except PermissionError as exc:
+            # Darwin reports EPERM for a process group whose only remaining
+            # member is its unreaped zombie leader.  The caller permits this
+            # result only after the multiprocessing sentinel proved that exact
+            # leader exited; it then reaps the leader and proves the group
+            # empty again.  Live same-UID descendants remain signalable.
+            if sys.platform == "darwin" and allow_darwin_zombie_leader:
+                return False
+            raise ProcessAgentError(
+                f"cannot signal Agent process group {group_id}"
+            ) from exc
+        except OSError as exc:
             raise ProcessAgentError(
                 f"cannot signal Agent process group {group_id}"
             ) from exc
@@ -2098,7 +2185,21 @@ class ProcessAgentRuntime:
                 os.killpg(group_id, 0)
             except ProcessLookupError:
                 return
-            except (PermissionError, OSError) as exc:
+            except PermissionError as exc:
+                # A zombie-only group is temporarily EPERM on Darwin until its
+                # final member is reaped.  Retry boundedly; an inaccessible live
+                # group never becomes ESRCH and therefore still fails closed.
+                if sys.platform == "darwin":
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise ProcessAgentError(
+                            f"Agent process group {group_id} remains live"
+                        ) from exc
+                    await asyncio.sleep(0.02)
+                    continue
+                raise ProcessAgentError(
+                    f"cannot prove Agent process group {group_id} empty"
+                ) from exc
+            except OSError as exc:
                 raise ProcessAgentError(
                     f"cannot prove Agent process group {group_id} empty"
                 ) from exc
@@ -2155,7 +2256,11 @@ class ProcessAgentRuntime:
         # cannot be reused as an unrelated process-group ID. Kill any tool/SDK
         # descendants before reaping that identity.
         if group_id == pid and not already_reaped:
-            self._signal_group(group_id, signal.SIGKILL)
+            self._signal_group(
+                group_id,
+                signal.SIGKILL,
+                allow_darwin_zombie_leader=exited,
+            )
         await asyncio.to_thread(process.join, 0)
         if process.exitcode is None:
             raise ProcessAgentError(
@@ -2175,6 +2280,7 @@ class ProcessAgentRuntime:
         process = self._process
         if process is not None:
             await self._terminate_process(process)
+        self._close_parent_liveness_connection()
         reader = self._reader_task
         if reader is not None and reader is not asyncio.current_task():
             if not reader.done():
@@ -2203,6 +2309,7 @@ class ProcessAgentRuntime:
             # Even a reaped leader can have left descendants in its dedicated
             # group. Do not release capacity until that group is proven empty.
             await self._terminate_process(process)
+        self._close_parent_liveness_connection()
         reader = self._reader_task
         if reader is not None and reader is not asyncio.current_task():
             if not reader.done():
@@ -2219,6 +2326,13 @@ class ProcessAgentRuntime:
     async def _close_parent_connection(self) -> None:
         connection = self._connection
         self._connection = None
+        if connection is not None:
+            with contextlib.suppress(Exception):
+                connection.close()
+
+    def _close_parent_liveness_connection(self) -> None:
+        connection = self._parent_liveness_connection
+        self._parent_liveness_connection = None
         if connection is not None:
             with contextlib.suppress(Exception):
                 connection.close()

@@ -291,3 +291,72 @@ def test_restart_rejects_persisted_profile_removed_from_allowlist_without_leak(
             await second.stop()
 
     asyncio.run(scenario())
+
+
+def test_wildcard_allowlist_accepts_any_existing_safe_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        config_home = tmp_path / "codex-home"
+        _profile_file(config_home, "qwen", _QWEN_MODEL)
+        _profile_file(config_home, "other", "other-model")
+        monkeypatch.setenv("CODEX_HOME", str(config_home))
+        runtime = _ProfileRuntime()
+        manager = _manager(tmp_path / "runtime.sqlite", runtime, allowed=("*",))
+        await manager.start()
+        try:
+            assert await _route(
+                MVPCommandRouter(manager),
+                "/agent researcher qwen",
+                message_id="wildcard-qwen",
+            ) == "switched to Agent: researcher"
+            assert await _route(
+                MVPCommandRouter(manager),
+                "/agent untrusted other",
+                message_id="wildcard-other",
+            ) == "switched to Agent: untrusted"
+            assert set(runtime.factory_calls) == {
+                ("researcher", "qwen"),
+                ("untrusted", "other"),
+            }
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_wildcard_mixed_with_names_still_rejects_unsafe_and_missing_profiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        config_home = tmp_path / "codex-home"
+        _profile_file(config_home, "qwen", _QWEN_MODEL)
+        monkeypatch.setenv("CODEX_HOME", str(config_home))
+        runtime = _ProfileRuntime()
+        manager = _manager(
+            tmp_path / "runtime.sqlite",
+            runtime,
+            allowed=("qwen", "*"),
+        )
+        await manager.start()
+        try:
+            router = MVPCommandRouter(manager)
+            denied = await _route(
+                router, "/agent evil ../evil", message_id="wildcard-unsafe"
+            )
+            assert denied.startswith("cannot switch Agent:")
+            assert str(config_home) not in denied
+            assert _SENSITIVE_MARKER not in denied
+            assert manager.registry.registration("evil") is None
+
+            ghost = await _route(
+                router, "/agent ghost missing", message_id="wildcard-missing"
+            )
+            assert ghost.startswith("cannot switch Agent:")
+            assert str(config_home) not in ghost
+            assert manager.registry.registration("ghost") is None
+            assert runtime.factory_calls == []
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
