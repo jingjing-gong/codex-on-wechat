@@ -55,7 +55,11 @@ from .skills import (
     normalize_skill,
     normalize_skills,
 )
-from .store import QueueFullError, format_working_directory_response
+from .store import (
+    MAILBOX_OPERATOR_CANCEL_REASON,
+    QueueFullError,
+    format_working_directory_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -480,6 +484,7 @@ class TaskManager:
         self.reconcile_interval = normalized_reconcile_interval
         self._reconcile_stop = asyncio.Event()
         self._reconcile_task: asyncio.Task[None] | None = None
+        self._mailbox_cancel_handler: Any | None = None
 
     @property
     def workers(self) -> tuple[TaskWorker, ...]:
@@ -2168,6 +2173,44 @@ class TaskManager:
 
     request_retry = retry
     retry_task = retry
+
+    def set_mailbox_cancel_handler(self, handler: Any | None) -> None:
+        """Wire the separately owned mailbox supervisor cancellation hook."""
+
+        if handler is not None and not callable(handler):
+            raise TypeError("mailbox cancel handler must be callable")
+        self._mailbox_cancel_handler = handler
+
+    async def cancel_active_agent_mailbox(
+        self,
+        agent_id: str,
+        *,
+        reason: str = MAILBOX_OPERATOR_CANCEL_REASON,
+    ) -> bool:
+        """Cooperatively cancel and release one active Agent mailbox turn."""
+
+        self._assert_loop()
+        agent_value = str(agent_id or "").strip()
+        if not agent_value:
+            return False
+        cancel = self._mailbox_cancel_handler
+        if cancel is None:
+            cancel = (
+                getattr(self.store, "cancel_active_mailbox_invocation", None)
+                or getattr(self.store, "cancel_active_agent_mailbox", None)
+                or getattr(self.store, "cancel_active_mailbox", None)
+            )
+        if cancel is None:
+            return False
+        changed = bool(
+            await _call_compatible(cancel, agent_value, reason=reason)
+        )
+        if changed:
+            self.dispatcher.wake()
+        return changed
+
+    cancel_agent_mailbox = cancel_active_agent_mailbox
+    request_mailbox_cancel = cancel_active_agent_mailbox
 
     async def cancel(self, task_id: str) -> bool:
         self._assert_loop()
@@ -4885,6 +4928,7 @@ class TaskManager:
                     limit=limit,
                     present=present,
                     switch_only=switch_only,
+                    include_command_responses=False,
                 )
                 or ()
             )
@@ -4905,6 +4949,7 @@ class TaskManager:
                         session_id=session_id,
                         agent_id=active,
                         limit=remaining,
+                        include_command_responses=False,
                     )
                     or ()
                 )
@@ -4921,6 +4966,7 @@ class TaskManager:
                 agent_id=active,
                 unseen=True,
                 limit=remaining,
+                include_command_responses=False,
             )
             or ()
         )

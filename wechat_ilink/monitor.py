@@ -432,8 +432,8 @@ def _is_command_message(msg: WeixinMessage) -> bool:
 def _is_immediate_command_message(msg: WeixinMessage) -> bool:
     """Return whether a command may bypass the per-contact ordering lock.
 
-    Status/list/cancel are deliberately short control operations and may run
-    while a Codex turn is active. Agent/mode/notify switches, retry, and
+    Status/list/cancel/report are deliberately short control operations and
+    may run while a Codex turn is active. Agent/mode/notify switches, retry, and
     legacy session/model controls share the contact lock with ordinary
     messages so their snapshots are ordered.
     Unknown commands are locked as well; this keeps a later prompt from
@@ -444,6 +444,7 @@ def _is_immediate_command_message(msg: WeixinMessage) -> bool:
         "/status",
         "/tasks",
         "/cancel",
+        "/report",
         "/agents",
         "/models",
         "/modes",

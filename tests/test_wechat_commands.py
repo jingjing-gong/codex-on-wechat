@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timezone
+import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -19,6 +22,7 @@ from src.channels.wechat import (
     MVPCommandRouter,
     MVP_COMMANDS,
     MVP_COMMAND_NAMES,
+    WeChatGateway,
     _MAX_COMMAND_MARKDOWN,
     command_delivery_id,
 )
@@ -28,6 +32,14 @@ from src.runtime.sqlite_store import SQLiteStore
 from src.runtime.store import (
     WORKING_DIRECTORY_RESPONSE_MAX_CHARS,
     format_working_directory_response,
+)
+from wechat_ilink.types import (
+    ITEM_TYPE_TEXT,
+    MESSAGE_STATE_FINISH,
+    MESSAGE_TYPE_USER,
+    MessageItem,
+    TextItem,
+    WeixinMessage,
 )
 
 
@@ -85,6 +97,7 @@ def test_help_is_deterministic_markdown_with_one_command_per_line():
         "notify",
         "recv",
         "reset",
+        "report",
         "retry",
         "sh",
         "skills",
@@ -100,6 +113,7 @@ def test_help_is_deterministic_markdown_with_one_command_per_line():
     assert "`/model [<model-id> <effort|default>|effort <effort|default>]`" in COMMAND_HELP
     assert "`/retry <task-id>`" in COMMAND_HELP
     assert "`/cancel [task-id]`" in COMMAND_HELP
+    assert "`/report <message>`" in COMMAND_HELP
     assert "`/compact`" in COMMAND_HELP
     assert "`/cd [path]`" in COMMAND_HELP
     assert "`/agent [agent-id] [profile]`" in COMMAND_HELP
@@ -111,6 +125,38 @@ def test_help_is_deterministic_markdown_with_one_command_per_line():
     assert sum(1 for line in COMMAND_HELP.splitlines() if line.startswith("- `/model ")) == 1
     assert "`/recv`" in COMMAND_HELP
     assert not COMMAND_HELP.endswith("\n\n")
+
+
+def test_production_gateway_help_includes_report_command(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        await store.initialize()
+        try:
+            gateway = WeChatGateway(store, bot_id="bot")
+            outcome = await gateway.accept(
+                WeixinMessage(
+                    seq=1,
+                    message_id=1,
+                    from_user_id="user",
+                    to_user_id="bot",
+                    message_type=MESSAGE_TYPE_USER,
+                    message_state=MESSAGE_STATE_FINISH,
+                    context_token="context",
+                    item_list=[
+                        MessageItem(
+                            type=ITEM_TYPE_TEXT,
+                            text_item=TextItem(text="/help"),
+                        )
+                    ],
+                )
+            )
+
+            assert outcome is not None
+            assert "`/report <message>`" in outcome.command_response
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
 
 
 def test_system_command_rejects_missing_or_mismatched_raw_compatibility_input():
@@ -1229,6 +1275,7 @@ def test_command_arities_are_rejected_before_dispatch():
             "<effort|default>]"
         ),
         "/cancel task-1 extra": "usage: /cancel [task-id]",
+        "/report": "usage: /report <message>",
     }
 
     async def scenario() -> None:
@@ -1239,6 +1286,93 @@ def test_command_arities_are_rejected_before_dispatch():
             ) == usage
 
     asyncio.run(scenario())
+
+
+def test_report_logs_parseable_warning_and_acknowledges_when_idle(caplog):
+    report = "stalled turn\nstill polling  without truncation"
+
+    class Manager:
+        async def get_active_agent(self, **_kwargs) -> str:
+            return "spark-it"
+
+    async def scenario() -> None:
+        router = MVPCommandRouter(Manager())
+        assert await router.handle_command(
+            parse_command("/report"), _envelope("/report")
+        ) == "usage: /report <message>"
+        assert await router.handle_command(
+            parse_command("/report   \t"), _envelope("/report   \t")
+        ) == "usage: /report <message>"
+        assert await router.handle_command(
+            parse_command(f"/report {report}"),
+            _envelope(f"/report {report}", session_id="ops"),
+        ) == "report received"
+
+    caplog.set_level(logging.WARNING, logger="src.channels.wechat")
+    asyncio.run(scenario())
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "src.channels.wechat"
+        and record.getMessage().startswith("COW_OP_REPORT ")
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.WARNING
+    message = record.getMessage()
+    assert "\n" not in message
+    assert "COW_OP_REPORT" in caplog.text
+    payload = json.loads(message.removeprefix("COW_OP_REPORT "))
+    timestamp = datetime.fromisoformat(payload["ts"])
+    assert timestamp.tzinfo is not None
+    assert timestamp.utcoffset() == timezone.utc.utcoffset(timestamp)
+    assert payload == {
+        "ts": payload["ts"],
+        "agent_id": "spark-it",
+        "user": {
+            "external_user_id": "user",
+            "bot_id": "bot",
+        },
+        "task_id": None,
+        "session": "ops",
+        "conversation": "wechat:bot:user:ops:codex",
+        "report": report,
+    }
+
+
+def test_report_includes_resolvable_active_task(caplog):
+    class Manager:
+        async def get_active_agent(self, **_kwargs) -> str:
+            return "codex"
+
+        async def list_tasks(self, **_kwargs):
+            return [
+                {
+                    "task_id": "active-task",
+                    "agent_id": "codex",
+                    "status": "running",
+                }
+            ]
+
+    async def scenario() -> None:
+        assert await MVPCommandRouter(Manager()).handle_command(
+            parse_command("/report operator note"),
+            _envelope("/report operator note"),
+        ) == "report received"
+
+    caplog.set_level(logging.WARNING, logger="src.channels.wechat")
+    asyncio.run(scenario())
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "src.channels.wechat"
+        and record.getMessage().startswith("COW_OP_REPORT ")
+    ]
+    assert len(messages) == 1
+    assert json.loads(messages[0].split(" ", 1)[1])["task_id"] == (
+        "active-task"
+    )
 
 
 def test_cancel_accepts_explicit_id_and_selects_only_current_running_task():
@@ -1282,22 +1416,31 @@ def test_cancel_accepts_explicit_id_and_selects_only_current_running_task():
             self.calls.append(("cancel", task_id))
             return True
 
+        async def cancel_active_agent_mailbox(self, agent_id: str) -> bool:
+            self.calls.append(("cancel_mailbox", agent_id))
+            return True
+
     async def scenario() -> None:
         manager = Manager()
         router = MVPCommandRouter(manager)
         assert await router.handle_command(
             parse_command("/cancel explicit-task"),
             _envelope("/cancel explicit-task"),
-        ) == "cancel requested: explicit-task"
+        ) == (
+            "cancel requested: explicit-task; agent mailbox turn cancelled"
+        )
         assert await router.handle_command(
             parse_command("/cancel"), _envelope("/cancel")
-        ) == "cancel requested: current-task"
+        ) == (
+            "cancel requested: current-task; agent mailbox turn cancelled"
+        )
 
-        assert manager.calls[0:2] == [
+        assert manager.calls[0:3] == [
             ("get_task", "explicit-task"),
             ("cancel", "explicit-task"),
+            ("cancel_mailbox", "codex"),
         ]
-        assert manager.calls[2] == (
+        assert manager.calls[3] == (
             "list_tasks",
             {
                 "channel": "wechat",
@@ -1312,10 +1455,52 @@ def test_cancel_accepts_explicit_id_and_selects_only_current_running_task():
                 "newest_first": True,
             },
         )
-        assert manager.calls[3:] == [
+        assert manager.calls[4:] == [
             ("get_task", "current-task"),
             ("cancel", "current-task"),
+            ("cancel_mailbox", "codex"),
         ]
+
+    asyncio.run(scenario())
+
+
+def test_cancel_failure_does_not_cancel_agent_mailbox():
+    class Manager:
+        def __init__(self) -> None:
+            self.mailbox_calls: list[str] = []
+
+        async def get_active_agent(self, **_kwargs) -> str:
+            return "codex"
+
+        async def get_task(self, task_id: str):
+            return {
+                "task_id": task_id,
+                "agent_id": "codex",
+                "status": "running",
+                "reply_target": {
+                    "channel": "wechat",
+                    "bot_id": "bot",
+                    "external_user_id": "user",
+                    "session_id": "default",
+                },
+            }
+
+        async def cancel(self, _task_id: str, **_kwargs) -> bool:
+            return False
+
+        async def cancel_active_agent_mailbox(self, agent_id: str) -> bool:
+            self.mailbox_calls.append(agent_id)
+            return True
+
+    async def scenario() -> None:
+        manager = Manager()
+        response = await MVPCommandRouter(manager).handle_command(
+            parse_command("/cancel task-1"),
+            _envelope("/cancel task-1"),
+        )
+
+        assert response == "cannot cancel task task-1"
+        assert manager.mailbox_calls == []
 
     asyncio.run(scenario())
 

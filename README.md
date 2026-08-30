@@ -85,6 +85,7 @@ Send `/help` in WeChat for the authoritative list.
 | `/sh <command>` | Run a shell command in the current Agent's working directory, with a 30-second limit. |
 | `/status`, `/tasks [limit]` | Show active work or task history. |
 | `/cancel [task-id]` | Cancel a task, or the current running task when omitted. |
+| `/report <message>` | Record an operator report in the persistent bot log without starting Agent work. |
 | `/retry <task-id>` | Retry failed, orphaned, or interrupted work. |
 | `/agents`, `/agent [agent-id] [profile]` | List Agents or show/switch/create the current Agent, optionally selecting a named Codex config. |
 | `/delagent <agent-id>` | Retire a dynamically created Agent; immutable task and history records remain. |
@@ -95,8 +96,12 @@ Send `/help` in WeChat for the authoritative list.
 | `/model <model-id> <effort\|default>` | Set the model and supported reasoning effort. |
 | `/model effort <effort\|default>` | Change or clear only the effort override. |
 | `/notify [on\|off]` | Control background notifications for the current Agent. |
-| `/inbox [agent-id\|all]` | Show unseen background replies. |
+| `/inbox [agent-id\|all]` | Show unseen background replies, excluding command results. |
 | `/recv` | Receive replies deferred by WeChat's ten-message quota. |
+
+Operator reports are emitted as one warning line whose message starts with
+`COW_OP_REPORT ` followed by compact JSON. Watch recent logs with
+`./cow logs 500 | grep 'COW_OP_REPORT'`.
 
 Run `/models` before choosing efforts such as `max` or `ultra`; supported
 efforts depend on the selected model.
@@ -194,7 +199,7 @@ immutable tasks and history remain.
 - The bot sends a best-effort typing state when it receives a supported message.
 - Each WeChat text reply is at most 3,000 characters.
 - One received message permits at most ten reply sends. Use `/recv` for overflow.
-- `/inbox` shows unseen background items; it does not drain `/recv` overflow.
+- `/inbox` shows unseen background items, excluding command results; it does not drain `/recv` overflow.
 - `/ask` results use `sender: message` so the producing Agent is clear.
 - Tasks and pending deliveries survive a normal restart.
 

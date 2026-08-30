@@ -76,6 +76,7 @@ from .models import (
     ReplyTarget,
     UserDelivery,
     parse_command,
+    utc_now,
 )
 from src.runtime.media import (
     AttachmentError,
@@ -187,6 +188,11 @@ COMMAND_REGISTRY = (
                 "cancel",
                 "/cancel [task-id]",
                 "Cancel a task, or the current running task when omitted",
+            ),
+            CommandRegistryEntry(
+                "report",
+                "/report <message>",
+                "Record an operator report in the persistent log",
             ),
         ),
     ),
@@ -2172,6 +2178,16 @@ def _task_state(record: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _command_message(command: ChannelCommand) -> str:
+    """Return the untruncated text after a slash-command token."""
+
+    raw = str(command.raw or "").lstrip()
+    match = re.match(r"/\S+(?:\s+(.*))?\Z", raw, flags=re.DOTALL)
+    if match is not None:
+        return str(match.group(1) or "").strip()
+    return command.argument.strip()
+
+
 def _normalized_public_text(value: Any) -> str:
     """Flatten public text and remove invisible control obfuscation."""
 
@@ -3227,6 +3243,70 @@ class MVPCommandRouter:
         if name == "help":
             return COMMAND_HELP if not command.args else _command_usage(name)
 
+        if name == "report":
+            report = _command_message(command)
+            if not report:
+                return _command_usage(name)
+            task_id: str | None = None
+            try:
+                active_tasks = await _invoke_compatible(
+                    self.manager,
+                    ("list_tasks", "tasks", "get_tasks"),
+                    keyword={
+                        **scope,
+                        "states": (
+                            "claimed",
+                            "running",
+                            "cancel_requested",
+                        ),
+                        "limit": 1,
+                        "newest_first": True,
+                    },
+                )
+            except Exception:
+                active_tasks = ()
+                logger.debug(
+                    "active task lookup unavailable for operator report",
+                    exc_info=True,
+                )
+            for item in active_tasks or ():
+                if (
+                    _task_state(item)
+                    in {"claimed", "dispatching", "running", "cancel_requested"}
+                    and str(
+                        _value(item, "agent_id", default=active_agent)
+                        or active_agent
+                    )
+                    == active_agent
+                ):
+                    task_id = _task_id(item) or None
+                    break
+            payload = {
+                "ts": utc_now(),
+                "agent_id": active_agent,
+                "user": {
+                    "external_user_id": envelope.external_user_id,
+                    "bot_id": envelope.bot_id,
+                },
+                "task_id": task_id,
+                "session": envelope.session_id or DEFAULT_SESSION_ID,
+                "conversation": str(
+                    route_scope.get("conversation_id")
+                    or envelope.conversation_id
+                    or ""
+                ),
+                "report": report,
+            }
+            logger.warning(
+                "COW_OP_REPORT %s",
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+            return "report received"
+
         if name in {"skills", "listskill", "listskills"}:
             if command.args:
                 return _command_usage(name)
@@ -4049,7 +4129,13 @@ class MVPCommandRouter:
                     result = await _invoke_compatible(
                         self.manager,
                         ("inbox", "present_inbox", "present_notifications"),
-                        keyword={**scope, "agent_id": agent_id, "limit": 100, "present": False},
+                        keyword={
+                            **scope,
+                            "agent_id": agent_id,
+                            "limit": 100,
+                            "present": False,
+                            "include_command_responses": False,
+                        },
                     )
                 except AttributeError:
                     result = []
@@ -4199,6 +4285,7 @@ class MVPCommandRouter:
         # Authorization is performed before invoking a control operation when
         # the facade exposes a public task lookup.  Missing/foreign tasks use
         # the same response to avoid leaking existence across users.
+        record = None
         getter = getattr(self.manager, "get_task", None)
         if getter is not None:
             try:
@@ -4257,7 +4344,42 @@ class MVPCommandRouter:
             "cancel": "cancel requested",
         }[name]
         if changed:
-            return f"{verb}: {task_id}"
+            acknowledgement = f"{verb}: {task_id}"
+            if name == "cancel" and record is not None:
+                task_agent_id = str(
+                    _value(record, "agent_id", default="") or ""
+                ).strip()
+                task_state = _task_state(record)
+                if (
+                    task_agent_id
+                    and task_state
+                    in ACTIVE_TASK_STATES | {"dispatching"}
+                ):
+                    try:
+                        mailbox_cancelled = bool(
+                            await _invoke_compatible(
+                                self.manager,
+                                (
+                                    "cancel_active_agent_mailbox",
+                                    "cancel_agent_mailbox",
+                                    "request_mailbox_cancel",
+                                ),
+                                positional=(task_agent_id,),
+                            )
+                        )
+                    except AttributeError:
+                        mailbox_cancelled = False
+                    except Exception:
+                        mailbox_cancelled = False
+                        logger.warning(
+                            "mailbox cancellation failed after task %s "
+                            "was cancelled",
+                            task_id,
+                            exc_info=True,
+                        )
+                    if mailbox_cancelled:
+                        acknowledgement += "; agent mailbox turn cancelled"
+            return acknowledgement
         return f"cannot {name} task {task_id}"
 
 

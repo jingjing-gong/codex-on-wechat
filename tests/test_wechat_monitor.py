@@ -95,6 +95,7 @@ def test_only_public_read_and_cancel_commands_bypass_contact_ordering():
         "/tasks 5",
         "/cancel",
         "/cancel task-1",
+        "/report stalled turn",
         "/agents",
         "/models",
         "/modes",

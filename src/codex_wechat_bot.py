@@ -110,6 +110,7 @@ KNOWN_COMMANDS = [
     "/tasks",
     "/retry",
     "/cancel",
+    "/report",
     "/recv",
     "/model",
     "/models",
@@ -136,6 +137,7 @@ HELP_TEXT = """## Commands
 - `/tasks [limit]` - List durable tasks
 - `/retry <task_id>` - Explicitly retry a failed or orphaned task
 - `/cancel [task_id]` - Cancel a task, or the current running task when omitted
+- `/report <message>` - Record an operator report in the persistent log
 
 -### Models And Sessions
 - `/model [<model-id> <effort|default>|effort <effort|default>]` - Show or set the model and reasoning effort
@@ -1813,6 +1815,9 @@ def _run_owned_durable(
                 store,
                 manager.registry,
                 reply_handler=reply_mailbox,
+            )
+            manager.set_mailbox_cancel_handler(
+                mailbox_supervisor.request_cancel
             )
         except BaseException:
             # ``TaskManager.start`` rolls back workers, but a failure during

@@ -21,6 +21,7 @@ from typing import Any, Protocol, runtime_checkable
 
 WORKING_DIRECTORY_RESPONSE_PREFIX = "working directory: "
 WORKING_DIRECTORY_RESPONSE_MAX_CHARS = 512
+MAILBOX_OPERATOR_CANCEL_REASON = "cancelled by operator /cancel"
 
 
 def format_working_directory_response(path: Any) -> str:
@@ -259,6 +260,10 @@ class DurableStore(Protocol):
         self, mailbox_id: str, claim_token: str, **kwargs: Any
     ) -> bool: ...
 
+    async def cancel_active_mailbox_invocation(
+        self, agent_id: str, **kwargs: Any
+    ) -> bool: ...
+
     async def create_agent_message(self, **kwargs: Any) -> Any: ...
 
     async def review_mailbox_orphan(
@@ -341,6 +346,7 @@ RuntimeStore = DurableStore
 __all__ = [
     "DurableStore",
     "InvalidTransition",
+    "MAILBOX_OPERATOR_CANCEL_REASON",
     "NotFoundError",
     "QueueFullError",
     "RuntimeStore",

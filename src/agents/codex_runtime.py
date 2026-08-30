@@ -2154,7 +2154,11 @@ class CodexRuntime:
                 and context_settings is None
             ):
                 raise RuntimeError(
-                    "model-specific context metadata is unavailable for the new model"
+                    "model-specific context metadata is unavailable for the new "
+                    f"model '{model_id}' under the current provider; the "
+                    "requested model may be served by a different provider. "
+                    "Clear the conversation and select a model available for "
+                    "this agent before retrying"
                 )
             context_changed = bool(
                 existing.provider_id != provider_id

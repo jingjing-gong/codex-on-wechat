@@ -37,6 +37,7 @@ from .maintenance_authority import (
 )
 from .store import (
     InvalidTransition,
+    MAILBOX_OPERATOR_CANCEL_REASON,
     NotFoundError,
     QueueFullError,
     StoreError,
@@ -23736,6 +23737,7 @@ class SQLiteStore:
         unseen: bool | None = None,
         limit: int = 100,
         include_silent: bool = True,
+        include_command_responses: bool = True,
     ) -> list[UserOutboxItem]:
         filters: list[str] = []
         params: list[Any] = []
@@ -23758,6 +23760,14 @@ class SQLiteStore:
             filters.append("presentation <> 'unseen'")
         if not include_silent:
             filters.append("priority > 0")
+        if not include_command_responses:
+            filters.append(
+                "outbox_id NOT LIKE 'command:%' AND NOT EXISTS ("
+                "SELECT 1 FROM reply_candidates AS candidate "
+                "WHERE candidate.reply_candidate_id="
+                "user_outbox.reply_candidate_id "
+                "AND candidate.source_key LIKE 'outbox:command:%')"
+            )
         where = " WHERE " + " AND ".join(filters) if filters else ""
         params.append(max(0, int(limit)))
         def op(conn: sqlite3.Connection) -> list[UserOutboxItem]:
@@ -25337,6 +25347,7 @@ class SQLiteStore:
         limit: int = 100,
         present: bool = True,
         switch_only: bool = False,
+        include_command_responses: bool = True,
     ) -> list[ReplyCandidateRecord]:
         """Select completed items retained exclusively for explicit inbox use.
 
@@ -25345,6 +25356,7 @@ class SQLiteStore:
         and quota-deferred output (which belongs solely to ``/recv``).
         ``switch_only`` additionally selects the immutable background class
         captured while another Agent owned the front route.
+        Command responses can be excluded by their durable source namespace.
         """
 
         def op(conn: sqlite3.Connection) -> list[ReplyCandidateRecord]:
@@ -25372,6 +25384,8 @@ class SQLiteStore:
                 ]
                 if switch_only:
                     filters.append("c.foreground=0")
+                if not include_command_responses:
+                    filters.append("c.source_key NOT LIKE 'outbox:command:%'")
                 params.append(max(0, int(limit)))
                 rows = conn.execute(
                     "SELECT c.* FROM reply_candidates AS c WHERE "
@@ -25416,6 +25430,7 @@ class SQLiteStore:
         agent_id: str,
         limit: int = 100,
         present: bool = True,
+        include_command_responses: bool = True,
     ) -> list[UserOutboxItem]:
         """Return unseen records, optionally marking them presented.
 
@@ -25427,12 +25442,34 @@ class SQLiteStore:
         """
         def op(conn: sqlite3.Connection) -> list[UserOutboxItem]:
             with _transaction(conn):
+                filters = [
+                    "channel=?",
+                    "bot_id=?",
+                    "external_user_id=?",
+                    "session_id=?",
+                    "agent_id=?",
+                    "presentation='unseen'",
+                ]
+                if not include_command_responses:
+                    filters.append(
+                        "outbox_id NOT LIKE 'command:%' AND NOT EXISTS ("
+                        "SELECT 1 FROM reply_candidates AS candidate "
+                        "WHERE candidate.reply_candidate_id="
+                        "user_outbox.reply_candidate_id "
+                        "AND candidate.source_key LIKE 'outbox:command:%')"
+                    )
                 rows = conn.execute(
-                    """SELECT * FROM user_outbox WHERE channel=? AND bot_id=?
-                       AND external_user_id=? AND session_id=? AND agent_id=?
-                       AND presentation='unseen'
-                       ORDER BY priority DESC, created_at ASC, outbox_id ASC LIMIT ?""",
-                    (channel, bot_id, external_user_id, session_id, agent_id, max(0, int(limit))),
+                    "SELECT * FROM user_outbox WHERE "
+                    + " AND ".join(filters)
+                    + " ORDER BY priority DESC, created_at ASC, outbox_id ASC LIMIT ?",
+                    (
+                        channel,
+                        bot_id,
+                        external_user_id,
+                        session_id,
+                        agent_id,
+                        max(0, int(limit)),
+                    ),
                 ).fetchall()
                 ids = [row["outbox_id"] for row in rows]
                 if ids and present:
@@ -26202,6 +26239,91 @@ class SQLiteStore:
 
     renew_agent_mailbox_lease = renew_mailbox_lease
     extend_mailbox_lease = renew_mailbox_lease
+
+    async def cancel_active_mailbox_invocation(
+        self,
+        agent_id: str,
+        *,
+        reason: str = MAILBOX_OPERATOR_CANCEL_REASON,
+        now: datetime | str | None = None,
+    ) -> bool:
+        """Reject and release one active mailbox claim for an Agent."""
+
+        agent_value = str(agent_id or "").strip()
+        if not agent_value:
+            return False
+        reason_value = str(reason or MAILBOX_OPERATOR_CANCEL_REASON)
+
+        def op(conn: sqlite3.Connection) -> bool:
+            with _transaction(conn):
+                now_text = self._now(now)
+                row = conn.execute(
+                    """SELECT mailbox.mailbox_id,
+                              mailbox.current_invocation_id
+                         FROM agent_mailbox AS mailbox
+                         JOIN agent_invocations AS invocation
+                           ON invocation.invocation_id=
+                              mailbox.current_invocation_id
+                          AND invocation.work_kind='mailbox'
+                          AND invocation.work_id=mailbox.message_id
+                          AND invocation.mailbox_id=mailbox.mailbox_id
+                          AND invocation.agent_id=
+                              mailbox.destination_agent_id
+                          AND invocation.agent_incarnation=
+                              mailbox.destination_agent_incarnation
+                         JOIN agent_lifecycle AS lifecycle
+                           ON lifecycle.agent_id=
+                              mailbox.destination_agent_id
+                          AND lifecycle.agent_incarnation=
+                              mailbox.destination_agent_incarnation
+                        WHERE mailbox.destination_agent_id=?
+                          AND lifecycle.lifecycle_state='enabled'
+                          AND mailbox.state IN ('dispatching','processing')
+                          AND invocation.state IN
+                              ('dispatching','running','cancel_requested')
+                          AND invocation.admission_released_at IS NULL
+                        ORDER BY invocation.ready_sequence,
+                                 invocation.invocation_id
+                        LIMIT 1""",
+                    (agent_value,),
+                ).fetchone()
+                if row is None:
+                    return False
+                changed = conn.execute(
+                    """UPDATE agent_mailbox
+                          SET state='rejected',last_error=?,processed_at=?,
+                              next_attempt_at=NULL,claimed_by=NULL,
+                              claim_token=NULL,lease_expires_at=NULL
+                        WHERE mailbox_id=?
+                          AND current_invocation_id=?
+                          AND state IN ('dispatching','processing')""",
+                    (
+                        reason_value,
+                        now_text,
+                        row["mailbox_id"],
+                        row["current_invocation_id"],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise StoreError(
+                        "active mailbox cancellation lost its aggregate fence"
+                    )
+                if not self._release_invocation_tx(
+                    conn,
+                    invocation_id=str(row["current_invocation_id"]),
+                    state=InvocationState.CANCELLED.value,
+                    now=now_text,
+                    last_error=reason_value,
+                ):
+                    raise StoreError(
+                        "active mailbox invocation was already released"
+                    )
+                return True
+
+        return await self._call(op)
+
+    cancel_active_agent_mailbox = cancel_active_mailbox_invocation
+    cancel_active_mailbox = cancel_active_mailbox_invocation
 
     async def mark_mailbox_processed(self, mailbox_id: str, claim_token: str | None = None, *, now: datetime | str | None = None) -> bool:
         if not claim_token:

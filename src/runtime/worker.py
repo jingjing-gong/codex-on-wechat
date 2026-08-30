@@ -25,6 +25,7 @@ from src.agents.base import (
 from .dispatcher import SQLiteDispatcher, _call_compatible
 from .diagnostics import log_task_started, log_task_terminal
 from .identity import mailbox_conversation_id
+from .store import MAILBOX_OPERATOR_CANCEL_REASON
 
 logger = logging.getLogger(__name__)
 
@@ -1315,6 +1316,39 @@ class AgentMailboxWorker:
                 return runtime
         raise KeyError(f"unknown Agent runtime: {self.destination_agent_id}")
 
+    def _signal_claim_loss(self, mailbox_id: str) -> None:
+        self._lost_mailbox_claims.add(mailbox_id)
+        claim_lost = self._mailbox_claim_loss_events.get(mailbox_id)
+        if claim_lost is not None:
+            claim_lost.set()
+
+    async def request_cancel(
+        self, *, reason: str = MAILBOX_OPERATOR_CANCEL_REASON
+    ) -> bool:
+        """Cancel this Agent's in-flight mailbox turn and durable claim."""
+
+        self._assert_loop()
+        cancel = (
+            getattr(self.store, "cancel_active_mailbox_invocation", None)
+            or getattr(self.store, "cancel_active_agent_mailbox", None)
+            or getattr(self.store, "cancel_active_mailbox", None)
+        )
+        if cancel is None:
+            raise AttributeError(
+                "store must implement cancel_active_mailbox_invocation()"
+            )
+        for mailbox_id in tuple(self._mailbox_claim_loss_events):
+            self._signal_claim_loss(mailbox_id)
+        return bool(
+            await _call_compatible(
+                cancel,
+                self.destination_agent_id,
+                reason=reason,
+            )
+        )
+
+    cancel_active_mailbox = request_cancel
+
     async def run_once(self) -> int:
         self._assert_loop()
         claim_method = getattr(self.store, "claim_mailbox", None) or getattr(
@@ -1367,19 +1401,26 @@ class AgentMailboxWorker:
             )
             if not mailbox_id:
                 continue
-            mark_processing = getattr(self.store, "mark_mailbox_processing", None)
-            if mark_processing is not None:
-                changed = await _call_compatible(mark_processing, mailbox_id, claim_token=token)
-                if changed is False:
-                    continue
             claim_lost = asyncio.Event()
             self._mailbox_claim_loss_events[mailbox_id] = claim_lost
-            heartbeat = self._start_lease_heartbeat(
-                mailbox_id,
-                token,
-                lease_deadline=claim_started + self.lease_seconds,
-            )
+            heartbeat: asyncio.Task[None] | None = None
             try:
+                mark_processing = getattr(
+                    self.store, "mark_mailbox_processing", None
+                )
+                if mark_processing is not None:
+                    changed = await _call_compatible(
+                        mark_processing, mailbox_id, claim_token=token
+                    )
+                    if changed is False:
+                        continue
+                if claim_lost.is_set():
+                    continue
+                heartbeat = self._start_lease_heartbeat(
+                    mailbox_id,
+                    token,
+                    lease_deadline=claim_started + self.lease_seconds,
+                )
                 processed += await self._process_claimed_item(
                     item,
                     mailbox_id=mailbox_id,
@@ -1549,10 +1590,7 @@ class AgentMailboxWorker:
             nonlocal confirmed_until
 
             def lose_ownership() -> None:
-                self._lost_mailbox_claims.add(mailbox_id)
-                claim_lost = self._mailbox_claim_loss_events.get(mailbox_id)
-                if claim_lost is not None:
-                    claim_lost.set()
+                self._signal_claim_loss(mailbox_id)
                 logger.warning("mailbox lease ownership lost for %s", mailbox_id)
 
             try:
@@ -1956,6 +1994,57 @@ class AgentMailboxSupervisor:
                 return
         self._assert_loop()
         self._stop.set()
+
+    async def _request_cancel_owned(
+        self, agent_id: str, *, reason: str
+    ) -> bool:
+        self._assert_loop()
+        agent_value = str(agent_id or "").strip()
+        if not agent_value:
+            return False
+        worker = self._workers.get(agent_value)
+        if worker is not None:
+            return await worker.request_cancel(reason=reason)
+        cancel = (
+            getattr(self.store, "cancel_active_mailbox_invocation", None)
+            or getattr(self.store, "cancel_active_agent_mailbox", None)
+            or getattr(self.store, "cancel_active_mailbox", None)
+        )
+        if cancel is None:
+            raise AttributeError(
+                "store must implement cancel_active_mailbox_invocation()"
+            )
+        return bool(
+            await _call_compatible(cancel, agent_value, reason=reason)
+        )
+
+    async def request_cancel(
+        self,
+        agent_id: str,
+        *,
+        reason: str = MAILBOX_OPERATOR_CANCEL_REASON,
+    ) -> bool:
+        """Cancel one Agent mailbox turn on the supervisor's owning loop."""
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        owner_loop = self._owner_loop
+        if owner_loop is not None and owner_loop is not loop:
+            if not owner_loop.is_running():
+                raise RuntimeError(
+                    "AgentMailboxSupervisor event loop is not running"
+                )
+            future = asyncio.run_coroutine_threadsafe(
+                self._request_cancel_owned(agent_id, reason=reason),
+                owner_loop,
+            )
+            return bool(await asyncio.wrap_future(future))
+        return await self._request_cancel_owned(agent_id, reason=reason)
+
+    cancel_active_agent_mailbox = request_cancel
+    cancel_active_mailbox = request_cancel
 
     async def _agent_ids(self) -> set[str]:
         listing = (

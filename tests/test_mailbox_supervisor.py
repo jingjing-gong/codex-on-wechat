@@ -130,3 +130,46 @@ def test_mailbox_supervisor_bounds_shutdown_of_stuck_runtime(tmp_path):
             await manager.stop()
 
     asyncio.run(scenario())
+
+
+def test_mailbox_supervisor_schedules_cancel_on_its_owner_loop():
+    class Store:
+        def __init__(self) -> None:
+            self.cancel_loops = []
+
+        async def cancel_active_mailbox_invocation(
+            self, agent_id: str, **_kwargs
+        ) -> bool:
+            assert agent_id == "codex"
+            self.cancel_loops.append(asyncio.get_running_loop())
+            return True
+
+    class Registry:
+        def list(self):
+            return []
+
+    async def scenario() -> None:
+        store = Store()
+        supervisor = AgentMailboxSupervisor(
+            store, Registry(), poll_interval=0.01
+        )
+        running = asyncio.create_task(supervisor.run())
+        try:
+            for _ in range(100):
+                if supervisor._owner_loop is not None:
+                    break
+                await asyncio.sleep(0.01)
+            owner_loop = asyncio.get_running_loop()
+            assert supervisor._owner_loop is owner_loop
+
+            changed = await asyncio.to_thread(
+                lambda: asyncio.run(supervisor.request_cancel("codex"))
+            )
+
+            assert changed
+            assert store.cancel_loops == [owner_loop]
+        finally:
+            supervisor.stop()
+            await asyncio.wait_for(running, timeout=1)
+
+    asyncio.run(scenario())

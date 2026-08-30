@@ -225,6 +225,34 @@ def test_missing_new_model_metadata_cannot_reuse_old_model_context_override():
     asyncio.run(scenario())
 
 
+def test_missing_new_model_metadata_error_names_model_and_is_actionable():
+    async def scenario() -> None:
+        resolver = _Resolver(_settings())
+        codex = _Codex()
+        runtime = CodexRuntime(
+            codex=codex,
+            cwd="/workspace",
+            model_context_resolver=resolver,
+        )
+        await runtime.start()
+        await runtime._binding_for(_task())
+
+        resolver.settings = ModelContextResolutionError("generic unavailable")
+        with pytest.raises(
+            RuntimeError,
+            match="unavailable for the new model 'model-b'",
+        ) as excinfo:
+            await runtime._binding_for(
+                _task(task_id="task-b", model="model-b")
+            )
+        message = str(excinfo.value)
+        assert "Clear the conversation" in message
+        assert len(codex.thread_resume_calls) == 0
+        assert len(codex.thread_start_calls) == 1
+
+    asyncio.run(scenario())
+
+
 def test_public_config_reader_is_scoped_to_the_task_workspace():
     class ConfigCodex(_Codex):
         def __init__(self) -> None:
