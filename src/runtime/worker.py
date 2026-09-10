@@ -104,6 +104,11 @@ class TaskWorker:
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._active: dict[str, tuple[Any, AgentTask]] = {}
         self._heartbeat_tasks: dict[str, asyncio.Task[None]] = {}
+        # Steering delivery is durable in the store, while these Events are a
+        # loop-local latency optimization.  A missed notification is harmless:
+        # every active pump polls until its runtime call returns.
+        self._steering_wakeups: dict[str, asyncio.Event] = {}
+        self._steering_pumps: dict[str, asyncio.Task[None]] = {}
         self._runtime_active: set[str] = set()
         self._lost_task_claims: set[str] = set()
         self.completed_count = 0
@@ -145,6 +150,9 @@ class TaskWorker:
                 await self.interrupt(task_id)
             except Exception:
                 logger.debug("failed to interrupt task during worker shutdown", exc_info=True)
+            wake = self._steering_wakeups.get(task_id)
+            if wake is not None:
+                wake.set()
         task, self._task = self._task, None
         if task is not None:
             done: set[asyncio.Task[None]] = set()
@@ -371,6 +379,13 @@ class TaskWorker:
                             )
                     return True
                 self._runtime_active.add(task_id)
+                steering_stop = asyncio.Event()
+                steering_pump = self._start_steering_pump(
+                    runtime,
+                    task,
+                    claim_token=claim_token,
+                    stop_event=steering_stop,
+                )
                 try:
                     try:
                         result = await runtime.run(task, emit)
@@ -397,6 +412,23 @@ class TaskWorker:
                             events=tuple(events),
                         )
                 finally:
+                    # Stop accepting new delivery attempts before the terminal
+                    # store transaction.  That transaction is responsible for
+                    # promoting any still-pending input when the native turn
+                    # ended just before it could accept steering.
+                    steering_stop.set()
+                    wake = self._steering_wakeups.get(task_id)
+                    if wake is not None:
+                        wake.set()
+                    if steering_pump is not None:
+                        try:
+                            await steering_pump
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "task steering pump failed for %s", task_id
+                            )
                     self._runtime_active.discard(task_id)
                 # A token can remain on the row briefly after its lease has
                 # expired.  Once ownership is lost or can no longer be
@@ -507,6 +539,8 @@ class TaskWorker:
                     except asyncio.CancelledError:
                         pass
                 self._active.pop(task_id, None)
+                self._steering_wakeups.pop(task_id, None)
+                self._steering_pumps.pop(task_id, None)
                 self._runtime_active.discard(task_id)
                 self._lost_task_claims.discard(task_id)
         return True
@@ -523,6 +557,173 @@ class TaskWorker:
         _, task = active
         runtime = self._runtime_for(task.agent_id)
         return bool(await runtime.interrupt(str(task_id)))
+
+    def notify_steering(self, task_id: str) -> None:
+        """Wake the delivery pump for one active task, if this worker owns it."""
+
+        self._assert_loop()
+        wake = self._steering_wakeups.get(str(task_id))
+        if wake is not None:
+            wake.set()
+
+    def _start_steering_pump(
+        self,
+        runtime: Any,
+        task: AgentTask,
+        *,
+        claim_token: str | None,
+        stop_event: asyncio.Event,
+    ) -> asyncio.Task[None] | None:
+        """Deliver durable steering rows to the exact live runtime in order."""
+
+        claim = getattr(self.store, "claim_next_task_steering", None)
+        steer = getattr(runtime, "steer", None)
+        if claim is None or not callable(steer) or not claim_token or not task.execution_id:
+            return None
+        task_id = str(task.task_id)
+        wake = self._steering_wakeups.setdefault(task_id, asyncio.Event())
+        pump = asyncio.create_task(
+            self._pump_steering(
+                runtime,
+                task,
+                claim_token=str(claim_token),
+                stop_event=stop_event,
+                wake=wake,
+            ),
+            name=f"task-steering:{task_id}",
+        )
+        self._steering_pumps[task_id] = pump
+        return pump
+
+    async def _pump_steering(
+        self,
+        runtime: Any,
+        task: AgentTask,
+        *,
+        claim_token: str,
+        stop_event: asyncio.Event,
+        wake: asyncio.Event,
+    ) -> None:
+        """Claim and acknowledge steering without ever replaying uncertainty."""
+
+        task_id = str(task.task_id)
+        execution_id = str(task.execution_id or "")
+        claim_method = getattr(self.store, "claim_next_task_steering", None)
+        applied_method = getattr(self.store, "mark_task_steering_applied", None)
+        release_method = getattr(self.store, "release_task_steering", None)
+        if claim_method is None or applied_method is None or release_method is None:
+            return
+
+        # Let runtime.run enter its assignment/startup path first.  Both the
+        # in-process Codex adapter and the process proxy can then latch input
+        # during the short pre-native-handle window.
+        await asyncio.sleep(0)
+        while not stop_event.is_set() and task_id not in self._lost_task_claims:
+            # Clear before looking in SQLite.  A notification racing the query
+            # remains set and causes an immediate follow-up pass.
+            wake.clear()
+            steering = await _call_compatible(
+                claim_method,
+                task_id,
+                execution_id,
+                task_claim_token=claim_token,
+                claimed_by=self.worker_id,
+                lease_seconds=self.lease_seconds,
+            )
+            if steering is None:
+                await self._wait_for_steering(wake, stop_event)
+                continue
+
+            steering_id = str(_field(steering, "steering_id", "") or "")
+            delivery_token = str(_field(steering, "claim_token", "") or "")
+            if not steering_id or not delivery_token:
+                raise RuntimeError("claimed task steering has no durable identity")
+            inputs = _field(steering, "inputs", {})
+            sequence = _field(steering, "sequence", None)
+            try:
+                accepted = bool(
+                    await _call_compatible(
+                        runtime.steer,
+                        task_id,
+                        inputs,
+                        steering_id=steering_id,
+                        execution_id=execution_id,
+                        sequence=sequence,
+                    )
+                )
+            except asyncio.CancelledError:
+                # Cancellation can happen after the runner accepted the input.
+                # Mark the delivery as unknown so neither restart recovery nor
+                # terminal promotion can execute it a second time.
+                try:
+                    await _call_compatible(
+                        release_method,
+                        steering_id,
+                        claim_token=delivery_token,
+                        delivery_unknown=True,
+                    )
+                except Exception:
+                    logger.exception(
+                        "could not fence cancelled steering delivery %s",
+                        steering_id,
+                    )
+                raise
+            except Exception as exc:
+                uncertain = bool(getattr(exc, "execution_uncertain", False))
+                await _call_compatible(
+                    release_method,
+                    steering_id,
+                    claim_token=delivery_token,
+                    delivery_unknown=uncertain,
+                )
+                if uncertain:
+                    logger.error(
+                        "task steering delivery became uncertain for %s",
+                        steering_id,
+                    )
+                    return
+                logger.debug(
+                    "runtime did not accept steering %s yet",
+                    steering_id,
+                    exc_info=True,
+                )
+                await self._wait_for_steering(wake, stop_event)
+                continue
+
+            if accepted:
+                await _call_compatible(
+                    applied_method,
+                    steering_id,
+                    claim_token=delivery_token,
+                )
+                # Drain the next durable ordinal immediately.
+                continue
+
+            # ``False`` is a proven not-active boundary, not an acknowledgement.
+            # Put the row back so a task waiting for the Agent process slot can
+            # retry; if the turn has really ended, complete_task promotes it.
+            await _call_compatible(
+                release_method,
+                steering_id,
+                claim_token=delivery_token,
+                delivery_unknown=False,
+            )
+            await self._wait_for_steering(wake, stop_event)
+
+    async def _wait_for_steering(
+        self,
+        wake: asyncio.Event,
+        stop_event: asyncio.Event,
+    ) -> None:
+        if stop_event.is_set():
+            return
+        try:
+            await asyncio.wait_for(
+                wake.wait(),
+                timeout=min(0.1, max(0.01, float(self.poll_interval))),
+            )
+        except asyncio.TimeoutError:
+            pass
 
     def active_tasks(self) -> tuple[str, ...]:
         self._assert_loop()
@@ -585,7 +786,22 @@ class TaskWorker:
         if target is not None and not hasattr(target, "as_dict"):
             target_data = {
                 name: getattr(target, name, None)
-                for name in ("channel", "bot_id", "external_user_id", "session_id", "source_message_id", "source_sequence", "context_token")
+                for name in (
+                    "channel",
+                    "bot_id",
+                    "external_user_id",
+                    "session_id",
+                    "source_message_id",
+                    "source_sequence",
+                    "context_token",
+                    "conversation_subject_id",
+                    "conversation_subject_scope",
+                    "destination_kind",
+                    "destination_id",
+                    "thread_id",
+                    "root_message_id",
+                    "transport_metadata",
+                )
             }
             from src.agents.base import ReplyTarget
 

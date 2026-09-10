@@ -1,4 +1,4 @@
-"""Small client for the local task-scoped Agent collaboration bridge."""
+"""Small client for task-scoped Agent collaboration and cron drafts."""
 
 from __future__ import annotations
 
@@ -25,7 +25,9 @@ class AgentCLIError(RuntimeError):
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.agent_cli",
-        description="List or message Agents authorized for the current task.",
+        description=(
+            "Use task-scoped Agent collaboration and cron-draft operations."
+        ),
     )
     parser.add_argument(
         "--socket",
@@ -54,6 +56,36 @@ def _parser() -> argparse.ArgumentParser:
     sending.add_argument("content", nargs="+")
     sending.add_argument("--request-type", default="ask")
     sending.add_argument("--request-id", default="")
+
+    cron = commands.add_parser(
+        "cron",
+        help="propose, confirm, cancel, or inspect a natural-language cron draft",
+    )
+    cron_commands = cron.add_subparsers(dest="cron_command", required=True)
+
+    proposing = cron_commands.add_parser(
+        "propose",
+        help="validate and save a draft without creating a cron job",
+    )
+    proposing.add_argument("--schedule", required=True)
+    proposing.add_argument("--prompt", required=True)
+
+    confirming = cron_commands.add_parser(
+        "confirm",
+        help="confirm a draft after a later explicit user confirmation",
+    )
+    confirming.add_argument("draft_id", nargs="?", default="")
+
+    cancelling = cron_commands.add_parser(
+        "cancel",
+        help="cancel a draft after a later explicit user cancellation",
+    )
+    cancelling.add_argument("draft_id", nargs="?", default="")
+
+    cron_commands.add_parser(
+        "pending",
+        help="list pending drafts owned by this task's exact conversation origin",
+    )
     return parser
 
 
@@ -147,7 +179,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "capability": capability,
                 "request_type": args.request_type,
             }
-        else:
+        elif args.command == "send":
             content = " ".join(args.content)
             request = {
                 "operation": "send",
@@ -163,6 +195,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                     request_type=args.request_type,
                     content=content,
                 ),
+            }
+        elif args.cron_command == "propose":
+            request = {
+                "operation": "cron_propose",
+                "task_id": task_id,
+                "capability": capability,
+                "schedule": args.schedule,
+                "prompt": args.prompt,
+            }
+        elif args.cron_command == "confirm":
+            request = {
+                "operation": "cron_confirm",
+                "task_id": task_id,
+                "capability": capability,
+                "draft_id": args.draft_id,
+            }
+        elif args.cron_command == "cancel":
+            request = {
+                "operation": "cron_cancel",
+                "task_id": task_id,
+                "capability": capability,
+                "draft_id": args.draft_id,
+            }
+        else:
+            request = {
+                "operation": "cron_pending",
+                "task_id": task_id,
+                "capability": capability,
             }
         response = _request(
             str(args.socket_path), request, timeout=float(args.timeout)

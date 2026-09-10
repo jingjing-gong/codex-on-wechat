@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.agents.base import AgentResult
+from src.channels.lark import LarkCommandRouter
 from src.channels.models import InboundEnvelope, parse_command
 from src.channels.wechat import MVPCommandRouter
 from src.runtime.manager import TaskManager
@@ -126,6 +127,138 @@ def test_agent_command_creates_named_agent_and_routes_new_work(tmp_path):
             assert accepted.task.agent_id == "planner"
             assert accepted.task.conversation_id.endswith(":planner")
             assert await store.get_profile("planner", 1) is not None
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_existing_only_agent_switch_never_recreates_a_deleted_agent(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "planner",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="owner",
+                session_id="default",
+            )
+            assert await manager.delete_agent("planner")
+
+            with pytest.raises(KeyError, match="Agent was deleted: planner"):
+                await manager.set_existing_active_agent(
+                    "planner",
+                    channel="lark",
+                    bot_id="cli_restricted",
+                    external_user_id="ou_restricted",
+                    session_id="default",
+                )
+
+            assert await store.is_agent_deleted("planner")
+            assert manager.registry.registration("planner") is None
+            assert await store.get_route(
+                channel="lark",
+                bot_id="cli_restricted",
+                external_user_id="ou_restricted",
+                session_id="default",
+                default_agent_id="codex",
+            ) == "codex"
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_lark_existing_only_switch_loses_delete_race_without_recreating_agent(
+    tmp_path,
+):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "planner",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="owner",
+                session_id="default",
+            )
+
+            passed_lark_admission = asyncio.Event()
+            continue_switch = asyncio.Event()
+            shared = MVPCommandRouter(manager)
+
+            class BlockingSharedRouter:
+                async def handle_command(
+                    self,
+                    command,
+                    envelope,
+                    *,
+                    command_id="",
+                    existing_agent_only=False,
+                ):
+                    assert command.name == "agent"
+                    assert existing_agent_only is True
+                    passed_lark_admission.set()
+                    await continue_switch.wait()
+                    return await shared.handle_command(
+                        command,
+                        envelope,
+                        command_id=command_id,
+                        existing_agent_only=existing_agent_only,
+                    )
+
+            user_envelope = InboundEnvelope(
+                channel="lark",
+                bot_id="cli_restricted",
+                external_user_id="ou_restricted",
+                external_message_id="om_switch_race",
+                text="/agent planner",
+            )
+            user_router = LarkCommandRouter(
+                manager,
+                shared_router=BlockingSharedRouter(),
+            )
+            switching = asyncio.create_task(
+                user_router.handle_command(
+                    parse_command("/agent planner"), user_envelope
+                )
+            )
+            await passed_lark_admission.wait()
+
+            admin_envelope = InboundEnvelope(
+                channel="lark",
+                bot_id="cli_admin",
+                external_user_id="ou_admin",
+                external_message_id="om_delete_race",
+                text="/delagent planner",
+            )
+            admin_router = LarkCommandRouter(
+                manager,
+                shared_router=shared,
+                administrator=lambda _envelope: True,
+            )
+            assert await admin_router.handle_command(
+                parse_command("/delagent planner"), admin_envelope
+            ) == "Agent deleted: planner"
+
+            continue_switch.set()
+            response = await switching
+            assert str(response).startswith("cannot switch Agent:")
+            assert "Agent was deleted: planner" in str(response)
+            assert await store.is_agent_deleted("planner")
+            assert manager.registry.registration("planner") is None
+            assert await store.get_route(
+                channel="lark",
+                bot_id="cli_restricted",
+                external_user_id="ou_restricted",
+                session_id="default",
+                default_agent_id="codex",
+            ) == "codex"
         finally:
             await manager.stop()
 
@@ -1274,6 +1407,304 @@ def test_delagent_rejects_agent_with_unfinished_or_resumable_work(
                 external_user_id="user",
                 session_id="default",
             ) == "planner"
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("task_state", "terminal_state", "runtime_interrupt"),
+    (
+        ("queued", "cancelled", False),
+        ("claimed", "interrupted", True),
+        ("running", "interrupted", True),
+        ("cancel_requested", "interrupted", True),
+        ("orphaned", "cancelled", False),
+    ),
+)
+def test_delagent_force_terminalizes_unfinished_work_atomically(
+    tmp_path, task_state, terminal_state, runtime_interrupt
+):
+    class OwnedChild(_Runtime):
+        def __init__(self, agent_id: str) -> None:
+            super().__init__()
+            self.agent_id = agent_id
+            self.interrupted: list[str] = []
+
+        async def interrupt(self, task_id: str) -> bool:
+            self.interrupted.append(task_id)
+            return True
+
+    class FactoryRuntime(_Runtime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.children: dict[str, OwnedChild] = {}
+
+        def for_agent(self, agent_id: str) -> OwnedChild:
+            child = OwnedChild(agent_id)
+            self.children[agent_id] = child
+            return child
+
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / f"force-{task_state}.sqlite")
+        runtime = FactoryRuntime()
+        manager = _manager(store, runtime)
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "planner",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            child = runtime.children["planner"]
+            task = await manager.submit(
+                f"force {task_state}",
+                _envelope("work").reply_target,
+                agent_id="planner",
+            )
+            execution_id = str(task.execution_id)
+
+            claimed_at = datetime.now(timezone.utc)
+            claim = None
+            if task_state != "queued":
+                claim = await store.claim_task_by_id(
+                    task.task_id,
+                    "worker",
+                    lease_seconds=60,
+                    now=claimed_at,
+                )
+                assert claim is not None
+            if task_state in {"running", "cancel_requested", "orphaned"}:
+                assert claim is not None
+                assert await store.mark_task_running(
+                    task.task_id,
+                    claim.claim_token,
+                    execution_id=claim.execution_id,
+                    now=claimed_at,
+                )
+            if task_state == "cancel_requested":
+                assert await store.cancel_task(task.task_id, actor="owner")
+            elif task_state == "orphaned":
+                await store.reconcile(
+                    now=claimed_at + timedelta(seconds=61)
+                )
+
+            result = await manager.delete_agent("planner", force=True)
+            assert result["cancelled_task_ids"] == (task.task_id,)
+            assert result["active_task_ids"] == (
+                (task.task_id,) if runtime_interrupt else ()
+            )
+            assert result["disabled_profile_count"] == 1
+
+            stored = await store.get_task(task.task_id)
+            assert stored is not None and stored.state.value == terminal_state
+            execution = await store.get_execution(execution_id)
+            assert execution is not None
+            assert execution.state.value == (
+                "orphaned" if task_state == "orphaned" else terminal_state
+            )
+            invocation = await store.get_agent_invocation(execution_id)
+            assert invocation is not None
+            assert invocation.admission_released_at is not None
+            assert child.interrupted == (
+                [task.task_id] if runtime_interrupt else []
+            )
+            assert child.stopped == 1
+            assert manager.registry.registration("planner") is None
+            assert await store.is_agent_deleted("planner")
+            profile = await store.get_profile("planner", 1)
+            assert profile is not None and not profile.enabled
+            assert await manager.get_active_agent(
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            ) == "codex"
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_delagent_force_rejects_mailbox_queue_and_reply_survives_self_delete(
+    tmp_path,
+):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "force-mailbox.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "planner",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            task = await manager.submit(
+                "queued work",
+                _envelope("work").reply_target,
+                agent_id="planner",
+            )
+            mailbox = await store.create_agent_message(
+                source_agent_id="codex",
+                destination_agent_id="planner",
+                content="queued collaboration",
+                request_id="force-delete-request",
+                message_id="force-delete-message",
+                payload={"request_type": "ask"},
+            )
+
+            response = await MVPCommandRouter(manager).handle_command(
+                parse_command("/delagent planner force"),
+                _envelope("/delagent planner force", message_id="delete-message"),
+            )
+            assert response == (
+                "Agent force-deleted: planner; force-cancelled 1 unfinished "
+                f"task(s): {task.task_id}; rejected 1 queued Agent message(s)"
+            )
+            stored_mailbox = await store.get_mailbox_item(mailbox.mailbox_id)
+            assert stored_mailbox is not None
+            assert stored_mailbox.state.value == "rejected"
+            invocation = await store.get_agent_invocation(
+                str(mailbox.current_invocation_id)
+            )
+            assert invocation is not None
+            assert invocation.state.value == "cancelled"
+            assert invocation.admission_released_at is not None
+            # The command is handled outside the deleted Agent process; route
+            # fallback and process teardown cannot crash its acknowledgement.
+            assert manager.registry.registration("planner") is None
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_delagent_force_retries_runtime_cleanup_after_durable_retirement(tmp_path):
+    class FlakyOwnedChild(_Runtime):
+        def __init__(self, agent_id: str) -> None:
+            super().__init__()
+            self.agent_id = agent_id
+            self.stop_attempts = 0
+
+        async def stop(self) -> None:
+            self.stop_attempts += 1
+            if self.stop_attempts == 1:
+                raise RuntimeError("shutdown is not yet proven")
+            await super().stop()
+
+    class FactoryRuntime(_Runtime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.children: dict[str, FlakyOwnedChild] = {}
+
+        def for_agent(self, agent_id: str) -> FlakyOwnedChild:
+            child = FlakyOwnedChild(agent_id)
+            self.children[agent_id] = child
+            return child
+
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "force-stop-retry.sqlite")
+        runtime = FactoryRuntime()
+        manager = _manager(store, runtime)
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "planner",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            child = runtime.children["planner"]
+            task = await manager.submit(
+                "cancel me during force-delete",
+                _envelope("work").reply_target,
+                agent_id="planner",
+            )
+
+            with pytest.raises(RuntimeError, match="shutdown is not yet proven"):
+                await manager.delete_agent("planner", force=True)
+
+            assert await store.is_agent_deleted("planner")
+            assert manager.registry.registration("planner") is not None
+            assert child.stop_attempts == 1
+
+            result = await manager.delete_agent("planner", force=True)
+
+            assert result["cancelled_task_ids"] == (task.task_id,)
+            assert result["active_task_ids"] == ()
+            assert result["rejected_mailbox_ids"] == ()
+            assert result["disabled_profile_count"] == 1
+            assert child.stop_attempts == 2
+            assert child.stopped == 1
+            assert manager.registry.registration("planner") is None
+            assert await store.is_agent_deleted("planner")
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_delagent_force_distinguishes_missing_and_tombstoned_agents(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "force-missing.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        try:
+            with pytest.raises(KeyError, match="Agent not found: missing"):
+                await manager.delete_agent("missing", force=True)
+
+            await manager.set_active_agent(
+                "planner",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            assert await manager.delete_agent("planner")
+            with pytest.raises(
+                RuntimeError, match="Agent was already deleted: planner"
+            ):
+                await manager.delete_agent("planner", force=True)
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_agent_reactivation_discards_stale_force_delete_report(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "force-report-reactivation.sqlite")
+        manager = _manager(store, _Runtime())
+        await manager.start()
+        try:
+            await manager.set_active_agent(
+                "planner",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+            assert await manager.delete_agent("planner")
+            manager._pending_force_delete_reports["planner"] = {
+                "cancelled_task_ids": ("old-task",)
+            }
+
+            await manager.set_active_agent(
+                "planner",
+                channel="wechat",
+                bot_id="bot",
+                external_user_id="user",
+                session_id="default",
+            )
+
+            assert "planner" not in manager._pending_force_delete_reports
+            assert not await store.is_agent_deleted("planner")
         finally:
             await manager.stop()
 

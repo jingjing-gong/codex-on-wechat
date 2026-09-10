@@ -5,9 +5,14 @@
 # Usage:
 #   ./cow          # run the bot
 #   ./cow run      # run the bot
-#   ./cow login    # log in to WeChat and save credentials
-#   ./cow logout   # delete saved WeChat credentials
+#   ./cow wechat login   # log in to WeChat and save credentials
+#   ./cow wechat logout  # delete saved WeChat credentials
+#   ./cow login          # legacy alias for ./cow wechat login
+#   ./cow logout         # legacy alias for ./cow wechat logout
+#   ./cow status   # show readiness for every registered channel bot
 #   ./cow logs 300 # dump the newest 300 persistent log lines
+#   ./cow lark ... # add, recover, inspect, reauthorize, enable, or remove Lark bots
+#   ./cow principal ... # map exact channel accounts to canonical principals
 #
 set -euo pipefail
 
@@ -25,21 +30,163 @@ if ! command -v uv >/dev/null 2>&1; then
     fi
 fi
 
+ensure_codex() {
+    local codex_bin="${CODEX_WECHAT_CODEX_BIN:-}"
+    if [[ -z "$codex_bin" ]]; then
+        if command -v codex >/dev/null 2>&1; then
+            codex_bin="$(command -v codex)"
+        elif [[ -x "$HOME/.local/bin/codex" ]]; then
+            codex_bin="$HOME/.local/bin/codex"
+        else
+            echo "==> 'codex' not found, installing it (https://chatgpt.com/codex/install.sh)"
+            if ! sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh' </dev/null; then
+                echo "error: Codex installation failed. Install Codex manually or set CODEX_WECHAT_CODEX_BIN." >&2
+                return 1
+            fi
+            export PATH="$HOME/.local/bin:$PATH"
+            codex_bin="$(command -v codex || true)"
+        fi
+    fi
+    case "$codex_bin" in
+        "~/"*) codex_bin="$HOME/${codex_bin:2}" ;;
+    esac
+    if [[ -z "$codex_bin" ]] || ! codex_bin="$(command -v "$codex_bin")" || [[ ! -f "$codex_bin" || ! -x "$codex_bin" ]]; then
+        echo "error: Codex executable not found or not executable. Install Codex or set CODEX_WECHAT_CODEX_BIN to a valid executable." >&2
+        return 1
+    fi
+    export CODEX_WECHAT_CODEX_BIN="$codex_bin"
+}
+
 command="${1:-run}"
 shift || true
 
+if [[ "$command" == "wechat" ]]; then
+    wechat_command="${1:-}"
+    shift || true
+    case "$wechat_command" in
+        login|logout)
+            # Normalize the scoped public command onto the established,
+            # ownership-safe Python entrypoint below. These commands take no
+            # options: accepting residual flags could create a conflicting
+            # --login/--logout invocation at the Python entrypoint.
+            if (( $# != 0 )); then
+                echo "unexpected arguments for './cow wechat $wechat_command'" >&2
+                echo "usage: ./cow wechat <login|logout>" >&2
+                exit 2
+            fi
+            command="$wechat_command"
+            ;;
+        -h|--help|help)
+            printf '%s\n' \
+                "usage: ./cow wechat <login|logout>" \
+                "  login   log in to WeChat and save credentials" \
+                "  logout  delete saved WeChat credentials"
+            exit 0
+            ;;
+        "")
+            echo "usage: ./cow wechat <login|logout>" >&2
+            exit 2
+            ;;
+        *)
+            echo "unknown WeChat command: $wechat_command" >&2
+            echo "usage: ./cow wechat <login|logout>" >&2
+            exit 2
+            ;;
+    esac
+fi
+
 case "$command" in
     run)
+        ensure_codex
         uv sync --extra test
         exec uv run src/codex_wechat_bot.py "$@"
         ;;
     login)
+        ensure_codex
         uv sync --extra test
         exec uv run src/codex_wechat_bot.py --login "$@"
         ;;
     logout)
         uv sync --extra test
         exec uv run src/codex_wechat_bot.py --logout "$@"
+        ;;
+    lark)
+        # Keep credential-bearing stdin reserved for the owner CLI. Dependency
+        # synchronization must never have an opportunity to consume it.
+        uv sync --extra test </dev/null
+        lark_add_has_app_id=0
+        lark_add_has_secret_stdin=0
+        lark_add_help=0
+        lark_app_id_value=""
+        lark_expect_app_id_value=0
+        lark_options_ended=0
+        if [[ "${1:-}" == "add" ]]; then
+            for lark_argument in "$@"; do
+                if (( lark_options_ended )); then
+                    continue
+                fi
+                if (( lark_expect_app_id_value )); then
+                    if [[ -n "$lark_argument" && "$lark_argument" != -* ]]; then
+                        lark_app_id_value="$lark_argument"
+                    fi
+                    lark_expect_app_id_value=0
+                fi
+                case "$lark_argument" in
+                    --)
+                        lark_options_ended=1
+                        lark_expect_app_id_value=0
+                        ;;
+                    -h|--help)
+                        lark_add_help=1
+                        ;;
+                    --app-id)
+                        lark_app_id_value=""
+                        lark_expect_app_id_value=1
+                        ;;
+                    --app-id=*)
+                        lark_app_id_value="${lark_argument#--app-id=}"
+                        ;;
+                    --app-secret-stdin)
+                        lark_add_has_secret_stdin=1
+                        ;;
+                esac
+            done
+            if [[ "$lark_app_id_value" =~ ^cli_[A-Za-z0-9_-]{4,128}$ ]]; then
+                lark_add_has_app_id=1
+            fi
+        fi
+        if (( lark_add_has_app_id && ! lark_add_help )) && [[ -t 0 ]]; then
+            # Interactive launcher convenience. Keep the Python owner CLI's
+            # strict stdin-only contract so the secret never enters argv or the
+            # environment. Disable inherited xtrace before the value exists.
+            set +x
+            lark_app_secret=""
+            printf 'App Secret: ' >&2
+            if ! IFS= read -r -s lark_app_secret; then
+                printf '\n' >&2
+                unset lark_app_secret
+                echo "error: could not read App Secret from the terminal" >&2
+                exit 1
+            fi
+            printf '\n' >&2
+            if (( ! lark_add_has_secret_stdin )); then
+                set -- "$1" --app-secret-stdin "${@:2}"
+            fi
+            # Process substitution keeps the value off disk and lets the uv
+            # process replace this shell, preserving exact exit/signal behavior.
+            exec 3< <(printf '%s\n' "$lark_app_secret")
+            unset lark_app_secret
+            exec uv run src/lark_cli.py "$@" <&3 3<&-
+        fi
+        exec uv run src/lark_cli.py "$@"
+        ;;
+    principal)
+        uv sync --extra test
+        exec uv run src/principal_cli.py "$@"
+        ;;
+    status)
+        uv sync --extra test
+        exec uv run src/status_cli.py "$@"
         ;;
     logs)
         lines="${1:-200}"
@@ -55,11 +202,11 @@ case "$command" in
         exec tail -n "$lines" -- "$log_file"
         ;;
     -h|--help|help)
-        sed -n '3,11p' "$0"
+        sed -n '3,15p' "$0"
         ;;
     *)
         echo "unknown command: $command" >&2
-        echo "usage: ./cow [run|login|logout|logs [lines]]" >&2
+        echo "usage: ./cow [run|status|wechat <login|logout>|login|logout|logs [lines]|lark <command>|principal <command>]" >&2
         exit 2
         ;;
 esac

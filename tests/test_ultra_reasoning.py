@@ -7,6 +7,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+import pytest
+
 from src.agents.base import AgentResult
 from src.channels.models import InboundEnvelope, parse_command
 from src.channels.wechat import MVPCommandRouter
@@ -150,7 +152,7 @@ def test_help_keeps_effort_choices_model_scoped() -> None:
             rendered = await _route(MVPCommandRouter(manager), "/help")
             assert (
                 rendered.count(
-                    "`/model [<model-id> <effort|default>|effort <effort|default>]`"
+                    "`/model [<model-id> [<effort|default>]|effort <effort|default>]`"
                 )
                 == 1
             )
@@ -254,7 +256,17 @@ def test_luna_rejects_ultra_without_mutating_model_or_effort(tmp_path) -> None:
     asyncio.run(scenario())
 
 
-def test_default_effort_forgets_the_sticky_ultra_thread(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "command,model_id,default_effort",
+    [
+        ("/model effort default", "gpt-5.6-sol", "model default"),
+        ("/model gpt-5.6-sol", "gpt-5.6-sol", "low"),
+        ("/model gpt-5.6-terra", "gpt-5.6-terra", "medium"),
+    ],
+)
+def test_default_effort_forgets_the_sticky_ultra_thread(
+    tmp_path, command, model_id, default_effort
+) -> None:
     async def scenario() -> None:
         manager, runtime = _manager_for(tmp_path / "runtime.sqlite")
         await manager.start()
@@ -278,12 +290,13 @@ def test_default_effort_forgets_the_sticky_ultra_thread(tmp_path) -> None:
                 policy_version=accepted.task.policy_version,
             ) == "native-ultra-thread"
 
-            rendered = await _route(router, "/model effort default")
+            rendered = await _route(router, command)
 
-            assert "- **Reasoning effort:** `model default` (default)" in rendered
+            assert f"- **Reasoning effort:** `{default_effort}` (default)" in rendered
+            assert (await _selection(manager))["model_id"] == model_id
             assert (await _selection(manager))["reasoning_effort"] == ""
             assert runtime.reset_calls == [
-                (conversation_id, "gpt-5.6-sol", "")
+                (conversation_id, model_id, "")
             ]
             assert await manager.store.get_thread_binding(
                 conversation_id,
@@ -297,6 +310,7 @@ def test_default_effort_forgets_the_sticky_ultra_thread(tmp_path) -> None:
             )
             assert future.task is not None
             assert future.task.thread_id is None
+            assert future.task.model == model_id
             assert future.task.reasoning_effort == ""
         finally:
             await manager.stop()

@@ -252,7 +252,7 @@ def test_skill_store_fresh_schema_and_migration(tmp_path):
             columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(skills)")
             }
-        assert version == 35
+        assert version == 41
         assert columns == {
             "agent_id",
             "skill_id",

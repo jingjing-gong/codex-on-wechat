@@ -52,7 +52,7 @@ def test_schema_v33_migrates_a_v32_database(tmp_path: Path) -> None:
         with sqlite3.connect(path) as connection:
             assert connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
-            ).fetchall() == [(version,) for version in range(1, 36)]
+            ).fetchall() == [(version,) for version in range(1, 42)]
             columns = {
                 row[1]: row
                 for row in connection.execute(
@@ -103,7 +103,7 @@ def test_schema_v33_finishes_a_landed_table_without_its_marker(
         with sqlite3.connect(path) as connection:
             assert connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone() == (35,)
+            ).fetchone() == (41,)
             assert connection.execute(
                 "SELECT tbl_name FROM sqlite_master WHERE type='index' "
                 "AND name='idx_session_agent_working_directories_agent'"
@@ -174,7 +174,7 @@ def test_schema_v33_marker_without_its_table_fails_closed(
         with sqlite3.connect(path) as connection:
             assert connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone() == (35,)
+            ).fetchone() == (41,)
             assert connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='session_agent_working_directories'"

@@ -85,6 +85,7 @@ def test_help_is_deterministic_markdown_with_one_command_per_line():
         "cd",
         "clear",
         "compact",
+        "cron",
         "delagent",
         "help",
         "inbox",
@@ -110,14 +111,15 @@ def test_help_is_deterministic_markdown_with_one_command_per_line():
     assert "`/listskill`" not in COMMAND_HELP
     assert "`/listskills`" not in COMMAND_HELP
     assert COMMAND_HELP.count("`$<skill> <task description>`") == 1
-    assert "`/model [<model-id> <effort|default>|effort <effort|default>]`" in COMMAND_HELP
+    assert "`/model [<model-id> [<effort|default>]|effort <effort|default>]`" in COMMAND_HELP
     assert "`/retry <task-id>`" in COMMAND_HELP
     assert "`/cancel [task-id]`" in COMMAND_HELP
     assert "`/report <message>`" in COMMAND_HELP
     assert "`/compact`" in COMMAND_HELP
+    assert "`/cron <add|list|delete|help> ...`" in COMMAND_HELP
     assert "`/cd [path]`" in COMMAND_HELP
     assert "`/agent [agent-id] [profile]`" in COMMAND_HELP
-    assert "`/delagent <agent-id>`" in COMMAND_HELP
+    assert "`/delagent <agent-id> [force]`" in COMMAND_HELP
     assert "`/ask <agent-id> <prompt>`" in COMMAND_HELP
     assert "`/inbox [agent-id|all]`" in COMMAND_HELP
     assert "`/execute`" not in COMMAND_HELP
@@ -265,13 +267,24 @@ def test_recv_has_deterministic_empty_and_usage_responses():
 
 
 def test_delagent_command_validates_arity_and_delegates():
+    calls: list[tuple[str, bool]] = []
+
     class Manager:
         async def get_active_agent(self, **_kwargs) -> str:
             return "codex"
 
         async def delete_agent(self, agent_id: str, **_kwargs) -> bool:
             assert agent_id == "planner"
+            calls.append((agent_id, False))
             return True
+
+        async def force_delete_agent(self, agent_id: str, **_kwargs):
+            assert agent_id == "planner"
+            calls.append((agent_id, True))
+            return {
+                "cancelled_task_ids": ("task-1", "task-2"),
+                "rejected_mailbox_ids": ("mailbox-1",),
+            }
 
     async def scenario() -> None:
         router = MVPCommandRouter(Manager())
@@ -280,11 +293,24 @@ def test_delagent_command_validates_arity_and_delegates():
             parse_command("/delagent planner"), envelope
         ) == "Agent deleted: planner"
         assert await router.handle_command(
-            parse_command("/delagent"), _envelope("/delagent")
-        ) == "usage: /delagent <agent-id>"
+            parse_command("/delagent planner FORCE"),
+            _envelope("/delagent planner FORCE"),
+        ) == (
+            "Agent force-deleted: planner; force-cancelled 2 unfinished "
+            "task(s): task-1, task-2; rejected 1 queued Agent message(s)"
+        )
+        assert calls == [("planner", False), ("planner", True)]
         assert await router.handle_command(
-            parse_command("/delagent a b"), _envelope("/delagent a b")
-        ) == "usage: /delagent <agent-id>"
+            parse_command("/delagent"), _envelope("/delagent")
+        ) == "usage: /delagent <agent-id> [force]"
+        assert await router.handle_command(
+            parse_command("/delagent a unsafe"),
+            _envelope("/delagent a unsafe"),
+        ) == "usage: /delagent <agent-id> [force]"
+        assert await router.handle_command(
+            parse_command("/delagent a force extra"),
+            _envelope("/delagent a force extra"),
+        ) == "usage: /delagent <agent-id> [force]"
 
     asyncio.run(scenario())
 
@@ -999,6 +1025,32 @@ def test_model_exact_syntax_dispatches_model_and_effort_only_calls():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("channel", ["wechat", "lark", "feishu"])
+@pytest.mark.parametrize("model_id,default_effort", [("gpt-fast", "medium"), ("gpt-deep", "high")])
+def test_model_without_effort_clears_previous_override(channel, model_id, default_effort):
+    async def scenario() -> None:
+        manager = _ModelCommandManager()
+        text = f"/model {model_id}"
+        envelope = replace(
+            _envelope(text),
+            channel=channel,
+            conversation_id=f"{channel}:bot:user:default:codex",
+        )
+
+        result = await MVPCommandRouter(manager).handle_command(
+            parse_command(text), envelope
+        )
+
+        assert manager.model_id == model_id
+        assert manager.effort == ""
+        assert manager.calls[-1] == (
+            "set_model", model_id, "default", "planner", envelope.conversation_id
+        )
+        assert f"- **Reasoning effort:** `{default_effort}` (default)" in result
+
+    asyncio.run(scenario())
+
+
 def test_model_effort_default_does_not_require_live_catalog():
     class Manager(_ModelCommandManager):
         async def list_models(self, **_kwargs):
@@ -1257,21 +1309,42 @@ def test_model_read_response_bounds_stale_persisted_selection():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    "argument,expected",
+    [
+        ("", ("show", "", "")),
+        ("gpt-deep", ("set-model", "gpt-deep", "default")),
+        ("gpt-deep high", ("set-model", "gpt-deep", "high")),
+        ("gpt-deep default", ("set-model", "gpt-deep", "default")),
+        ("effort default", ("set-effort", "", "default")),
+        ("effort high", ("set-effort", "", "high")),
+    ],
+)
+def test_legacy_model_parser_defaults_omitted_effort(argument, expected):
+    from src.codex_wechat_bot import _parse_model_command
+
+    assert _parse_model_command(argument) == expected
+
+
+@pytest.mark.parametrize("argument", ["effort", "effort high extra", "gpt-deep high extra"])
+def test_legacy_model_parser_rejects_invalid_arities(argument):
+    from src.codex_wechat_bot import _parse_model_command
+
+    with pytest.raises(ValueError, match="usage: /model"):
+        _parse_model_command(argument)
+
+
 def test_command_arities_are_rejected_before_dispatch():
     expected = {
         "/agents extra": "usage: /agents",
         "/modes extra": "usage: /modes",
         "/models extra": "usage: /models",
-        "/model gpt-deep": (
-            "usage: /model [<model-id> <effort|default>|effort "
-            "<effort|default>]"
-        ),
         "/model gpt-deep high extra": (
-            "usage: /model [<model-id> <effort|default>|effort "
+            "usage: /model [<model-id> [<effort|default>]|effort "
             "<effort|default>]"
         ),
         "/model effort": (
-            "usage: /model [<model-id> <effort|default>|effort "
+            "usage: /model [<model-id> [<effort|default>]|effort "
             "<effort|default>]"
         ),
         "/cancel task-1 extra": "usage: /cancel [task-id]",

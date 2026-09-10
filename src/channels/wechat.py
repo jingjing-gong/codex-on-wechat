@@ -28,7 +28,6 @@ import threading
 import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass, replace
-from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from pydantic import ValidationError
@@ -78,6 +77,84 @@ from .models import (
     parse_command,
     utc_now,
 )
+from .commands import (
+    CommandResponse,
+    MVPCommandRouter,
+    _bounded_catalog_markdown,
+    _bounded_markdown_fence,
+    _bounded_public_error,
+    _bounded_public_value,
+    _command_message,
+    _command_request_id_for_delivery,
+    _default_model,
+    _find_model,
+    _format_agent,
+    _format_agents_markdown,
+    _format_inbox_item,
+    _format_model_capability_error,
+    _format_model_selection_markdown,
+    _format_models_markdown,
+    _format_modes_markdown,
+    _format_shell_error,
+    _format_shell_markdown,
+    _format_task,
+    _format_working_directory,
+    _inbox_ids,
+    _invoke_compatible,
+    _is_accepted,
+    _is_duplicate,
+    _markdown_fence,
+    _matching_effort,
+    _maybe_await,
+    _model_default_effort,
+    _model_display_name,
+    _model_efforts,
+    _model_id,
+    _model_is_default,
+    _model_mapping,
+    _model_selection,
+    _normalized_public_text,
+    _switch_back_fragment_specs,
+    _system_role_command_response,
+    _system_role_fragment_specs,
+    _system_role_fragments_from_response,
+    _task_belongs_to,
+    _task_dedupe_key,
+    _task_id,
+    _task_state,
+    _value,
+    _working_directory_path,
+    command_client_id,
+    command_delivery_id,
+    command_delivery_id_candidates,
+    command_initial_reply,
+    command_request_id,
+    command_request_id_candidates,
+    command_task_id,
+    legacy_command_delivery_id,
+    run_shell_command,
+    COMMAND_HELP,
+    COMMAND_POLICIES,
+    COMMAND_REGISTRY,
+    DEFAULT_COMMAND_POLICY,
+    DEFERRED_REPLY_QUOTA_CAPABILITY,
+    LARK_COMMAND_POLICY,
+    MVP_COMMANDS,
+    MVP_COMMAND_NAMES,
+    WECHAT_COMMAND_POLICY,
+    ChannelCommandPolicy,
+    CommandRegistryEntry,
+    CommandRegistryGroup,
+    _command_registry_indexes,
+    _command_usage,
+    _render_command_help,
+    command_help_for_channel,
+    command_names_for_channel,
+    command_policy_for,
+    command_supported,
+    filter_command_registry,
+    unsupported_command_response,
+)
 from src.runtime.media import (
     AttachmentError,
     AttachmentStore,
@@ -117,214 +194,6 @@ DEFAULT_AGENT_ID = "codex"
 DEFAULT_SESSION_ID = "default"
 
 
-@dataclass(frozen=True, slots=True)
-class CommandRegistryEntry:
-    """One public command row and any help-hidden compatibility aliases."""
-
-    name: str | None
-    syntax: str
-    description: str
-    hidden_aliases: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class CommandRegistryGroup:
-    """An ordered help section in the immutable command registry."""
-
-    title: str
-    entries: tuple[CommandRegistryEntry, ...]
-
-
-COMMAND_REGISTRY = (
-    CommandRegistryGroup(
-        "Conversation",
-        (
-            CommandRegistryEntry("help", "/help", "Show this help"),
-            CommandRegistryEntry(
-                "clear",
-                "/clear",
-                "Clear the active conversation and start a fresh thread",
-            ),
-            CommandRegistryEntry("reset", "/reset", "Alias for `/clear`"),
-            CommandRegistryEntry(
-                "compact",
-                "/compact",
-                "Compact the active conversation while preserving context",
-            ),
-            CommandRegistryEntry(
-                "cd",
-                "/cd [path]",
-                "Show or change the current Agent's working directory",
-            ),
-            CommandRegistryEntry(
-                "sh",
-                "/sh <command>",
-                "Run a bounded shell command in the current Agent's workspace",
-            ),
-            CommandRegistryEntry(
-                "skills",
-                "/skills",
-                "List enabled skills",
-                hidden_aliases=("listskill", "listskills"),
-            ),
-            CommandRegistryEntry(
-                None,
-                "$<skill> <task description>",
-                "Run a task with a selected skill",
-            ),
-        ),
-    ),
-    CommandRegistryGroup(
-        "Tasks",
-        (
-            CommandRegistryEntry("status", "/status", "Show active tasks"),
-            CommandRegistryEntry("tasks", "/tasks [limit]", "List your tasks"),
-            CommandRegistryEntry(
-                "retry",
-                "/retry <task-id>",
-                "Explicitly retry a failed or orphaned task",
-            ),
-            CommandRegistryEntry(
-                "cancel",
-                "/cancel [task-id]",
-                "Cancel a task, or the current running task when omitted",
-            ),
-            CommandRegistryEntry(
-                "report",
-                "/report <message>",
-                "Record an operator report in the persistent log",
-            ),
-        ),
-    ),
-    CommandRegistryGroup(
-        "Agents",
-        (
-            CommandRegistryEntry("agents", "/agents", "List Agents"),
-            CommandRegistryEntry(
-                "agent",
-                "/agent [agent-id] [profile]",
-                "Show, switch, or create the front Agent",
-            ),
-            CommandRegistryEntry(
-                "delagent",
-                "/delagent <agent-id>",
-                "Delete a dynamically created Agent",
-            ),
-            CommandRegistryEntry(
-                "ask",
-                "/ask <agent-id> <prompt>",
-                "Send a correlated Agent request",
-            ),
-        ),
-    ),
-    CommandRegistryGroup(
-        "Agent Configuration",
-        (
-            CommandRegistryEntry(
-                "system",
-                "/system [default|<role>]",
-                "Show, set, or clear the current Agent's role",
-            ),
-            CommandRegistryEntry(
-                "mode",
-                "/mode [chat|plan|review|execute]",
-                "Show or set the operating mode",
-            ),
-            CommandRegistryEntry(
-                "modes",
-                "/modes",
-                "List operating modes and mark the current mode",
-            ),
-            CommandRegistryEntry(
-                "model",
-                "/model [<model-id> <effort|default>|effort <effort|default>]",
-                "Show or set the model and reasoning effort",
-            ),
-            CommandRegistryEntry(
-                "models",
-                "/models",
-                "List models and their supported reasoning efforts",
-            ),
-            CommandRegistryEntry(
-                "notify",
-                "/notify [on|off]",
-                "Show or set notifications",
-            ),
-        ),
-    ),
-    CommandRegistryGroup(
-        "Delivery",
-        (
-            CommandRegistryEntry(
-                "inbox",
-                "/inbox [agent-id|all]",
-                "Present unseen notifications",
-            ),
-            CommandRegistryEntry(
-                "recv",
-                "/recv",
-                "Receive the next replies deferred by WeChat's ten-message quota",
-            ),
-        ),
-    ),
-)
-
-
-def _command_registry_indexes() -> tuple[
-    frozenset[str], Mapping[str, CommandRegistryEntry]
-]:
-    names: dict[str, CommandRegistryEntry] = {}
-    syntaxes: set[str] = set()
-    for group in COMMAND_REGISTRY:
-        for entry in group.entries:
-            if entry.syntax in syntaxes:
-                raise RuntimeError(f"duplicate public command syntax: {entry.syntax}")
-            syntaxes.add(entry.syntax)
-            if entry.name is None:
-                if entry.hidden_aliases:
-                    raise RuntimeError("a pseudo-command cannot have slash aliases")
-            elif entry.syntax.split(maxsplit=1)[0] != f"/{entry.name}":
-                raise RuntimeError(
-                    f"command name and public syntax conflict: {entry.name}"
-                )
-            entry_names = (() if entry.name is None else (entry.name,)) + tuple(
-                entry.hidden_aliases
-            )
-            for name in entry_names:
-                canonical = str(name or "").strip().lower()
-                if not canonical or canonical in names:
-                    raise RuntimeError(f"duplicate or empty command name: {name}")
-                names[canonical] = entry
-    return frozenset(names), MappingProxyType(names)
-
-
-MVP_COMMANDS, _COMMAND_ENTRY_BY_NAME = _command_registry_indexes()
-MVP_COMMAND_NAMES = frozenset(f"/{name}" for name in MVP_COMMANDS)
-
-
-def _render_command_help() -> str:
-    lines = ["## Commands"]
-    for group in COMMAND_REGISTRY:
-        lines.extend(("", f"### {group.title}"))
-        lines.extend(
-            f"- `{entry.syntax}` - {entry.description}" for entry in group.entries
-        )
-    return "\n".join(lines) + "\n"
-
-
-def _command_usage(name: str) -> str:
-    canonical = str(name or "").strip().lower()
-    entry = _COMMAND_ENTRY_BY_NAME.get(canonical)
-    if entry is None:
-        return f"usage: /{canonical}" if canonical else "usage: /"
-    syntax = entry.syntax
-    if canonical != entry.name:
-        _slash, separator, tail = syntax.partition(" ")
-        syntax = f"/{canonical}" + (separator + tail if separator else "")
-    return f"usage: {syntax}"
-
-
-COMMAND_HELP = _render_command_help()
 ACTIVE_TASK_STATES = frozenset({"queued", "claimed", "running", "cancel_requested"})
 RETRYABLE_TASK_STATES = frozenset({"failed", "orphaned", "interrupted"})
 TERMINAL_TASK_STATES = frozenset({"completed", "failed", "interrupted", "cancelled", "canceled"})
@@ -439,26 +308,6 @@ async def _invoke_external_hook(hook: Callable[..., Any], *args: Any) -> Any:
     return await result if inspect.isawaitable(result) else result
 
 
-def run_shell_command(
-    command: str,
-    *,
-    cwd: str | Path | None = None,
-    timeout: int = _SHELL_TIMEOUT,
-    max_output: int = _MAX_SHELL_OUTPUT,
-) -> str:
-    """Execute a bounded shell command for the legacy ``/sh`` command.
-
-    This intentionally mirrors the original bot helper.  The durable router
-    invokes it in a worker thread so a command cannot block the owner loop.
-    """
-
-    completed = run_bounded_shell_process(
-        command,
-        cwd=cwd or Path(__file__).resolve().parents[2],
-        timeout=timeout,
-        max_output=max_output,
-    )
-    return f"exit code: {completed.returncode}\n{completed.output}"
 
 
 COMMAND_INTERRUPTED_RESPONSE = (
@@ -534,22 +383,6 @@ class _MonitorCallbackFailure:
     exception: BaseException
 
 
-class CommandResponse(str):
-    """String-compatible command result carrying projection metadata."""
-
-    def __new__(
-        cls,
-        value: str,
-        presentation_ids: Sequence[str] = (),
-        *,
-        response_fragments: Sequence[Mapping[str, Any]] = (),
-    ) -> "CommandResponse":
-        result = str.__new__(cls, value)
-        result.presentation_ids = tuple(str(item) for item in presentation_ids if item)
-        result.response_fragments = tuple(
-            dict(fragment) for fragment in response_fragments
-        )
-        return result
 
 
 def conversation_id_for(
@@ -877,131 +710,22 @@ def _delivery_sender_id(item: UserDelivery) -> str:
     return sender_id
 
 
-def command_delivery_id(envelope: InboundEnvelope) -> str:
-    """Return the stable outbox ID for one inbound control command."""
-
-    return scoped_id(
-        "command",
-        (
-            envelope.channel,
-            envelope.bot_id,
-            envelope.external_user_id,
-            envelope.session_id or DEFAULT_SESSION_ID,
-            envelope.external_message_id,
-        ),
-    )
 
 
-def legacy_command_delivery_id(envelope: InboundEnvelope) -> str:
-    """Return the persisted pre-v1 command identity for upgrade recovery."""
-
-    identity = ":".join(
-        (
-            envelope.channel,
-            envelope.bot_id,
-            envelope.external_user_id,
-            envelope.session_id or DEFAULT_SESSION_ID,
-            envelope.external_message_id,
-        )
-    )
-    return f"command:{identity}"
 
 
-def command_delivery_id_candidates(envelope: InboundEnvelope) -> tuple[str, ...]:
-    """Return canonical then legacy command IDs in lookup preference order."""
-
-    return tuple(
-        dict.fromkeys(
-            (command_delivery_id(envelope), legacy_command_delivery_id(envelope))
-        )
-    )
 
 
-def command_request_id(envelope: InboundEnvelope) -> str:
-    """Return an idempotency key for a command-created Agent task.
-
-    A process can crash after durable ingress but before the command response
-    is projected.  Replaying ``/ask`` must therefore identify the same logical
-    task instead of enqueueing a second request.
-    """
-
-    return _command_request_id_for_delivery(
-        command_delivery_id(envelope), envelope.text
-    )
 
 
-def command_task_id(envelope: InboundEnvelope) -> str:
-    """Return the stable task identity for work created by one command.
-
-    The task ID has to be known before ``/ask`` reserves its acknowledgement:
-    the acknowledgement includes that ID and is committed in the same SQLite
-    transaction that publishes the queued task.  Deriving it from the framed
-    command request identity also makes a direct router replay deterministic.
-    """
-
-    return str(
-        uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"codex-wechat:command-task:{command_request_id(envelope)}",
-        )
-    )
 
 
-def command_client_id(envelope: InboundEnvelope) -> str:
-    """Return the immutable primary iLink ID for a command response."""
-
-    delivery_id = command_delivery_id(envelope)
-    identity = delivery_id.removeprefix("command:")
-    return str(
-        uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"codex-wechat:command:{identity}",
-        )
-    )
 
 
-def command_initial_reply(
-    envelope: InboundEnvelope,
-    content: str,
-    *,
-    agent_id: str,
-) -> dict[str, Any]:
-    """Build the canonical command-reply projection used before dispatch.
-
-    ``create_user_outbox`` derives ``outbox:<delivery-id>`` when the gateway
-    later replays this projection for its immediate send.  Persisting that
-    exact source key here ensures both paths resolve to one candidate, slot,
-    outbox row, and primary wire identity.
-    """
-
-    delivery_id = command_delivery_id(envelope)
-    return {
-        "target": envelope.reply_target.to_dict(),
-        "source_key": f"outbox:{delivery_id}",
-        "content": str(content),
-        "outbox_id": delivery_id,
-        "client_id": command_client_id(envelope),
-        "from_user_id": envelope.bot_id,
-        "agent_id": str(agent_id or envelope.agent_id),
-    }
 
 
-def _command_request_id_for_delivery(delivery_id: str, command_text: str) -> str:
-    material = "\x1f".join((delivery_id, str(command_text or "").strip()))
-    return str(
-        uuid.uuid5(uuid.NAMESPACE_URL, f"codex-wechat:command-request:{material}")
-    )
 
 
-def command_request_id_candidates(envelope: InboundEnvelope) -> tuple[str, ...]:
-    """Return request keys corresponding to canonical and legacy command IDs."""
-
-    return tuple(
-        dict.fromkeys(
-            _command_request_id_for_delivery(candidate, envelope.text)
-            for candidate in command_delivery_id_candidates(envelope)
-        )
-    )
 
 
 def transcription_confirmation_id(envelope: InboundEnvelope, ordinal: int) -> str:
@@ -1439,16 +1163,6 @@ def send_media_delivery(client: Any, record: Any, uploaded: Any = None) -> bool:
     return True
 
 
-def _value(record: Any, *names: str, default: Any = None) -> Any:
-    if isinstance(record, Mapping):
-        for name in names:
-            if name in record:
-                return record[name]
-        return default
-    for name in names:
-        if hasattr(record, name):
-            return getattr(record, name)
-    return default
 
 
 def _has_field(record: Any, name: str) -> bool:
@@ -1466,10 +1180,6 @@ def _has_field(record: Any, name: str) -> bool:
     return hasattr(record, name)
 
 
-async def _maybe_await(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        return await value
-    return value
 
 
 def _capability_target(target: Any, names: Sequence[str]) -> Any | None:
@@ -1502,71 +1212,6 @@ def _coerce_delivery(value: Any) -> UserDelivery:
     raise TypeError("delivery must be a UserDelivery, mapping, or outbox record")
 
 
-async def _invoke_compatible(
-    target: Any,
-    names: Sequence[str],
-    *,
-    positional: Sequence[Any] = (),
-    keyword: Mapping[str, Any] | None = None,
-) -> Any:
-    """Call the first supported public method while tolerating narrow fakes.
-
-    The small amount of signature adaptation keeps the channel layer usable
-    with the store protocol as well as with a TaskManager facade.  It does not
-    inspect or mutate runtime-owned dictionaries.
-    """
-
-    keyword = dict(keyword or {})
-    for name in names:
-        method = getattr(target, name, None)
-        if method is None:
-            continue
-        try:
-            signature = inspect.signature(method)
-        except (TypeError, ValueError):
-            return await _maybe_await(method(*positional, **keyword))
-        accepts_var_kw = any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
-        if accepts_var_kw:
-            filtered = keyword
-        else:
-            filtered = {
-                key: value
-                for key, value in keyword.items()
-                if key in signature.parameters
-            }
-        try:
-            signature.bind(*positional, **filtered)
-        except TypeError:
-            # A compatibility call may provide a value both positionally and
-            # under its conventional keyword name (or the target may expose a
-            # keyword-only parameter).  Retry with keyword arguments alone
-            # before deciding that this method is unsupported.
-            if positional:
-                retry_keywords = dict(filtered)
-                parameter_names = [
-                    parameter.name
-                    for parameter in signature.parameters.values()
-                    if parameter.kind
-                    in {
-                        inspect.Parameter.POSITIONAL_ONLY,
-                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                        inspect.Parameter.KEYWORD_ONLY,
-                    }
-                ]
-                for parameter_name, value in zip(parameter_names, positional):
-                    retry_keywords.setdefault(parameter_name, value)
-                try:
-                    signature.bind(**retry_keywords)
-                except TypeError:
-                    continue
-                return await _maybe_await(method(**retry_keywords))
-            continue
-        return await _maybe_await(method(*positional, **filtered))
-    joined = ", ".join(names)
-    raise AttributeError(f"{type(target).__name__} implements none of: {joined}")
 
 
 class WeChatInboundMediaPromoter:
@@ -2121,95 +1766,22 @@ class WeChatInboundMediaPromoter:
         return await _maybe_await(result)
 
 
-def _task_id(result: Any) -> str:
-    return str(_value(result, "task_id", "id", default="") or "")
 
 
-def _task_dedupe_key(result: Any) -> str:
-    return str(_value(result, "dedupe_key", default="") or "")
 
 
-def _is_duplicate(result: Any) -> bool:
-    duplicate = _value(result, "duplicate", "is_duplicate", default=None)
-    if duplicate is not None:
-        return bool(duplicate)
-    status = str(_value(result, "status", "inbound_status", default="")).lower()
-    return status == "duplicate"
 
 
-def _is_accepted(result: Any) -> bool:
-    accepted = _value(result, "accepted", "created", default=None)
-    if accepted is not None:
-        return bool(accepted) or _is_duplicate(result)
-    status = str(_value(result, "status", "inbound_status", default="")).lower()
-    if status:
-        return status in {
-            "accepted",
-            "duplicate",
-            "stored",
-            "task_queued",
-            "queued",
-        }
-    return result is not False and result is not None
 
 
-def _format_task(record: Any) -> str:
-    task_id = str(_value(record, "task_id", "id", default="?") or "?")
-    status = str(_value(record, "status", "state", default="unknown") or "unknown")
-    agent_id = str(_value(record, "agent_id", default="") or "")
-    attempts = _value(record, "attempts", "attempt", default=None)
-    error = _bounded_public_error(
-        _value(record, "last_error", "error", default=""),
-        max_length=_MAX_PUBLIC_TEXT,
-    )
-    suffix = f" agent={agent_id}" if agent_id else ""
-    if attempts is not None:
-        suffix += f" attempts={attempts}"
-    if error:
-        suffix += f" error={error}"
-    return f"{task_id} {status}{suffix}"
 
 
-def _task_state(record: Any) -> str:
-    """Return a normalized task state for command guards and formatting."""
-
-    value = _value(record, "status", "state", default="")
-    value = getattr(value, "value", value)
-    return str(value or "").strip().lower()
 
 
-def _command_message(command: ChannelCommand) -> str:
-    """Return the untruncated text after a slash-command token."""
-
-    raw = str(command.raw or "").lstrip()
-    match = re.match(r"/\S+(?:\s+(.*))?\Z", raw, flags=re.DOTALL)
-    if match is not None:
-        return str(match.group(1) or "").strip()
-    return command.argument.strip()
 
 
-def _normalized_public_text(value: Any) -> str:
-    """Flatten public text and remove invisible control obfuscation."""
-
-    without_escapes = _ANSI_ESCAPE_PATTERN.sub("", str(value or ""))
-    cleaned = "".join(
-        " "
-        if character.isspace()
-        else ""
-        if unicodedata.category(character).startswith("C")
-        else character
-        for character in without_escapes
-    )
-    return " ".join(cleaned.split()).replace("`", "'")
 
 
-def _bounded_public_value(value: Any, *, max_length: int) -> str:
-    """Normalize one public catalog field without allowing it to own a reply."""
-
-    normalized = _normalized_public_text(value)
-    if len(normalized) <= max_length:
-        return normalized
-    return normalized[: max(0, max_length - 3)].rstrip() + "..."
 
 
 _ANSI_ESCAPE_PATTERN = re.compile(
@@ -2245,794 +1817,69 @@ _PUBLIC_ERROR_HOST_PATTERN = re.compile(
 )
 
 
-def _bounded_public_error(value: Any, *, max_length: int) -> str:
-    """Render an actionable exception without exposing transport secrets."""
-
-    normalized = _normalized_public_text(value)
-    normalized = _PUBLIC_ERROR_URL_PATTERN.sub("<redacted-url>", normalized)
-    normalized = _PUBLIC_ERROR_AUTH_SCHEME_PATTERN.sub(
-        "<redacted-authorization>", normalized
-    )
-    normalized = _PUBLIC_ERROR_ASSIGNMENT_PATTERN.sub(
-        lambda match: f"{match.group(1)}=<redacted>", normalized
-    )
-    normalized = _PUBLIC_ERROR_HOST_PATTERN.sub(
-        "<redacted-host>", normalized
-    )
-    return _bounded_public_value(normalized, max_length=max_length)
 
 
-def _working_directory_path(
-    value: Any,
-    *,
-    fallback: str | Path | None = None,
-) -> tuple[str | Path, str]:
-    """Return a validated facade path and its display representation."""
-
-    raw_path = _value(value, "path", default=None)
-    if raw_path is None and not isinstance(value, Mapping):
-        raw_path = value
-    if raw_path is None:
-        raw_path = fallback
-    if not isinstance(raw_path, (str, Path)):
-        raise ValueError("working directory response has no path")
-    display_path = str(raw_path)
-    if not display_path.strip():
-        raise ValueError("working directory response has no path")
-    return raw_path, display_path
 
 
-def _format_working_directory(path: Any) -> str:
-    """Render one bounded, single-line working-directory acknowledgement."""
-
-    return format_working_directory_response(path)
 
 
-def _format_model_capability_error(action: str, exc: ValueError) -> str:
-    """Return one bounded line for an expected model capability rejection."""
-
-    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-    return f"cannot {action} model: {detail or 'invalid model selection'}"
 
 
-def _bounded_catalog_markdown(
-    prefix: Sequence[str],
-    entries: Sequence[tuple[str, bool]],
-) -> str:
-    """Render complete catalog entries while retaining the current selection."""
-
-    lines = [*prefix, *(line for line, _current in entries)]
-    rendered = "\n".join(lines)
-    if len(rendered) <= _MAX_COMMAND_MARKDOWN:
-        return rendered
-
-    current_index = next(
-        (index for index, (_line, current) in enumerate(entries) if current),
-        None,
-    )
-    retained: list[str] = []
-    retained_indexes: set[int] = set()
-    for index, (line, _current) in enumerate(entries):
-        proposed = [*retained, line]
-        proposed_indexes = retained_indexes | {index}
-        tail = [_LIST_TRUNCATION_MARKER]
-        if current_index is not None and current_index not in proposed_indexes:
-            tail.append(entries[current_index][0])
-        candidate = "\n".join((*prefix, *proposed, *tail))
-        if len(candidate) > _MAX_COMMAND_MARKDOWN:
-            break
-        retained = proposed
-        retained_indexes = proposed_indexes
-
-    tail = [_LIST_TRUNCATION_MARKER]
-    if current_index is not None and current_index not in retained_indexes:
-        tail.append(entries[current_index][0])
-    return "\n".join((*prefix, *retained, *tail))
 
 
-def _format_agent(record: Any, *, active: bool = False) -> str:
-    agent_id = _bounded_public_value(
-        _value(record, "agent_id", "id", default="?") or "?",
-        max_length=_MAX_PUBLIC_ID,
-    )
-    display = _bounded_public_value(
-        _value(record, "display_name", "name", default=agent_id) or agent_id,
-        max_length=_MAX_PUBLIC_TEXT,
-    )
-    summary = _bounded_public_value(
-        _value(record, "summary", default="") or "",
-        max_length=_MAX_PUBLIC_TEXT,
-    )
-    marker = " **(current)**" if active else ""
-    suffix = f": {summary}" if summary else ""
-    process_suffix = ""
-    if bool(_value(record, "process_isolated", default=False)):
-        pid = _bounded_public_value(
-            _value(record, "pid", default=None) or "pending",
-            max_length=_MAX_PUBLIC_ID,
-        )
-        generation = _bounded_public_value(
-            _value(record, "generation", default=None) or "pending",
-            max_length=_MAX_PUBLIC_ID,
-        )
-        health = _bounded_public_value(
-            _value(record, "health", default="unknown") or "unknown",
-            max_length=_MAX_PUBLIC_ID,
-        )
-        process_suffix = (
-            f" · process pid `{pid}`, generation `{generation}`, health `{health}`"
-        )
-    return f"- **`{agent_id}`**{marker} - {display}{suffix}{process_suffix}"
 
 
-def _format_agents_markdown(records: Sequence[Any], *, active_agent: str) -> str:
-    prefix = ["## Agents", ""]
-    entries: list[tuple[str, bool]] = []
-    current_listed = False
-    normalized_active = str(active_agent or "").casefold()
-    for record in records:
-        record_id = str(_value(record, "agent_id", "id", default="") or "")
-        is_current = (
-            not current_listed
-            and bool(record_id)
-            and record_id.casefold() == normalized_active
-        )
-        if is_current:
-            current_listed = True
-        entries.append((_format_agent(record, active=is_current), is_current))
-    if active_agent and not current_listed:
-        agent_id = _bounded_public_value(active_agent, max_length=_MAX_PUBLIC_ID)
-        entries.append(
-            (f"- **`{agent_id}`** **(current)** **(unavailable)**", True)
-        )
-    elif not entries:
-        entries.append(("_No Agents are available._", False))
-    return _bounded_catalog_markdown(prefix, entries)
 
 
-def _markdown_fence(content: Any, *, language: str = "text") -> str:
-    """Wrap arbitrary output in a code fence longer than any embedded run."""
-
-    value = str(content)
-    longest = 0
-    current = 0
-    for character in value:
-        if character == "`":
-            current += 1
-            longest = max(longest, current)
-        else:
-            current = 0
-    fence = "`" * max(3, longest + 1)
-    return f"{fence}{language}\n{value}\n{fence}"
 
 
-def _bounded_markdown_fence(
-    content: Any,
-    *,
-    language: str,
-    max_length: int,
-) -> str:
-    """Return a complete dynamic fence no longer than ``max_length``."""
-
-    value = str(content)
-    rendered = _markdown_fence(value, language=language)
-    if len(rendered) <= max_length:
-        return rendered
-
-    def truncated(prefix_length: int) -> str:
-        prefix = value[:prefix_length]
-        separator = "" if not prefix or prefix.endswith("\n") else "\n"
-        return _markdown_fence(
-            prefix + separator + _CONTENT_TRUNCATION_MARKER,
-            language=language,
-        )
-
-    low = 0
-    high = len(value)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if len(truncated(middle)) <= max_length:
-            low = middle
-        else:
-            high = middle - 1
-    return truncated(low)
 
 
 _SYSTEM_ROLE_RESPONSE_PREFIX = "system role:\n"
 
 
-def _system_role_fragment_specs(content: str) -> tuple[dict[str, str], ...]:
-    """Render role text as independently valid WeChat Markdown fragments.
-
-    Reply-candidate fragmentation normally slices an opaque string every
-    3,000 characters.  That is unsafe for a fenced role: fragment one can lose
-    its closing fence while fragment two starts without an opening fence.  A
-    role can also contain arbitrarily long backtick runs, so a fixed fence is
-    insufficient.  Partition the *content* losslessly and choose a safe fence
-    for each piece instead.
-    """
-
-    remaining = str(content)
-    fragments: list[dict[str, str]] = []
-    while remaining:
-        heading = _SYSTEM_ROLE_RESPONSE_PREFIX if not fragments else ""
-        available = _WECHAT_REPLY_TEXT_LIMIT - len(heading)
-        if len(fragments) + 1 >= 10:
-            available -= len(_REPLY_CONTINUATION_SUFFIX)
-        low = 1
-        high = len(remaining)
-        best = 0
-        while low <= high:
-            middle = (low + high) // 2
-            rendered = _markdown_fence(remaining[:middle], language="text")
-            if len(rendered) <= available:
-                best = middle
-                low = middle + 1
-            else:
-                high = middle - 1
-        if best <= 0:  # Defensive: even one scalar easily fits in 3,000.
-            raise ValueError("system role cannot be represented as a reply fragment")
-        piece = remaining[:best]
-        fragments.append(
-            {
-                "kind": "text",
-                "content": heading + _markdown_fence(piece, language="text"),
-            }
-        )
-        remaining = remaining[best:]
-    return tuple(fragments)
 
 
-def _system_role_command_response(content: str) -> CommandResponse:
-    """Return the complete receipt text plus its lossless wire presentation."""
-
-    canonical = str(content)
-    return CommandResponse(
-        _SYSTEM_ROLE_RESPONSE_PREFIX + _markdown_fence(canonical, language="text"),
-        response_fragments=_system_role_fragment_specs(canonical),
-    )
 
 
-def _system_role_fragments_from_response(
-    response: str,
-) -> tuple[dict[str, str], ...]:
-    """Rebuild role fragments from a completed receipt after redelivery."""
-
-    rendered = str(response or "")
-    if not rendered.startswith(_SYSTEM_ROLE_RESPONSE_PREFIX):
-        return ()
-    fenced = rendered[len(_SYSTEM_ROLE_RESPONSE_PREFIX) :]
-    opening, separator, remainder = fenced.partition("\n")
-    if not separator or not opening.endswith("text"):
-        return ()
-    fence = opening[: -len("text")]
-    if len(fence) < 3 or set(fence) != {"`"}:
-        return ()
-    closing = "\n" + fence
-    if not remainder.endswith(closing):
-        return ()
-    content = remainder[: -len(closing)]
-    if not content:
-        return ()
-    return _system_role_fragment_specs(content)
 
 
-def _format_shell_markdown(command: str, result: Any) -> str:
-    """Render the bounded legacy shell result without trusting its contents."""
-
-    raw = str(result)
-    first_line, separator, output = raw.partition("\n")
-    exit_code = "unknown"
-    if first_line.lower().startswith("exit code:"):
-        candidate = first_line.split(":", 1)[1].strip()
-        # A subprocess exit status is small.  Bounding this before ``int``
-        # also avoids Python 3.10 accepting an arbitrarily long decimal that
-        # would consume the Markdown budget in the trusted heading.
-        if len(candidate) > 16 or re.fullmatch(r"[+-]?\d+", candidate) is None:
-            output = raw
-        else:
-            exit_code = str(int(candidate))
-            if not separator:
-                output = "(no output)"
-    else:
-        output = raw
-    prefix = (
-        "## Shell Result\n\n"
-        f"- **Exit code:** `{exit_code}`\n\n"
-        "### Command\n\n"
-    )
-    output_heading = "\n\n### Output\n\n"
-    minimum_output = _markdown_fence("", language="text")
-    command_budget = min(
-        _MAX_SHELL_COMMAND_MARKDOWN,
-        _MAX_COMMAND_MARKDOWN
-        - len(prefix)
-        - len(output_heading)
-        - len(minimum_output),
-    )
-    command_fence = _bounded_markdown_fence(
-        command,
-        language="sh",
-        max_length=command_budget,
-    )
-    output_prefix = prefix + command_fence + output_heading
-    output_fence = _bounded_markdown_fence(
-        output or "(no output)",
-        language="text",
-        max_length=_MAX_COMMAND_MARKDOWN - len(output_prefix),
-    )
-    return output_prefix + output_fence
 
 
-def _format_shell_error(message: Any) -> str:
-    prefix = "## Shell Error\n\n"
-    return prefix + _bounded_markdown_fence(
-        message,
-        language="text",
-        max_length=_MAX_COMMAND_MARKDOWN - len(prefix),
-    )
 
 
-def _model_mapping(record: Any) -> Mapping[str, Any]:
-    if isinstance(record, Mapping):
-        return record
-    for method_name in ("model_dump", "to_dict", "as_dict"):
-        method = getattr(record, method_name, None)
-        if callable(method):
-            value = method()
-            if isinstance(value, Mapping):
-                return value
-    return {}
 
 
-def _model_id(record: Any) -> str:
-    value = _value(record, "id", "model_id", "model", default="")
-    return str(getattr(value, "value", value) or "").strip()
 
 
-def _model_display_name(record: Any) -> str:
-    return str(
-        _value(record, "displayName", "display_name", "name", default="") or ""
-    ).strip()
 
 
-def _model_is_default(record: Any) -> bool:
-    return bool(_value(record, "isDefault", "is_default", "default", default=False))
 
 
-def _model_default_effort(record: Any) -> str:
-    value = _value(
-        record,
-        "defaultReasoningEffort",
-        "default_reasoning_effort",
-        default="",
-    )
-    return str(getattr(value, "value", value) or "").strip()
 
 
-def _model_efforts(record: Any) -> tuple[str, ...]:
-    values = _value(
-        record,
-        "supportedReasoningEfforts",
-        "supported_reasoning_efforts",
-        "reasoning_efforts",
-        default=(),
-    )
-    if isinstance(values, Mapping):
-        values = values.values()
-    efforts: list[str] = []
-    for value in values or ():
-        effort = (
-            _value(value, "reasoningEffort", "reasoning_effort", "effort", default="")
-            if isinstance(value, Mapping) or not isinstance(value, str)
-            else value
-        )
-        normalized = str(getattr(effort, "value", effort) or "").strip()
-        if normalized and normalized.lower() not in {item.lower() for item in efforts}:
-            efforts.append(normalized)
-    return tuple(efforts)
 
 
-def _find_model(records: Sequence[Any], model_id: str) -> Any | None:
-    requested = str(model_id or "").strip().lower()
-    return next(
-        (record for record in records if _model_id(record).lower() == requested),
-        None,
-    )
 
 
-def _default_model(records: Sequence[Any]) -> Any | None:
-    return next((record for record in records if _model_is_default(record)), None)
 
 
-def _matching_effort(record: Any, effort: str) -> str | None:
-    requested = str(effort or "").strip().lower()
-    return next(
-        (value for value in _model_efforts(record) if value.lower() == requested),
-        None,
-    )
 
 
-def _model_selection(result: Any) -> tuple[str, str]:
-    model_id = str(
-        _value(result, "model_id", "model", "id", default="") or ""
-    ).strip()
-    effort = str(
-        _value(result, "reasoning_effort", "effort", default="") or ""
-    ).strip()
-    if isinstance(result, (tuple, list)):
-        if result:
-            model_id = str(result[0] or "").strip()
-        if len(result) > 1:
-            effort = str(result[1] or "").strip()
-    return model_id, effort
 
 
-def _format_model_selection_markdown(
-    records: Sequence[Any],
-    *,
-    agent_id: str,
-    configured_model: str,
-    configured_effort: str,
-    heading: str = "Current Model",
-) -> str:
-    selected = _find_model(records, configured_model) if configured_model else _default_model(records)
-    selected_id = _model_id(selected) if selected is not None else configured_model
-    default_effort = _model_default_effort(selected) if selected is not None else ""
-    effective_effort = configured_effort or default_effort or "model default"
-    effort_source = "override" if configured_effort else "default"
-    public_agent_id = _bounded_public_error(
-        agent_id,
-        max_length=_MAX_PUBLIC_ID,
-    )
-    public_model_id = _bounded_public_error(
-        selected_id or "runtime default",
-        max_length=_MAX_PUBLIC_ID,
-    )
-    public_effort = _bounded_public_error(
-        effective_effort,
-        max_length=_MAX_EFFORT_NAME,
-    )
-    return "\n".join(
-        (
-            f"## {heading}",
-            "",
-            f"- **Agent:** `{public_agent_id}`",
-            f"- **Model:** `{public_model_id}`",
-            f"- **Reasoning effort:** `{public_effort}` ({effort_source})",
-            "- **Applies to:** future tasks",
-        )
-    )
 
 
-def _format_models_markdown(
-    records: Sequence[Any],
-    *,
-    agent_id: str,
-    configured_model: str,
-    configured_effort: str,
-) -> str:
-    selected = _find_model(records, configured_model) if configured_model else _default_model(records)
-    prefix = [
-        "## Models",
-        "",
-        "**Current Agent:** `"
-        + _bounded_public_error(agent_id, max_length=_MAX_PUBLIC_ID)
-        + "`",
-        "",
-    ]
-    entries: list[tuple[str, bool]] = []
-    if not records:
-        if configured_model:
-            model_id = _bounded_public_error(
-                configured_model,
-                max_length=_MAX_PUBLIC_ID,
-            )
-            effective_effort = _bounded_public_error(
-                configured_effort or "model default",
-                max_length=_MAX_EFFORT_NAME,
-            )
-            source = "override" if configured_effort else "default"
-            entries.append(
-                (
-                    f"- **`{model_id}`** **(current)** **(unavailable)**. "
-                    f"Efforts: not reported; current effort: `{effective_effort}` ({source}).",
-                    True,
-                )
-            )
-        else:
-            entries.append(
-                (
-                    "- **`runtime default`** **(current)** **(unavailable)**. "
-                    "Efforts: not reported; current effort: "
-                    f"`{_bounded_public_error(configured_effort or 'model default', max_length=_MAX_EFFORT_NAME)}` "
-                    f"({'override' if configured_effort else 'default'}).",
-                    True,
-                )
-            )
-        return _bounded_catalog_markdown(prefix, entries)
-    for record in records:
-        raw_model_id = _model_id(record) or "unknown"
-        model_id = _bounded_public_error(
-            raw_model_id,
-            max_length=_MAX_PUBLIC_ID,
-        )
-        is_current = record is selected
-        marker = " **(current)**" if is_current else ""
-        if _model_is_default(record):
-            marker += " **(default)**"
-        display = _bounded_public_error(
-            _model_display_name(record),
-            max_length=_MAX_PUBLIC_TEXT,
-        )
-        efforts: list[str] = []
-        effort_length = 0
-        efforts_truncated = False
-        for raw_effort in _model_efforts(record):
-            effort = _bounded_public_error(raw_effort, max_length=_MAX_EFFORT_NAME)
-            addition = len(effort) + 2 + (2 if efforts else 0)
-            if effort_length + addition > _MAX_EFFORT_LIST:
-                efforts_truncated = True
-                break
-            efforts.append(f"`{effort}`")
-            effort_length += addition
-        effort_text = ", ".join(efforts) or "not reported"
-        if efforts_truncated:
-            effort_text += ", ..."
-        default_effort = _bounded_public_error(
-            _model_default_effort(record),
-            max_length=_MAX_EFFORT_NAME,
-        )
-        details = f"; default effort: `{default_effort}`" if default_effort else ""
-        current_effort = ""
-        if is_current:
-            effective_effort = _bounded_public_error(
-                configured_effort or default_effort or "model default",
-                max_length=_MAX_EFFORT_NAME,
-            )
-            source = "override" if configured_effort else "default"
-            current_effort = f"; current effort: `{effective_effort}` ({source})"
-        display_text = f" - {display}" if display else ""
-        entries.append(
-            (
-                f"- **`{model_id}`**{marker}{display_text}. Efforts: "
-                f"{effort_text}{details}{current_effort}.",
-                is_current,
-            )
-        )
-    if configured_model and selected is None:
-        # A durable preference can outlive a runtime catalog entry.  Do not
-        # silently relabel the runtime default as current: future tasks still
-        # carry the stored selection until the user changes it.  Keeping the
-        # unavailable selection visible also preserves the `/models`
-        # exactly-one-current-marker contract without mutating a read command.
-        model_id = _bounded_public_error(
-            configured_model,
-            max_length=_MAX_PUBLIC_ID,
-        )
-        effective_effort = _bounded_public_error(
-            configured_effort or "model default",
-            max_length=_MAX_EFFORT_NAME,
-        )
-        source = "override" if configured_effort else "default"
-        entries.append(
-            (
-                f"- **`{model_id}`** **(current)** **(unavailable)**. "
-                f"Efforts: not reported; current effort: `{effective_effort}` ({source}).",
-                True,
-            )
-        )
-    elif not configured_model and selected is None:
-        # Some runtimes report a catalog without flagging a default.  There
-        # is still one effective selection: the runtime's opaque default.
-        # Keep it explicit instead of marking an arbitrary catalog row.
-        effective_effort = _bounded_public_error(
-            configured_effort or "model default",
-            max_length=_MAX_EFFORT_NAME,
-        )
-        source = "override" if configured_effort else "default"
-        entries.append(
-            (
-                "- **`runtime default`** **(current)** **(unavailable)**. "
-                "Efforts: not reported; current effort: "
-                f"`{effective_effort}` ({source}).",
-                True,
-            )
-        )
-    return _bounded_catalog_markdown(prefix, entries)
 
 
-def _format_modes_markdown(records: Sequence[Any], *, current_mode: str) -> str:
-    prefix = ["## Modes", ""]
-    entries: list[tuple[str, bool]] = []
-    if not records:
-        if current_mode:
-            mode_id = _bounded_public_value(
-                current_mode,
-                max_length=_MAX_PUBLIC_ID,
-            )
-            entries.append(
-                (f"- **`{mode_id}`** **(current)** **(unavailable)**", True)
-            )
-        else:
-            entries.append(("_No modes are available._", False))
-        return _bounded_catalog_markdown(prefix, entries)
-    current_listed = False
-    for record in records:
-        raw_mode_id = str(
-            _value(record, "mode_id", "id", "name", default="") or ""
-        ).strip()
-        if not raw_mode_id:
-            continue
-        mode_id = _bounded_public_value(raw_mode_id, max_length=_MAX_PUBLIC_ID)
-        is_current = (
-            not current_listed
-            and raw_mode_id.lower() == current_mode.lower()
-        )
-        if is_current:
-            current_listed = True
-        marker = " **(current)**" if is_current else ""
-        sandbox = _bounded_public_value(
-            _value(record, "sandbox_policy", "sandbox", default="") or "",
-            max_length=_MAX_PUBLIC_TEXT,
-        )
-        permissions: list[str] = []
-        if sandbox:
-            permissions.append(f"sandbox `{sandbox}`")
-        if bool(_value(record, "can_write_files", default=False)):
-            permissions.append("file writes")
-        if bool(_value(record, "can_execute_commands", default=False)):
-            permissions.append("commands")
-        detail = f" - {', '.join(permissions)}" if permissions else ""
-        entries.append((f"- **`{mode_id}`**{marker}{detail}", is_current))
-    if current_mode and not current_listed:
-        mode_id = _bounded_public_value(current_mode, max_length=_MAX_PUBLIC_ID)
-        entries.append(
-            (f"- **`{mode_id}`** **(current)** **(unavailable)**", True)
-        )
-    if not entries:
-        entries.append(("_No modes are available._", False))
-    return _bounded_catalog_markdown(prefix, entries)
 
 
-def _format_inbox_item(record: Any) -> str:
-    content = str(_value(record, "content", "text", default="") or "").strip()
-    task_id = str(_value(record, "task_id", default="") or "")
-    priority = _value(record, "priority", default=1)
-    priority = int(getattr(priority, "value", priority))
-    prefix = f"[{task_id}] " if task_id else ""
-    if priority >= 3:
-        prefix = "[attention] " + prefix
-    elif priority >= 2:
-        prefix = "[notify] " + prefix
-    return f"- {prefix}{content or '(empty notification)'}"
 
 
-def _inbox_ids(records: Sequence[Any]) -> tuple[str, ...]:
-    """Extract durable outbox/item IDs from presentation candidates."""
-
-    values: list[str] = []
-    for record in records:
-        identifier = _value(
-            record,
-            "outbox_id",
-            "delivery_id",
-            "reply_candidate_id",
-            "presentation_id",
-            "id",
-            default="",
-        )
-        if identifier:
-            values.append(str(identifier))
-    return tuple(dict.fromkeys(values))
 
 
-def _switch_back_fragment_specs(
-    acknowledgement: str,
-    records: Sequence[Any],
-) -> tuple[dict[str, str], ...]:
-    """Pack retained items into bounded terminal WeChat text messages.
-
-    Completed items remain the durable presentation/deduplication boundary,
-    but they are not forced to consume one ``SendMsg`` each.  Adjacent text is
-    joined with exactly one blank line; a long individual item is continued
-    losslessly without adding a synthetic separator inside that item.
-    """
-
-    logical_items = [
-        str(acknowledgement) + "\n\nunseen messages:",
-        *(_format_inbox_item(record) for record in records),
-    ]
-    fragments: list[dict[str, str]] = []
-    current = ""
-
-    def limit_for_next_fragment() -> int:
-        return (
-            _WECHAT_REPLY_TEXT_LIMIT
-            if len(fragments) + 1 < 10
-            else _WECHAT_REPLY_TEXT_LIMIT - len(_REPLY_CONTINUATION_SUFFIX)
-        )
-
-    def seal() -> None:
-        nonlocal current
-        if current:
-            fragments.append({"kind": "text", "content": current})
-            current = ""
-
-    for logical_item in logical_items:
-        remaining = str(logical_item)
-        if not remaining:
-            continue
-        separator = "\n\n" if current else ""
-        limit = limit_for_next_fragment()
-        if current and len(current) + len(separator) + len(remaining) <= limit:
-            current += separator + remaining
-            continue
-        if current:
-            seal()
-        # Keep an item whole when it fits an empty message.  Only an item that
-        # is itself too large is divided; continuation chunks receive no item
-        # separator because they are still one logical source item.
-        while remaining:
-            limit = limit_for_next_fragment()
-            if len(remaining) <= limit:
-                current = remaining
-                remaining = ""
-            else:
-                fragments.append(
-                    {"kind": "text", "content": remaining[:limit]}
-                )
-                remaining = remaining[limit:]
-    seal()
-    return tuple(fragments)
 
 
-def _task_belongs_to(record: Any, envelope: InboundEnvelope) -> bool:
-    """Check durable task ownership without exposing another user's task IDs.
-
-    An explicit task ID is user-scoped, not session-scoped.  Session and
-    active-Agent filtering belongs to the no-argument ``/cancel`` lookup; a
-    user must still be able to control one of their tasks after switching
-    sessions.
-    """
-
-    target = _value(record, "reply_target", "target", default=None)
-    target_owner: Any = None
-    if target is not None:
-        target_value = (
-            target.to_dict()
-            if hasattr(target, "to_dict")
-            else target.as_dict()
-            if hasattr(target, "as_dict")
-            else target
-        )
-        target_owner = _value(
-            target_value,
-            "external_user_id",
-            "user_id",
-            default=None,
-        )
-        if target_owner not in (None, ""):
-            return (
-                str(_value(target_value, "channel", default="") or "")
-                == envelope.channel
-                and str(_value(target_value, "bot_id", default="") or "")
-                == envelope.bot_id
-                and str(target_owner) == envelope.external_user_id
-            )
-    # Store task rows expose these columns even when no target projection was
-    # materialized yet.
-    owner = _value(record, "external_user_id", "user_id", default=None)
-    # A row with neither a populated reply target nor explicit owner columns
-    # cannot be authorized.  Treating empty defaults as a match would let any
-    # user operate on a malformed/legacy task ID.
-    if owner is None and target_owner in (None, ""):
-        return False
-    if owner is not None and str(owner) != envelope.external_user_id:
-        return False
-    channel = str(_value(record, "channel", default="") or "")
-    bot_id = str(_value(record, "bot_id", default="") or "")
-    return channel == envelope.channel and bot_id == envelope.bot_id
 
 
 def _ask_task_matches(
@@ -3133,1254 +1980,26 @@ def _command_projection_matches(
     )
 
 
-class MVPCommandRouter:
-    """Handle durable-task control commands through a manager/store facade."""
+def _trusted_principal_mapping_revision(
+    value: Any,
+    *,
+    allow_unmapped: bool = False,
+) -> int | None:
+    """Normalize a revision read from the store-owned identity snapshot."""
 
-    def __init__(
-        self,
-        manager: Any,
-        *,
-        shell_cwd: str | Path | None = None,
-        shell_runner: Callable[..., str] = run_shell_command,
-    ) -> None:
-        self.manager = manager
-        self.shell_cwd = shell_cwd
-        self.shell_runner = shell_runner
-
-    async def handle_command(
-        self,
-        command: ChannelCommand,
-        envelope: InboundEnvelope,
-        *,
-        command_id: str = "",
-    ) -> str | None:
-        name = command.name
-        if name == "__file_upload__":
-            media_values = (
-                envelope.raw.get("media", ())
-                if isinstance(envelope.raw, Mapping)
-                else ()
-            )
-            if isinstance(media_values, Mapping):
-                media_values = (media_values,)
-            files = [
-                item
-                for item in media_values
-                if isinstance(item, Mapping)
-                and str(item.get("kind", "")).strip().lower() == "file"
-            ]
-            labels: list[str] = []
-            for ordinal, item in enumerate(files, start=1):
-                filename = Path(str(item.get("filename", "") or "")).name
-                filename = " ".join(filename.split()).replace("`", "\\`")
-                labels.append(f"- `{filename or f'file {ordinal}'}`")
-            heading = "File stored" if len(labels) == 1 else "Files stored"
-            listing = "\n".join(labels) if labels else "- Uploaded file"
-            pronoun = "it" if len(labels) == 1 else "them"
-            return (
-                f"## {heading}\n\n{listing}\n\n"
-                f"What would you like me to do with {pronoun}?"
-            )
-        if name == "__skill_error__":
-            return command.args[0] if command.args else "unknown skill: use /skills"
-        if name == "__audio_error__":
-            return (
-                command.args[0]
-                if command.args
-                else "I couldn't transcribe that audio; please resend it or type the instruction."
-            )
-        if name == "__queue_full__":
-            return "Agent queue is full; try again later."
-        if name not in MVP_COMMANDS:
-            # A slash-prefixed message is a control-plane input even when the
-            # command is unsupported.  Returning a response here lets the
-            # gateway durably record it without accidentally dispatching it to
-            # an Agent as ordinary user text.
-            token = f"/{name}" if name else "/"
-            return f"unknown command: {token}. try /help"
-
-        # A command redelivery must execute against the route captured when its
-        # inbound row was first accepted.  The gateway restores that durable
-        # snapshot under the reserved raw-payload key.  Only standalone router
-        # calls without a snapshot consult the live route.
-        command_snapshot = (
-            envelope.raw.get("__command_snapshot")
-            if isinstance(envelope.raw, Mapping)
-            else None
-        )
-        route_scope = {
-            "channel": envelope.channel,
-            "bot_id": envelope.bot_id,
-            "external_user_id": envelope.external_user_id,
-            "user_id": envelope.external_user_id,
-            "session_id": envelope.session_id,
-            "conversation_id": envelope.conversation_id,
-        }
-        snapshot_agent = (
-            command_snapshot.get("agent_id")
-            if isinstance(command_snapshot, Mapping)
-            else None
-        )
-        if snapshot_agent:
-            active_agent = snapshot_agent
-        else:
-            try:
-                active_agent = await _invoke_compatible(
-                    self.manager,
-                    ("get_active_agent", "active_agent"),
-                    keyword=route_scope,
-                )
-            except Exception:
-                logger.debug("active Agent lookup unavailable; using envelope route", exc_info=True)
-                active_agent = envelope.agent_id
-        active_agent = _value(active_agent, "agent_id", "id", default=active_agent)
-        active_agent = str(active_agent or envelope.agent_id or DEFAULT_AGENT_ID)
-        if isinstance(command_snapshot, Mapping) and command_snapshot.get(
-            "conversation_id"
-        ):
-            route_scope["conversation_id"] = str(command_snapshot["conversation_id"])
-        scope = {**route_scope, "agent_id": active_agent}
-        if name == "help":
-            return COMMAND_HELP if not command.args else _command_usage(name)
-
-        if name == "report":
-            report = _command_message(command)
-            if not report:
-                return _command_usage(name)
-            task_id: str | None = None
-            try:
-                active_tasks = await _invoke_compatible(
-                    self.manager,
-                    ("list_tasks", "tasks", "get_tasks"),
-                    keyword={
-                        **scope,
-                        "states": (
-                            "claimed",
-                            "running",
-                            "cancel_requested",
-                        ),
-                        "limit": 1,
-                        "newest_first": True,
-                    },
-                )
-            except Exception:
-                active_tasks = ()
-                logger.debug(
-                    "active task lookup unavailable for operator report",
-                    exc_info=True,
-                )
-            for item in active_tasks or ():
-                if (
-                    _task_state(item)
-                    in {"claimed", "dispatching", "running", "cancel_requested"}
-                    and str(
-                        _value(item, "agent_id", default=active_agent)
-                        or active_agent
-                    )
-                    == active_agent
-                ):
-                    task_id = _task_id(item) or None
-                    break
-            payload = {
-                "ts": utc_now(),
-                "agent_id": active_agent,
-                "user": {
-                    "external_user_id": envelope.external_user_id,
-                    "bot_id": envelope.bot_id,
-                },
-                "task_id": task_id,
-                "session": envelope.session_id or DEFAULT_SESSION_ID,
-                "conversation": str(
-                    route_scope.get("conversation_id")
-                    or envelope.conversation_id
-                    or ""
-                ),
-                "report": report,
-            }
-            logger.warning(
-                "COW_OP_REPORT %s",
-                json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            )
-            return "report received"
-
-        if name in {"skills", "listskill", "listskills"}:
-            if command.args:
-                return _command_usage(name)
-            try:
-                result = await _invoke_compatible(
-                    self.manager,
-                    ("list_skills", "skills"),
-                    keyword={
-                        **scope,
-                        "agent_id": active_agent,
-                        "refresh": False,
-                        "workspace_snapshot": (
-                            command_snapshot.get("execution_workspace")
-                            if isinstance(command_snapshot, Mapping)
-                            else None
-                        ),
-                    },
-                )
-            except Exception:
-                logger.debug("skill listing unavailable", exc_info=True)
-                return "skills unavailable; try again later"
-            return format_skills_markdown(result)
-
-        if name in {"clear", "reset"}:
-            if command.args:
-                return _command_usage(name)
-            # ``/clear`` is a compatibility command, but it still has to use
-            # the durable manager boundary.  A manager implementation can
-            # clear its SQLite thread binding and reset the selected runtime
-            # atomically under the per-session control lock.  The fallback is
-            # retained for narrow legacy facades that expose only the runtime
-            # reset method.
-            try:
-                result = await _invoke_compatible(
-                    self.manager,
-                    ("clear_session", "reset_session", "clear_conversation", "reset_conversation"),
-                    keyword={
-                        **scope,
-                        "agent_id": active_agent,
-                        "actor": envelope.external_user_id,
-                    },
-                )
-            except AttributeError:
-                runtime_target = None
-                registry = getattr(self.manager, "registry", None)
-                if registry is not None:
-                    getter = getattr(registry, "require", None) or getattr(
-                        registry, "runtime_for", None
-                    )
-                    if getter is not None:
-                        try:
-                            runtime_target = getter(active_agent)
-                        except Exception:
-                            runtime_target = None
-                if runtime_target is None:
-                    runtime_target = self.manager
-                try:
-                    result = await _invoke_compatible(
-                        runtime_target,
-                        ("reset_session", "clear_session", "clear_conversation"),
-                        positional=(envelope.conversation_id,),
-                        keyword={"conversation_id": envelope.conversation_id},
-                    )
-                except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                    return (
-                        "cannot clear conversation: "
-                        f"{detail or 'operation failed'}"
-                    )
-            except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return (
-                    "cannot clear conversation: "
-                    f"{detail or 'operation failed'}"
-                )
-            # Do not expose a provider-specific thread identifier in the
-            # command response; it is an implementation detail and may be
-            # rotated on the next task claim.
-            return "context cleared, starting a new conversation"
-
-        if name == "compact":
-            if command.args:
-                return _command_usage(name)
-            # Manual compaction belongs at the durable manager boundary so it
-            # shares the per-session control lock with route changes, model
-            # changes, and `/clear`.  The manager also owns persistence of any
-            # exact provider thread binding.
-            try:
-                result = await _invoke_compatible(
-                    self.manager,
-                    ("compact_session", "compact_conversation"),
-                    keyword={
-                        **scope,
-                        "agent_id": active_agent,
-                        "actor": envelope.external_user_id,
-                    },
-                )
-            except AttributeError:
-                return "cannot compact conversation: context compaction is unavailable"
-            except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return (
-                    "cannot compact conversation: "
-                    f"{detail or 'operation failed'}"
-                )
-            # The pinned SDK reports request acceptance before asynchronous
-            # compaction finishes.  A runtime without the public thread-read
-            # confirmation surface therefore receives a truthful "started"
-            # acknowledgement instead of a false completion claim.
-            if (
-                isinstance(result, Mapping)
-                and result.get("completion_confirmed") is False
-            ):
-                return "context compaction started"
-            # Keep the provider-specific thread identifier out of the channel
-            # acknowledgement; in-place compaction preserves that identity.
-            return "context compacted"
-
-        if name == "system":
-            # Role content is an exact raw-tail contract.  Consume only the
-            # command token and its horizontal separator; normalization owns
-            # outer Unicode whitespace while preserving internal layout.
-            raw_command = str(command.raw or "")
-            match = re.match(
-                r"^\s*/system(?=$|\s)",
-                raw_command,
-                flags=re.IGNORECASE,
-            )
-            if match is None:
-                # ``ChannelCommand.raw`` is required for this command because
-                # whitespace and newlines in the role are semantically
-                # significant.  Compatibility callers must not accidentally
-                # turn a malformed/missing raw command into a read request.
-                return "invalid system command"
-            raw_tail = raw_command[match.end() :]
-            raw_tail = re.sub(r"^[ \t]*", "", raw_tail, count=1)
-            try:
-                canonical = normalize_role_text(raw_tail)
-            except RoleValidationError as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return f"invalid system role: {detail or 'invalid role'}"
-
-            if not canonical:
-                try:
-                    value = await _invoke_compatible(
-                        self.manager,
-                        ("get_system_role", "get_session_role", "get_role"),
-                        keyword=scope,
-                    )
-                    role = validate_role_snapshot(value)
-                except AttributeError:
-                    return "system role is unavailable"
-                except RoleValidationError:
-                    return "cannot get system role: invalid stored role"
-                except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                    return f"cannot get system role: {detail or 'operation failed'}"
-                if role["kind"] == "default":
-                    return "system role: default"
-                return _system_role_command_response(role["normalized_content"])
-
-            requested_kind = (
-                "default" if is_default_role_token(canonical) else "custom"
-            )
-            role_text = "" if requested_kind == "default" else canonical
-            try:
-                role_keywords = {
-                    **scope,
-                    "kind": requested_kind,
-                    "actor": envelope.external_user_id,
-                }
-                if command_id:
-                    # Only the gateway receipt owner supplies this correlation.
-                    # Standalone router calls intentionally omit it and retain
-                    # the compatibility manager/store path.
-                    role_keywords["command_id"] = str(command_id)
-                value = await _invoke_compatible(
-                    self.manager,
-                    ("set_system_role", "set_session_role", "set_role"),
-                    positional=(role_text,),
-                    keyword=role_keywords,
-                )
-                if not isinstance(value, Mapping):
-                    raise RuntimeError("invalid role persistence response")
-                role = validate_role_snapshot(value)
-                changed = bool(value.get("changed", True))
-            except AttributeError:
-                return "system role is unavailable"
-            except RoleValidationError as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return f"invalid system role: {detail or 'invalid role'}"
-            except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return f"cannot set system role: {detail or 'operation failed'}"
-            response = (
-                "system role: unchanged"
-                if not changed
-                else (
-                    "system role: default"
-                    if role["kind"] == "default"
-                    else "system role: updated"
-                )
-            )
-            stored_response = value.get("command_response")
-            if stored_response is not None and (
-                not isinstance(stored_response, str)
-                or stored_response != response
-            ):
-                return "cannot set system role: invalid persistence response"
-            return stored_response or response
-
-        if name == "mode":
-            if len(command.args) > 1:
-                return _command_usage(name)
-            if not command.args:
-                try:
-                    mode = await _invoke_compatible(
-                        self.manager,
-                        ("get_mode", "mode"),
-                        keyword=scope,
-                    )
-                except AttributeError:
-                    return "mode selection is unavailable"
-                except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                    # A malformed or revoked persisted mode must produce a
-                    # durable command response rather than escaping through
-                    # the gateway and leaving the inbound command unhandled.
-                    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                    return f"cannot get mode: {detail or 'operation failed'}"
-                return f"mode: {mode}"
-            requested_mode = command.args[0].strip().lower()
-            if requested_mode not in {"chat", "plan", "review", "execute"}:
-                return _command_usage(name)
-            try:
-                mode = await _invoke_compatible(
-                    self.manager,
-                    ("set_mode", "switch_mode"),
-                    positional=(requested_mode,),
-                    keyword={
-                        **scope,
-                        "actor": envelope.external_user_id,
-                        "explicit": True,
-                    },
-                )
-            except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return f"cannot set mode: {detail or 'operation failed'}"
-            return f"mode: {mode}"
-
-        if name == "modes":
-            if command.args:
-                return _command_usage(name)
-            try:
-                modes = await _invoke_compatible(
-                    self.manager,
-                    ("list_modes", "modes"),
-                    keyword={"agent_id": active_agent},
-                )
-                current_mode = await _invoke_compatible(
-                    self.manager,
-                    ("get_mode", "mode"),
-                    keyword=scope,
-                )
-            except AttributeError:
-                return "mode registry is unavailable"
-            except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return f"cannot list modes: {detail or 'operation failed'}"
-            return _format_modes_markdown(
-                list(modes or ()), current_mode=str(current_mode or "")
-            )
-
-        if name in {"model", "models"}:
-            if name == "models" and command.args:
-                return _command_usage(name)
-            if name == "model" and command.args and len(command.args) != 2:
-                return _command_usage(name)
-            clears_effort = (
-                name == "model"
-                and len(command.args) == 2
-                and command.args[0].lower() == "effort"
-                and command.args[1].lower() == "default"
-            )
-            if clears_effort:
-                # Resetting to the runtime/model default is valid without a
-                # live catalog. Dispatch it directly so model discovery cannot
-                # prevent or delay clearing the durable override.
-                try:
-                    selection = await _invoke_compatible(
-                        self.manager,
-                        ("set_reasoning_effort",),
-                        positional=(command.args[1],),
-                        keyword={
-                            **scope,
-                            "reasoning_effort": command.args[1],
-                        },
-                    )
-                except AttributeError:
-                    return "model selection is unavailable"
-                except ValidationError as exc:
-                    logger.warning(
-                        "cannot reset model effort after invalid runtime response: %s",
-                        _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
-                    )
-                    return "cannot set model: model service is unavailable"
-                except (KeyError, PermissionError):
-                    return "model selection is unavailable"
-                except ValueError as exc:
-                    return _format_model_capability_error("set", exc)
-                except RuntimeError as exc:
-                    logger.warning(
-                        "cannot reset model effort through runtime: %s",
-                        _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
-                    )
-                    return "cannot set model: model service is unavailable"
-                except Exception as exc:
-                    logger.warning(
-                        "cannot reset model effort through runtime: %s",
-                        _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
-                    )
-                    return "cannot set model: model service is unavailable"
-                selected_model, selected_effort = _model_selection(selection)
-                return _format_model_selection_markdown(
-                    (),
-                    agent_id=active_agent,
-                    configured_model=selected_model,
-                    configured_effort=selected_effort,
-                )
-            try:
-                models = list(
-                    await _invoke_compatible(
-                        self.manager,
-                        ("list_models", "models"),
-                        keyword={"agent_id": active_agent, "include_hidden": False},
-                    )
-                    or ()
-                )
-                if name == "model" and command.args:
-                    requested, effort = command.args
-                    if requested.lower() == "effort":
-                        selection = await _invoke_compatible(
-                            self.manager,
-                            ("set_reasoning_effort",),
-                            positional=(effort,),
-                            keyword={**scope, "reasoning_effort": effort},
-                        )
-                    else:
-                        selection = await _invoke_compatible(
-                            self.manager,
-                            ("set_model", "select_model"),
-                            positional=(requested,),
-                            keyword={
-                                **scope,
-                                "model_id": requested,
-                                "reasoning_effort": effort,
-                            },
-                        )
-                else:
-                    selection = await _invoke_compatible(
-                        self.manager,
-                        ("get_model_selection", "get_model_preference"),
-                        keyword=scope,
-                    )
-            except AttributeError:
-                return "model selection is unavailable"
-            except ValidationError as exc:
-                action = "set" if name == "model" and command.args else "list"
-                logger.warning(
-                    "cannot %s model after invalid runtime response: %s",
-                    action,
-                    _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
-                )
-                return f"cannot {action} model: model service is unavailable"
-            except (KeyError, PermissionError):
-                return "model selection is unavailable"
-            except ValueError as exc:
-                action = "set" if name == "model" and command.args else "list"
-                return _format_model_capability_error(action, exc)
-            except RuntimeError as exc:
-                action = "set" if name == "model" and command.args else "list"
-                logger.warning(
-                    "cannot %s model through runtime: %s",
-                    action,
-                    _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
-                )
-                return f"cannot {action} model: model service is unavailable"
-            except Exception as exc:
-                # SDK transport/RPC failures are ordinary Exceptions. Convert
-                # them into a deterministic command result so the durable
-                # receipt completes and redelivery never reports an ambiguous
-                # unknown outcome. Cancellation remains outside this boundary.
-                action = "set" if name == "model" and command.args else "list"
-                logger.warning(
-                    "cannot %s model through runtime: %s",
-                    action,
-                    _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT),
-                )
-                return f"cannot {action} model: model service is unavailable"
-            selected_model, selected_effort = _model_selection(selection)
-            if name == "models":
-                return _format_models_markdown(
-                    models,
-                    agent_id=active_agent,
-                    configured_model=selected_model,
-                    configured_effort=selected_effort,
-                )
-            return _format_model_selection_markdown(
-                models,
-                agent_id=active_agent,
-                configured_model=selected_model,
-                configured_effort=selected_effort,
-            )
-
-        if name == "cd":
-            # A path is one shell-like token so quoted spaces remain usable,
-            # while the raw command remains the authority instead of the
-            # generic whitespace-normalized ``ChannelCommand.args`` tuple.
-            raw_command = str(command.raw or "")
-            match = re.match(r"^\s*/cd(?=$|\s)", raw_command, flags=re.IGNORECASE)
-            if match is None:
-                return _command_usage(name)
-            raw_tail = raw_command[match.end() :].strip()
-            if not raw_tail:
-                try:
-                    value = await _invoke_compatible(
-                        self.manager,
-                        ("get_working_directory",),
-                        keyword={
-                            **scope,
-                            "workspace_snapshot": (
-                                command_snapshot.get("execution_workspace")
-                                if isinstance(command_snapshot, Mapping)
-                                else None
-                            ),
-                        },
-                    )
-                    _cwd, display_path = _working_directory_path(value)
-                    return _format_working_directory(display_path)
-                except AttributeError:
-                    return "working directory is unavailable"
-                except Exception as exc:
-                    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                    return (
-                        "cannot get working directory: "
-                        f"{detail or 'operation failed'}"
-                    )
-
-            try:
-                path_values = shlex.split(raw_tail, posix=True)
-            except ValueError:
-                return _command_usage(name)
-            if len(path_values) != 1 or not path_values[0]:
-                return _command_usage(name)
-            requested_path = path_values[0]
-            try:
-                set_keywords = {
-                    **scope,
-                    "actor": envelope.external_user_id,
-                }
-                if command_id:
-                    set_keywords["command_id"] = str(command_id)
-                if isinstance(command_snapshot, Mapping):
-                    set_keywords["workspace_snapshot"] = command_snapshot.get(
-                        "execution_workspace"
-                    )
-                value = await _invoke_compatible(
-                    self.manager,
-                    ("set_working_directory",),
-                    positional=(requested_path,),
-                    keyword=set_keywords,
-                )
-                if not isinstance(value, Mapping):
-                    raise ValueError("invalid working directory persistence response")
-                _cwd, display_path = _working_directory_path(
-                    value,
-                    fallback=requested_path,
-                )
-                stored_response = value.get("command_response")
-                if stored_response is not None and not isinstance(
-                    stored_response, str
-                ):
-                    raise ValueError("invalid working directory persistence response")
-                response = _format_working_directory(display_path)
-                if stored_response is not None and stored_response != response:
-                    raise ValueError("invalid working directory persistence response")
-                return response
-            except AttributeError:
-                return "working directory is unavailable"
-            except Exception as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return (
-                    "cannot set working directory: "
-                    f"{detail or 'operation failed'}"
-                )
-
-        if name == "sh":
-            # ``ChannelCommand.args`` is intentionally whitespace-normalized
-            # for most controls.  `/sh` is different: preserve the original
-            # shell text so quoting and deliberate spacing retain the legacy
-            # command's behavior.
-            raw_command = str(command.raw or "").strip()
-            command_text = (
-                raw_command[3:].strip()
-                if raw_command[:3].lower() == "/sh"
-                else command.argument.strip()
-            )
-            if not command_text:
-                return _command_usage(name)
-
-            shell_cwd: str | Path | None = self.shell_cwd
-            working_directory_reader = getattr(
-                self.manager, "get_working_directory", None
-            )
-            if callable(working_directory_reader):
-                workspace_snapshot = (
-                    command_snapshot.get("execution_workspace")
-                    if isinstance(command_snapshot, Mapping)
-                    else None
-                )
-                try:
-                    directory = await _invoke_compatible(
-                        self.manager,
-                        ("get_working_directory",),
-                        keyword={
-                            **scope,
-                            "workspace_snapshot": workspace_snapshot,
-                        },
-                    )
-                    shell_cwd, _display_path = _working_directory_path(directory)
-                except Exception as exc:
-                    detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                    return _format_shell_error(
-                        "cannot get working directory: "
-                        f"{detail or 'operation failed'}"
-                    )
-
-            def invoke_shell() -> str:
-                # Inspect the injected helper before invoking it so a genuine
-                # TypeError raised by the command itself is not mistaken for
-                # a narrow legacy signature and executed twice.
-                try:
-                    signature = inspect.signature(self.shell_runner)
-                except (TypeError, ValueError):
-                    return self.shell_runner(command_text, cwd=shell_cwd)
-                accepts_var_kw = any(
-                    parameter.kind == inspect.Parameter.VAR_KEYWORD
-                    for parameter in signature.parameters.values()
-                )
-                if accepts_var_kw or "cwd" in signature.parameters:
-                    return self.shell_runner(command_text, cwd=shell_cwd)
-                return self.shell_runner(command_text)
-
-            try:
-                result = await asyncio.to_thread(invoke_shell)
-            except subprocess.TimeoutExpired:
-                return _format_shell_error(
-                    f"shell command timed out after {_SHELL_TIMEOUT} seconds"
-                )
-            except OSError as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return _format_shell_error(
-                    f"shell command failed to start: {detail or 'operation failed'}"
-                )
-            except Exception as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return _format_shell_error(
-                    f"shell command failed: {detail or 'operation failed'}"
-                )
-            return _format_shell_markdown(command_text, result)
-
-        if name == "ask":
-            if len(command.args) < 2:
-                return _command_usage(name)
-            destination = command.args[0].strip()
-            # ``ChannelCommand.args`` is whitespace-normalized for control
-            # syntax. The prompt is user input, so split only the command and
-            # destination tokens and preserve the remainder verbatim (apart
-            # from surrounding whitespace).
-            raw_command = str(command.raw or "")
-            ask_match = re.match(
-                r"^\s*/ask\s+(\S+)(?:\s+([\s\S]*))?$",
-                raw_command,
-                flags=re.IGNORECASE,
-            )
-            prompt = (
-                (ask_match.group(2) or "").strip()
-                if ask_match is not None
-                else " ".join(command.args[1:]).strip()
-            )
-            if not prompt:
-                return _command_usage(name)
-            request_id = command_request_id(envelope)
-            task_id = command_task_id(envelope)
-            acknowledgement = f"Agent task queued: {task_id}"
-            try:
-                await _invoke_compatible(
-                    self.manager,
-                    ("ensure_agent",),
-                    positional=(destination,),
-                    keyword={"agent_id": destination},
-                )
-                result = await _invoke_compatible(
-                    self.manager,
-                    ("submit", "enqueue", "create_task", "queue_task"),
-                    positional=(prompt, envelope.reply_target),
-                    keyword={
-                        "task_id": task_id,
-                        "agent_id": destination,
-                        "actor": envelope.external_user_id,
-                        "explicit": True,
-                        "request_id": request_id,
-                        "dedupe_key": f"command-ask:{request_id}",
-                        # Reserve the acknowledgement and ordinal before the
-                        # queued row becomes visible to any dispatcher.  The
-                        # gateway later replays this exact projection when it
-                        # performs the immediate external send.
-                        "initial_reply": command_initial_reply(
-                            envelope,
-                            acknowledgement,
-                            agent_id=active_agent,
-                        ),
-                        "metadata": {
-                            "direct_user_request": True,
-                            "requesting_agent_id": active_agent,
-                            "user_reply_format": USER_REPLY_FORMAT_AGENT_PREFIX_V1,
-                        },
-                    },
-                )
-            except QueueFullError:
-                return "cannot ask Agent: queue is full"
-            except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return f"cannot ask Agent: {detail or 'operation failed'}"
-            resolved_task_id = _task_id(result) or task_id
-            if resolved_task_id != task_id:
-                # A pre-framed legacy dedupe winner may carry a different
-                # random ID.  The atomic store rejects a new acknowledgement
-                # in that case; fail closed for narrower compatibility stores
-                # rather than telling the user about a task other than the
-                # one named in the reserved reply.
-                return "cannot ask Agent: task identity conflicts"
-            return acknowledgement
-
-        if name == "agents":
-            if command.args:
-                return _command_usage(name)
-            try:
-                result = await _invoke_compatible(
-                    self.manager,
-                    ("list_agents", "agents", "list_profiles"),
-                    keyword={},
-                )
-            except AttributeError:
-                return "Agent registry is unavailable"
-            records = list(result or [])
-            try:
-                active = await _invoke_compatible(
-                    self.manager,
-                    ("get_active_agent", "active_agent"),
-                    keyword={
-                        "channel": envelope.channel,
-                        "bot_id": envelope.bot_id,
-                        "external_user_id": envelope.external_user_id,
-                        "session_id": envelope.session_id,
-                    },
-                )
-            except AttributeError:
-                active = active_agent
-            return _format_agents_markdown(records, active_agent=str(active))
-
-        if name == "delagent":
-            if len(command.args) != 1:
-                return _command_usage(name)
-            selected = command.args[0].strip().lower()
-            try:
-                await _invoke_compatible(
-                    self.manager,
-                    ("delete_agent", "delagent", "remove_agent"),
-                    positional=(selected,),
-                    keyword={
-                        "channel": envelope.channel,
-                        "bot_id": envelope.bot_id,
-                        "external_user_id": envelope.external_user_id,
-                        "session_id": envelope.session_id,
-                    },
-                )
-            except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return f"cannot delete Agent: {detail or 'operation failed'}"
-            return f"Agent deleted: {selected}"
-
-        if name == "agent":
-            if len(command.args) > 2:
-                return _command_usage(name)
-            if not command.args:
-                try:
-                    active = await _invoke_compatible(
-                        self.manager,
-                        ("get_active_agent", "active_agent"),
-                        keyword={
-                            "channel": envelope.channel,
-                            "bot_id": envelope.bot_id,
-                            "external_user_id": envelope.external_user_id,
-                            "session_id": envelope.session_id,
-                        },
-                    )
-                except AttributeError:
-                    active = active_agent
-                active = _value(active, "agent_id", "id", default=active)
-                return f"active Agent: {active}"
-            # Agent IDs are canonicalized by the manager so routes and
-            # conversation identities remain stable across casing variants.
-            selected = command.args[0].strip().lower()
-            codex_config_profile = (
-                command.args[1].strip() if len(command.args) == 2 else None
-            )
-            try:
-                await _invoke_compatible(
-                    self.manager,
-                    ("set_active_agent", "switch_agent", "set_agent"),
-                    positional=(selected,),
-                    keyword={
-                        "codex_config_profile": codex_config_profile,
-                        "channel": envelope.channel,
-                        "bot_id": envelope.bot_id,
-                        "external_user_id": envelope.external_user_id,
-                        "session_id": envelope.session_id,
-                    },
-                )
-            except (AttributeError, KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return f"cannot switch Agent: {detail or 'operation failed'}"
-            # Only completed items retained while this Agent was in the
-            # background are eligible here.  The manager deliberately keeps
-            # allocated/sent history and `/recv` quota deferrals off this
-            # surface, so switching cannot replay a transcript.
-            try:
-                unseen = list(
-                    await _invoke_compatible(
-                        self.manager,
-                        ("switch_back_inbox",),
-                        keyword={
-                            "channel": envelope.channel,
-                            "bot_id": envelope.bot_id,
-                            "external_user_id": envelope.external_user_id,
-                            "session_id": envelope.session_id,
-                            "agent_id": selected,
-                            "limit": 100,
-                            "present": False,
-                        },
-                    )
-                    or ()
-                )
-            except AttributeError:
-                # Narrow compatibility managers predate durable candidate
-                # presentation; retain their route-only behavior.
-                unseen = []
-            response = f"switched to Agent: {selected}"
-            if not unseen:
-                return response
-            formatted = tuple(_format_inbox_item(item) for item in unseen)
-            return CommandResponse(
-                response
-                + "\n\nunseen messages:\n"
-                + "\n".join(formatted),
-                _inbox_ids(unseen),
-                response_fragments=_switch_back_fragment_specs(response, unseen),
-            )
-
-        if name == "notify":
-            if len(command.args) > 1 or (
-                command.args and command.args[0].lower() not in {"on", "off"}
-            ):
-                return _command_usage(name)
-            if not command.args:
-                try:
-                    enabled = await _invoke_compatible(
-                        self.manager,
-                        ("get_notify", "get_notification_preference"),
-                        keyword=scope,
-                    )
-                except AttributeError:
-                    return "notification preferences are unavailable"
-                return f"notifications: {'on' if bool(enabled) else 'off'}"
-            enabled = command.args[0].lower() == "on"
-            try:
-                result = await _invoke_compatible(
-                    self.manager,
-                    ("set_notify", "set_notification_preference", "set_notify_preference"),
-                    positional=(enabled,),
-                    keyword=scope,
-                )
-            except (AttributeError, ValueError, PermissionError, RuntimeError) as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return f"cannot set notifications: {detail or 'operation failed'}"
-            return f"notifications: {'on' if bool(result) else 'off'}"
-
-        if name == "inbox":
-            if len(command.args) > 1:
-                return _command_usage(name)
-            requested = command.args[0] if command.args else active_agent
-            if requested.lower() == "all":
-                try:
-                    agents = await _invoke_compatible(
-                        self.manager,
-                        ("list_agents", "agents"),
-                        keyword={},
-                    )
-                except AttributeError:
-                    agents = []
-                agent_ids = [
-                    str(_value(item, "agent_id", "id", default=""))
-                    for item in list(agents or [])
-                ]
-            else:
-                agent_ids = [requested]
-            records: list[Any] = []
-            for agent_id in agent_ids:
-                try:
-                    result = await _invoke_compatible(
-                        self.manager,
-                        ("inbox", "present_inbox", "present_notifications"),
-                        keyword={
-                            **scope,
-                            "agent_id": agent_id,
-                            "limit": 100,
-                            "present": False,
-                            "include_command_responses": False,
-                        },
-                    )
-                except AttributeError:
-                    result = []
-                records.extend(list(result or []))
-            if not records:
-                return "inbox: (empty)"
-            return CommandResponse(
-                "inbox:\n" + "\n".join(_format_inbox_item(item) for item in records),
-                _inbox_ids(records),
-            )
-
-        if name == "recv":
-            if command.args:
-                return _command_usage(name)
-            try:
-                projection = await _invoke_compatible(
-                    self.manager,
-                    (
-                        "drain_deferred_replies",
-                        "receive_deferred_replies",
-                        "drain_reply_overflow",
-                    ),
-                    keyword={
-                        "target": envelope.reply_target.to_dict(),
-                        # The full compound command identity is stable across
-                        # channel redelivery and cannot collide across bots,
-                        # users, sessions, or delimiter-bearing message IDs.
-                        "source_key": command_delivery_id(envelope),
-                        "limit": 10,
-                    },
-                )
-            except AttributeError:
-                return "reply continuation is unavailable"
-            except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-                detail = _bounded_public_error(exc, max_length=_MAX_PUBLIC_TEXT)
-                return (
-                    "cannot receive deferred replies: "
-                    f"{detail or 'operation failed'}"
-                )
-            outbox_items = tuple(
-                _value(projection, "outbox_items", default=()) or ()
-            )
-            if not outbox_items:
-                return "no deferred replies"
-            # The allocator already created one canonical outbox send per
-            # reply slot.  Returning another command string here would spend
-            # an extra slot and could overtake the retained FIFO batch.
-            return CommandResponse("")
-
-        if name == "status":
-            if command.args:
-                return _command_usage(name)
-            try:
-                result = await _invoke_compatible(
-                    self.manager,
-                    ("status", "get_status", "task_status"),
-                    keyword=scope,
-                )
-            except AttributeError:
-                return "status is unavailable"
-            if isinstance(result, str):
-                return result
-            if result is None:
-                return "idle"
-            if isinstance(result, Sequence) and not isinstance(
-                result, (str, bytes, bytearray)
-            ):
-                records = list(result)
-                # Facades other than TaskManager may return the full task
-                # history.  `/status` is intentionally an active-work query;
-                # completed/failed rows belong under `/tasks`.
-                records = [
-                    item
-                    for item in records
-                    if not _task_state(item) or _task_state(item) in ACTIVE_TASK_STATES
-                ]
-                if not records:
-                    return "idle"
-                return "active tasks:\n" + "\n".join(
-                    f"- {_format_task(item)}" for item in records
-                )
-            if _task_state(result) in TERMINAL_TASK_STATES:
-                return "idle"
-            return _format_task(result)
-
-        if name == "tasks":
-            if len(command.args) > 1 or (
-                command.args and not command.args[0].isdigit()
-            ):
-                return _command_usage(name)
-            limit = int(command.args[0]) if command.args else 20
-            limit = min(max(limit, 1), 100)
-            try:
-                result = await _invoke_compatible(
-                    self.manager,
-                    ("list_tasks", "tasks", "get_tasks"),
-                    keyword={**scope, "limit": limit},
-                )
-            except AttributeError:
-                return "tasks are unavailable"
-            records = list(result or [])
-            if not records:
-                return "tasks: (none)"
-            return "tasks:\n" + "\n".join(
-                f"- {_format_task(item)}" for item in records
-            )
-
-        if name == "cancel" and not command.args:
-            # Conversation serialization normally guarantees one running task
-            # for this Agent route. Fail closed if a corrupt/legacy store
-            # reports more than one instead of interrupting an arbitrary turn.
-            try:
-                active = await _invoke_compatible(
-                    self.manager,
-                    ("list_tasks", "tasks", "get_tasks"),
-                    keyword={
-                        **scope,
-                        "states": ("running",),
-                        "limit": 2,
-                        "newest_first": True,
-                    },
-                )
-            except AttributeError:
-                active = []
-            active_records = [
-                item
-                for item in list(active or [])
-                if _task_state(item) == "running"
-                and str(_value(item, "agent_id", default=active_agent) or active_agent)
-                == active_agent
-            ]
-            if len(active_records) == 1:
-                selected_id = _task_id(active_records[0])
-                if not selected_id:
-                    return "no running task for current Agent"
-                command = ChannelCommand(name="cancel", args=(selected_id,), raw=command.raw)
-            elif not active_records:
-                return "no running task for current Agent"
-            else:
-                return "multiple running tasks; use /cancel <task-id>"
-
-        if len(command.args) != 1:
-            if name == "cancel":
-                return _command_usage(name)
-            return _command_usage(name)
-        task_id = command.args[0]
-        # Authorization is performed before invoking a control operation when
-        # the facade exposes a public task lookup.  Missing/foreign tasks use
-        # the same response to avoid leaking existence across users.
-        record = None
-        getter = getattr(self.manager, "get_task", None)
-        if getter is not None:
-            try:
-                record = await _maybe_await(getter(task_id))
-            except Exception:
-                record = None
-            if record is None or not _task_belongs_to(record, envelope):
-                return f"cannot {name} task {task_id}"
-            state = _task_state(record)
-            if name == "retry" and state and state not in RETRYABLE_TASK_STATES:
-                return f"cannot retry task {task_id}"
-            if name == "cancel" and state in TERMINAL_TASK_STATES:
-                return f"cannot cancel task {task_id}"
-        action_names = {
-            "retry": ("retry", "retry_task", "requeue_task"),
-            "cancel": ("cancel", "cancel_task", "request_cancel"),
-        }
-        action_keyword = dict(scope)
-        if name == "retry":
-            retry_acknowledgement = f"retry queued: {task_id}"
-            action_keyword["initial_reply"] = command_initial_reply(
-                envelope,
-                retry_acknowledgement,
-                agent_id=active_agent,
-            )
-        try:
-            result = await _invoke_compatible(
-                self.manager,
-                action_names[name],
-                positional=(task_id,),
-                keyword=action_keyword,
-            )
-        except AttributeError:
-            return f"{name} is unavailable"
-        except QueueFullError:
-            return f"cannot {name} task {task_id}: queue is full"
-        except (KeyError, PermissionError, ValueError, RuntimeError) as exc:
-            # A durable command acknowledgement should not make the monitor
-            # retain its cursor indefinitely when the store rejects a stale
-            # or invalid task transition.  Keep the response deliberately
-            # non-disclosing for ownership/security errors.
-            logger.debug("%s task %s rejected", name, task_id, exc_info=True)
-            return f"cannot {name} task {task_id}"
-        if isinstance(result, str):
-            return result
-        state_value = _value(result, "state", "status", default="")
-        state = str(getattr(state_value, "value", state_value) or "").lower()
-        if name == "retry" and state:
-            changed = state == "queued"
-        else:
-            changed = bool(
-                _value(result, "changed", "accepted", "requested", default=result)
-            )
-        verb = {
-            "retry": "retry queued",
-            "cancel": "cancel requested",
-        }[name]
-        if changed:
-            acknowledgement = f"{verb}: {task_id}"
-            if name == "cancel" and record is not None:
-                task_agent_id = str(
-                    _value(record, "agent_id", default="") or ""
-                ).strip()
-                task_state = _task_state(record)
-                if (
-                    task_agent_id
-                    and task_state
-                    in ACTIVE_TASK_STATES | {"dispatching"}
-                ):
-                    try:
-                        mailbox_cancelled = bool(
-                            await _invoke_compatible(
-                                self.manager,
-                                (
-                                    "cancel_active_agent_mailbox",
-                                    "cancel_agent_mailbox",
-                                    "request_mailbox_cancel",
-                                ),
-                                positional=(task_agent_id,),
-                            )
-                        )
-                    except AttributeError:
-                        mailbox_cancelled = False
-                    except Exception:
-                        mailbox_cancelled = False
-                        logger.warning(
-                            "mailbox cancellation failed after task %s "
-                            "was cancelled",
-                            task_id,
-                            exc_info=True,
-                        )
-                    if mailbox_cancelled:
-                        acknowledgement += "; agent mailbox turn cancelled"
-            return acknowledgement
-        return f"cannot {name} task {task_id}"
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise RuntimeError("principal mapping revision is invalid")
+    try:
+        revision = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("principal mapping revision is invalid") from exc
+    if revision == 0 and allow_unmapped:
+        return 0
+    if revision <= 0:
+        raise RuntimeError("principal mapping revision is invalid")
+    return revision
 
 
 class WeChatGateway:
@@ -4828,6 +2447,40 @@ class WeChatGateway:
         persisted_text = _value(inbound_record, "text", default=None)
         persisted_received = _value(inbound_record, "received_at", default=None)
         persisted_payload = _value(inbound_record, "payload", default=None)
+        persisted_identity = _value(
+            inbound_record, "identity_snapshot", default=None
+        )
+        principal_snapshot = (
+            persisted_identity.get("principal", {})
+            if isinstance(persisted_identity, Mapping)
+            else {}
+        )
+        if not isinstance(principal_snapshot, Mapping):
+            principal_snapshot = {}
+        persisted_principal = _value(
+            inbound_record, "principal_id", default=None
+        )
+        persisted_principal_account = _value(
+            inbound_record, "principal_account_id", default=None
+        )
+        persisted_mapping_revision = _value(
+            inbound_record,
+            "principal_mapping_revision",
+            "mapping_revision",
+            default=None,
+        )
+        if persisted_mapping_revision is None:
+            persisted_mapping_revision = principal_snapshot.get(
+                "mapping_revision"
+            )
+        durable_unmapped = bool(
+            principal_snapshot
+            and str(principal_snapshot.get("source") or "") == "unmapped"
+            and not principal_snapshot.get("principal_id")
+            and not principal_snapshot.get("principal_account_id")
+        )
+        if persisted_mapping_revision is None and durable_unmapped:
+            persisted_mapping_revision = 0
         if any(
             value is not None
             for value in (
@@ -4841,6 +2494,10 @@ class WeChatGateway:
                 persisted_text,
                 persisted_received,
                 persisted_payload,
+                persisted_identity,
+                persisted_principal,
+                persisted_principal_account,
+                persisted_mapping_revision,
             )
         ):
             raw = (
@@ -4874,6 +2531,22 @@ class WeChatGateway:
                     str(persisted_received)
                     if persisted_received is not None
                     else envelope.received_at
+                ),
+                principal_id=str(
+                    persisted_principal
+                    or principal_snapshot.get("principal_id")
+                    or ""
+                ),
+                principal_account_id=str(
+                    persisted_principal_account
+                    or principal_snapshot.get("principal_account_id")
+                    or ""
+                ),
+                principal_mapping_revision=(
+                    _trusted_principal_mapping_revision(
+                        persisted_mapping_revision,
+                        allow_unmapped=durable_unmapped,
+                    )
                 ),
                 raw=raw,
             )
@@ -7750,15 +5423,21 @@ __all__ = [
     "Acceptance",
     "CHANNEL",
     "COMMAND_REGISTRY",
+    "COMMAND_POLICIES",
     "CommandRegistryEntry",
     "CommandRegistryGroup",
     "CommandResponse",
     "COMMAND_HELP",
+    "DEFAULT_COMMAND_POLICY",
+    "DEFERRED_REPLY_QUOTA_CAPABILITY",
     "DEFAULT_AGENT_ID",
     "DEFAULT_SESSION_ID",
+    "LARK_COMMAND_POLICY",
     "MVP_COMMANDS",
     "MVP_COMMAND_NAMES",
     "MVPCommandRouter",
+    "WECHAT_COMMAND_POLICY",
+    "ChannelCommandPolicy",
     "WeChatChannelAdapter",
     "WeChatAdapter",
     "WeChatGateway",
@@ -7786,6 +5465,12 @@ __all__ = [
     "command_initial_reply",
     "command_request_id",
     "command_task_id",
+    "command_help_for_channel",
+    "command_names_for_channel",
+    "command_policy_for",
+    "command_supported",
+    "filter_command_registry",
+    "unsupported_command_response",
     "transcription_confirmation_id",
     "WeChatDeliveryWorker",
     "WeChatMediaDeliveryWorker",

@@ -21,6 +21,7 @@ import re
 import shlex
 import sqlite3
 import threading
+import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -35,6 +36,13 @@ from .maintenance_authority import (
     canonical_mailbox_review_authorization_digest,
     canonical_mailbox_review_payload_hash,
 )
+from .cron_schedule import (
+    DEFAULT_TIMEZONE,
+    CronScheduleError,
+    first_fire_at,
+    plan_due_firing,
+    schedule_from_parts,
+)
 from .store import (
     InvalidTransition,
     MAILBOX_OPERATOR_CANCEL_REASON,
@@ -45,7 +53,9 @@ from .store import (
     format_working_directory_response,
 )
 from .models import (
+    AccountAdmissionCounterRecord,
     AgentEvent,
+    AgentAccountAdmissionCounterRecord,
     AgentAdmissionCounterRecord,
     AgentDispatchReservation,
     AgentDispatchAttemptRecord,
@@ -61,7 +71,16 @@ from .models import (
     AgentProcessState,
     AgentResult,
     AgentTask,
+    BotProfileRecord,
+    BotProfileStatusRecord,
+    ConversationSubjectRecord,
+    CronFireResult,
+    CronFiringRecord,
+    CronJobRecord,
+    NaturalCronDraftRecord,
+    DeliveryAddress,
     DeliveryMode,
+    DeliveryOutcome,
     DispatchBackend,
     DispatchDecisionKind,
     DispatchSourceState,
@@ -84,6 +103,8 @@ from .models import (
     OutgoingMediaRecord,
     OutboxState,
     PresentationState,
+    PrincipalAccountRecord,
+    PrincipalRecord,
     RecoveryReport,
     ReplyAggregateMemberRecord,
     ReplyAggregateRecord,
@@ -101,6 +122,9 @@ from .models import (
     TaskEvent,
     TaskExecution,
     TaskRecord,
+    TaskSteeringClaim,
+    TaskSteeringRecord,
+    TaskSteeringState,
     TaskState,
     UserOutboxItem,
     USER_REPLY_FORMAT_AGENT_PREFIX_V1,
@@ -126,7 +150,10 @@ from .identity import (
     conversation_id as canonical_conversation_id,
     conversation_id_candidates,
     conversation_id_matches,
+    direct_conversation_subject,
+    group_conversation_subject,
     mailbox_conversation_id,
+    principal_conversation_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -157,6 +184,12 @@ _INBOUND_STATES = tuple(state.value for state in InboundState)
 _OUTBOX_STATES = tuple(state.value for state in OutboxState)
 _MAILBOX_STATES = tuple(state.value for state in MailboxState)
 
+# Principal mappings for Lark are keyed by the app-local ``open_id`` carried
+# by authenticated inbound events.  Keep the durable onboarding bundle as
+# strict as the owner CLI/runtime adapters so an unusable identifier cannot be
+# committed together with an otherwise valid bot profile.
+_LARK_OPEN_ID = re.compile(r"\Aou_[A-Za-z0-9_-]{4,256}\Z")
+
 # Removing a live Agent registration would strand work that has not reached a
 # final state.  Orphaned work is included because it remains eligible for an
 # explicit retry.  Failed/interrupted/cancelled/completed rows are immutable
@@ -178,6 +211,12 @@ _UNSET = object()
 # Keep the default aligned with ``AudioConfirmationManager`` while allowing a
 # deployment to choose a shorter/longer policy at the durable store boundary.
 DEFAULT_TRANSCRIPTION_TTL_SECONDS = 300.0
+
+# Natural-language schedules require a second, explicit user turn.  Keep the
+# decision window short enough that a forgotten proposal cannot be activated
+# much later with an unrelated "confirm" message, while surviving ordinary
+# model/tool latency comfortably.
+DEFAULT_NATURAL_CRON_DRAFT_TTL_SECONDS = 15 * 60.0
 
 # A collaboration request must not remain schedulable forever when its source
 # turn disappears.  The absolute expiry is persisted on both the mailbox
@@ -3647,7 +3686,463 @@ END;
 """
 
 
-_LATEST_SCHEMA_VERSION = 35
+_MIGRATION_36 = """
+CREATE TABLE IF NOT EXISTS account_admission_counters (
+    channel TEXT NOT NULL CHECK (length(trim(channel)) > 0),
+    bot_id TEXT NOT NULL CHECK (length(trim(bot_id)) > 0),
+    unfinished_count INTEGER NOT NULL DEFAULT 0 CHECK (unfinished_count >= 0),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (channel, bot_id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_account_admission_counters (
+    agent_id TEXT NOT NULL,
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    channel TEXT NOT NULL CHECK (length(trim(channel)) > 0),
+    bot_id TEXT NOT NULL CHECK (length(trim(bot_id)) > 0),
+    unfinished_count INTEGER NOT NULL DEFAULT 0 CHECK (unfinished_count >= 0),
+    last_served_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (
+        typeof(last_served_ordinal) = 'integer' AND last_served_ordinal >= 0
+    ),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (agent_id, agent_incarnation, channel, bot_id),
+    FOREIGN KEY (agent_id, agent_incarnation)
+        REFERENCES agent_lifecycle(agent_id, agent_incarnation)
+        ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS principals (
+    principal_id TEXT PRIMARY KEY CHECK (length(trim(principal_id)) > 0),
+    display_name TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+        CHECK (json_valid(metadata_json) = 1 AND json_type(metadata_json) = 'object'),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS principal_accounts (
+    principal_account_id TEXT PRIMARY KEY
+        CHECK (length(trim(principal_account_id)) > 0),
+    principal_id TEXT NOT NULL,
+    channel TEXT NOT NULL CHECK (length(trim(channel)) > 0),
+    bot_id TEXT NOT NULL CHECK (length(trim(bot_id)) > 0),
+    external_user_id TEXT NOT NULL CHECK (length(trim(external_user_id)) > 0),
+    identifier_kind TEXT NOT NULL CHECK (length(trim(identifier_kind)) > 0),
+    mapping_revision INTEGER NOT NULL CHECK (mapping_revision > 0),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    configured_by TEXT NOT NULL CHECK (length(trim(configured_by)) > 0),
+    created_at TEXT NOT NULL,
+    retired_at TEXT,
+    FOREIGN KEY (principal_id) REFERENCES principals(principal_id)
+        ON DELETE RESTRICT,
+    UNIQUE (channel, bot_id, external_user_id, mapping_revision),
+    CHECK ((active = 1 AND retired_at IS NULL)
+        OR (active = 0 AND retired_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_principal_accounts_one_active
+    ON principal_accounts(channel, bot_id, external_user_id)
+    WHERE active = 1;
+CREATE INDEX IF NOT EXISTS idx_principal_accounts_principal
+    ON principal_accounts(principal_id, active, created_at);
+
+CREATE TABLE IF NOT EXISTS conversation_subjects (
+    conversation_subject_id TEXT PRIMARY KEY
+        CHECK (length(trim(conversation_subject_id)) > 0),
+    channel TEXT NOT NULL CHECK (length(trim(channel)) > 0),
+    bot_id TEXT NOT NULL CHECK (length(trim(bot_id)) > 0),
+    subject_kind TEXT NOT NULL
+        CHECK (subject_kind IN ('direct','group','thread')),
+    scope_key TEXT NOT NULL CHECK (length(trim(scope_key)) > 0),
+    external_chat_id TEXT NOT NULL DEFAULT '',
+    external_thread_id TEXT NOT NULL DEFAULT '',
+    parent_subject_id TEXT,
+    provenance_json TEXT NOT NULL DEFAULT '{}'
+        CHECK (json_valid(provenance_json) = 1
+            AND json_type(provenance_json) = 'object'),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (parent_subject_id)
+        REFERENCES conversation_subjects(conversation_subject_id)
+        ON DELETE RESTRICT,
+    UNIQUE (channel, bot_id, scope_key),
+    CHECK (subject_kind != 'thread' OR length(trim(external_thread_id)) > 0)
+);
+
+CREATE TABLE IF NOT EXISTS bot_profiles (
+    profile_id TEXT PRIMARY KEY CHECK (length(trim(profile_id)) > 0),
+    channel TEXT NOT NULL CHECK (length(trim(channel)) > 0),
+    bot_id TEXT NOT NULL CHECK (length(trim(bot_id)) > 0),
+    brand TEXT NOT NULL CHECK (brand IN ('lark','feishu')),
+    config_dir TEXT NOT NULL CHECK (length(trim(config_dir)) > 0),
+    config_dir_identity TEXT NOT NULL
+        CHECK (length(trim(config_dir_identity)) > 0),
+    cli_version TEXT NOT NULL CHECK (length(trim(cli_version)) > 0),
+    credential_ref TEXT NOT NULL CHECK (length(trim(credential_ref)) > 0),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    mention_policy TEXT NOT NULL CHECK (length(trim(mention_policy)) > 0),
+    access_policy TEXT NOT NULL CHECK (length(trim(access_policy)) > 0),
+    restart_policy_json TEXT NOT NULL DEFAULT '{}'
+        CHECK (json_valid(restart_policy_json) = 1
+            AND json_type(restart_policy_json) = 'object'),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    removed_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_profiles_live_account
+    ON bot_profiles(channel, bot_id) WHERE removed_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_profiles_live_config_dir
+    ON bot_profiles(config_dir) WHERE removed_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_profiles_live_config_identity
+    ON bot_profiles(config_dir_identity) WHERE removed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS bot_profile_status (
+    profile_id TEXT PRIMARY KEY,
+    onboarding_state TEXT NOT NULL CHECK (length(trim(onboarding_state)) > 0),
+    connection_state TEXT NOT NULL CHECK (length(trim(connection_state)) > 0),
+    generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+    last_ready_at TEXT,
+    retry_after TEXT,
+    last_error_code TEXT,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (profile_id) REFERENCES bot_profiles(profile_id)
+        ON DELETE CASCADE
+);
+"""
+
+
+_MIGRATION_37 = """
+CREATE TABLE IF NOT EXISTS principal_conversation_bindings (
+    principal_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT 'default'
+        CHECK (length(trim(session_id)) > 0),
+    conversation_id TEXT NOT NULL UNIQUE,
+    binding_kind TEXT NOT NULL
+        CHECK (binding_kind IN ('canonical','adopted')),
+    configured_by TEXT NOT NULL CHECK (length(trim(configured_by)) > 0),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (principal_id, agent_id, session_id),
+    FOREIGN KEY (principal_id) REFERENCES principals(principal_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+        ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_principal_conversation_anchor
+    ON principal_conversation_bindings(conversation_id);
+"""
+
+
+_MIGRATION_38 = """
+CREATE TABLE IF NOT EXISTS task_steering (
+    steering_id TEXT PRIMARY KEY CHECK (length(trim(steering_id)) > 0),
+    inbound_message_id TEXT NOT NULL UNIQUE,
+    target_task_id TEXT NOT NULL CHECK (length(trim(target_task_id)) > 0),
+    target_execution_id TEXT NOT NULL
+        CHECK (length(trim(target_execution_id)) > 0),
+    agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    conversation_id TEXT NOT NULL CHECK (length(trim(conversation_id)) > 0),
+    sequence INTEGER NOT NULL CHECK (
+        typeof(sequence) = 'integer' AND sequence > 0
+    ),
+    task_snapshot_json TEXT NOT NULL CHECK (
+        json_valid(task_snapshot_json) = 1
+        AND json_type(task_snapshot_json) = 'object'
+    ),
+    state TEXT NOT NULL CHECK (state IN (
+        'pending','delivering','applied','promoted','delivery_unknown'
+    )),
+    claimed_by TEXT,
+    claim_token TEXT,
+    lease_expires_at TEXT,
+    fallback_task_id TEXT NOT NULL UNIQUE
+        CHECK (length(trim(fallback_task_id)) > 0),
+    promoted_task_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    applied_at TEXT,
+    promoted_at TEXT,
+    UNIQUE (target_execution_id, sequence),
+    FOREIGN KEY (inbound_message_id)
+        REFERENCES inbound_messages(message_id) ON DELETE RESTRICT,
+    FOREIGN KEY (target_task_id)
+        REFERENCES tasks(task_id) ON DELETE RESTRICT,
+    FOREIGN KEY (target_execution_id, target_task_id, agent_id, agent_incarnation)
+        REFERENCES task_executions(
+            execution_id, task_id, agent_id, agent_incarnation
+        ) ON DELETE RESTRICT,
+    FOREIGN KEY (agent_id, agent_incarnation)
+        REFERENCES agent_lifecycle(agent_id, agent_incarnation)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (conversation_id)
+        REFERENCES conversations(conversation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (promoted_task_id)
+        REFERENCES tasks(task_id) ON DELETE RESTRICT,
+    CHECK (
+        (state = 'delivering'
+         AND claimed_by IS NOT NULL AND length(trim(claimed_by)) > 0
+         AND claim_token IS NOT NULL AND length(trim(claim_token)) > 0
+         AND lease_expires_at IS NOT NULL)
+        OR
+        (state != 'delivering'
+         AND claimed_by IS NULL AND claim_token IS NULL
+         AND lease_expires_at IS NULL)
+    ),
+    CHECK (
+        (state = 'applied' AND applied_at IS NOT NULL)
+        OR (state != 'applied' AND applied_at IS NULL)
+    ),
+    CHECK (
+        (state = 'promoted' AND promoted_task_id IS NOT NULL
+         AND promoted_at IS NOT NULL)
+        OR (state != 'promoted' AND promoted_task_id IS NULL
+            AND promoted_at IS NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_task_steering_delivery
+    ON task_steering(target_task_id, target_execution_id, state, sequence);
+CREATE INDEX IF NOT EXISTS idx_task_steering_pending
+    ON task_steering(state, updated_at, steering_id);
+CREATE INDEX IF NOT EXISTS idx_task_steering_promoted
+    ON task_steering(promoted_task_id) WHERE promoted_task_id IS NOT NULL;
+"""
+
+
+_MIGRATION_39 = """
+CREATE TABLE IF NOT EXISTS cron_jobs (
+    job_id TEXT PRIMARY KEY CHECK (length(trim(job_id)) > 0),
+    principal_id TEXT,
+    principal_account_id TEXT,
+    origin_channel TEXT NOT NULL CHECK (length(trim(origin_channel)) > 0),
+    origin_bot_id TEXT NOT NULL CHECK (length(trim(origin_bot_id)) > 0),
+    origin_external_user_id TEXT NOT NULL
+        CHECK (length(trim(origin_external_user_id)) > 0),
+    origin_conversation_subject_id TEXT,
+    origin_conversation_subject_scope TEXT NOT NULL
+        CHECK (length(trim(origin_conversation_subject_scope)) > 0),
+    origin_session_id TEXT NOT NULL DEFAULT 'default'
+        CHECK (length(trim(origin_session_id)) > 0),
+    origin_reply_target_json TEXT NOT NULL CHECK (
+        json_valid(origin_reply_target_json) = 1
+        AND json_type(origin_reply_target_json) = 'object'
+    ),
+    agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    task_template_json TEXT NOT NULL CHECK (
+        json_valid(task_template_json) = 1
+        AND json_type(task_template_json) = 'object'
+    ),
+    schedule_kind TEXT NOT NULL
+        CHECK (schedule_kind IN ('at','interval','cron')),
+    schedule_expression TEXT NOT NULL
+        CHECK (length(trim(schedule_expression)) > 0),
+    timezone_name TEXT NOT NULL CHECK (length(trim(timezone_name)) > 0),
+    prompt TEXT NOT NULL CHECK (length(trim(prompt)) > 0),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    next_fire_at TEXT,
+    last_fired_at TEXT,
+    expires_at TEXT,
+    disabled_at TEXT,
+    disabled_reason TEXT,
+    FOREIGN KEY (principal_id) REFERENCES principals(principal_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (principal_account_id)
+        REFERENCES principal_accounts(principal_account_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (origin_conversation_subject_id)
+        REFERENCES conversation_subjects(conversation_subject_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (agent_id, agent_incarnation)
+        REFERENCES agent_lifecycle(agent_id, agent_incarnation)
+        ON DELETE RESTRICT,
+    CHECK (
+        (principal_id IS NULL AND principal_account_id IS NULL)
+        OR (principal_id IS NOT NULL AND principal_account_id IS NOT NULL)
+    ),
+    CHECK (
+        (enabled = 1 AND next_fire_at IS NOT NULL
+         AND disabled_at IS NULL AND disabled_reason IS NULL)
+        OR (enabled = 0 AND next_fire_at IS NULL AND disabled_at IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_cron_jobs_due
+    ON cron_jobs(enabled, next_fire_at, job_id);
+CREATE INDEX IF NOT EXISTS idx_cron_jobs_owner
+    ON cron_jobs(principal_id, origin_channel, origin_bot_id,
+                 origin_external_user_id, created_at, job_id);
+CREATE INDEX IF NOT EXISTS idx_cron_jobs_agent
+    ON cron_jobs(agent_id, agent_incarnation, enabled);
+
+CREATE TABLE IF NOT EXISTS cron_firings (
+    firing_id TEXT PRIMARY KEY CHECK (length(trim(firing_id)) > 0),
+    job_id TEXT NOT NULL,
+    scheduled_for TEXT NOT NULL,
+    task_id TEXT NOT NULL UNIQUE,
+    outbox_id TEXT NOT NULL UNIQUE,
+    fired_at TEXT NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES cron_jobs(job_id) ON DELETE RESTRICT,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT,
+    FOREIGN KEY (outbox_id) REFERENCES user_outbox(outbox_id)
+        ON DELETE RESTRICT,
+    UNIQUE (job_id, scheduled_for)
+);
+CREATE INDEX IF NOT EXISTS idx_cron_firings_job
+    ON cron_firings(job_id, scheduled_for, firing_id);
+"""
+
+
+_MIGRATION_40 = """
+CREATE TABLE cron_firings_v40 (
+    firing_id TEXT PRIMARY KEY CHECK (length(trim(firing_id)) > 0),
+    job_id TEXT NOT NULL,
+    scheduled_for TEXT NOT NULL,
+    task_id TEXT NOT NULL UNIQUE,
+    outbox_id TEXT UNIQUE,
+    fired_at TEXT NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES cron_jobs(job_id) ON DELETE RESTRICT,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT,
+    FOREIGN KEY (outbox_id) REFERENCES user_outbox(outbox_id)
+        ON DELETE RESTRICT,
+    UNIQUE (job_id, scheduled_for)
+);
+INSERT INTO cron_firings_v40 (
+    firing_id,job_id,scheduled_for,task_id,outbox_id,fired_at
+)
+SELECT firing_id,job_id,scheduled_for,task_id,outbox_id,fired_at
+  FROM cron_firings;
+DROP TABLE cron_firings;
+ALTER TABLE cron_firings_v40 RENAME TO cron_firings;
+CREATE INDEX idx_cron_firings_job
+    ON cron_firings(job_id, scheduled_for, firing_id);
+"""
+
+
+_MIGRATION_41 = """
+CREATE TABLE IF NOT EXISTS natural_cron_drafts (
+    draft_id TEXT PRIMARY KEY CHECK (length(trim(draft_id)) > 0),
+    job_id TEXT NOT NULL UNIQUE CHECK (length(trim(job_id)) > 0),
+    source_task_id TEXT NOT NULL,
+    source_execution_id TEXT NOT NULL,
+    source_inbound_message_id TEXT NOT NULL,
+    principal_id TEXT,
+    principal_account_id TEXT,
+    principal_mapping_revision INTEGER,
+    origin_channel TEXT NOT NULL CHECK (length(trim(origin_channel)) > 0),
+    origin_bot_id TEXT NOT NULL CHECK (length(trim(origin_bot_id)) > 0),
+    origin_external_user_id TEXT NOT NULL
+        CHECK (length(trim(origin_external_user_id)) > 0),
+    origin_conversation_subject_id TEXT,
+    origin_conversation_subject_scope TEXT NOT NULL
+        CHECK (length(trim(origin_conversation_subject_scope)) > 0),
+    origin_session_id TEXT NOT NULL DEFAULT 'default'
+        CHECK (length(trim(origin_session_id)) > 0),
+    origin_reply_target_json TEXT NOT NULL CHECK (
+        json_valid(origin_reply_target_json) = 1
+        AND json_type(origin_reply_target_json) = 'object'
+    ),
+    conversation_id TEXT NOT NULL CHECK (length(trim(conversation_id)) > 0),
+    agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+    agent_incarnation INTEGER NOT NULL CHECK (
+        typeof(agent_incarnation) = 'integer' AND agent_incarnation > 0
+    ),
+    task_template_json TEXT NOT NULL CHECK (
+        json_valid(task_template_json) = 1
+        AND json_type(task_template_json) = 'object'
+    ),
+    schedule_kind TEXT NOT NULL
+        CHECK (schedule_kind IN ('at','interval','cron')),
+    schedule_expression TEXT NOT NULL
+        CHECK (length(trim(schedule_expression)) > 0),
+    timezone_name TEXT NOT NULL CHECK (length(trim(timezone_name)) > 0),
+    prompt TEXT NOT NULL CHECK (length(trim(prompt)) > 0),
+    next_fire_at TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'pending','confirmed','cancelled','expired','superseded'
+    )),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    resolved_at TEXT,
+    confirmation_task_id TEXT,
+    confirmation_execution_id TEXT,
+    confirmation_inbound_message_id TEXT UNIQUE,
+    confirmation_steering_id TEXT UNIQUE,
+    FOREIGN KEY (source_task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT,
+    FOREIGN KEY (source_execution_id) REFERENCES task_executions(execution_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (source_inbound_message_id)
+        REFERENCES inbound_messages(message_id) ON DELETE RESTRICT,
+    FOREIGN KEY (principal_id) REFERENCES principals(principal_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (principal_account_id)
+        REFERENCES principal_accounts(principal_account_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (origin_conversation_subject_id)
+        REFERENCES conversation_subjects(conversation_subject_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (agent_id, agent_incarnation)
+        REFERENCES agent_lifecycle(agent_id, agent_incarnation)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (confirmation_task_id) REFERENCES tasks(task_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (confirmation_execution_id)
+        REFERENCES task_executions(execution_id) ON DELETE RESTRICT,
+    FOREIGN KEY (confirmation_inbound_message_id)
+        REFERENCES inbound_messages(message_id) ON DELETE RESTRICT,
+    FOREIGN KEY (confirmation_steering_id)
+        REFERENCES task_steering(steering_id) ON DELETE RESTRICT,
+    CHECK (
+        (principal_id IS NULL AND principal_account_id IS NULL
+         AND principal_mapping_revision IS NULL)
+        OR (principal_id IS NOT NULL AND principal_account_id IS NOT NULL
+            AND typeof(principal_mapping_revision) = 'integer'
+            AND principal_mapping_revision > 0)
+    ),
+    CHECK (
+        (state = 'pending' AND resolved_at IS NULL
+         AND confirmation_task_id IS NULL
+         AND confirmation_execution_id IS NULL
+         AND confirmation_inbound_message_id IS NULL
+         AND confirmation_steering_id IS NULL)
+        OR (state = 'confirmed' AND resolved_at IS NOT NULL
+            AND confirmation_task_id IS NOT NULL
+            AND confirmation_execution_id IS NOT NULL
+            AND confirmation_inbound_message_id IS NOT NULL)
+        OR (state = 'cancelled' AND resolved_at IS NOT NULL
+            AND confirmation_task_id IS NOT NULL
+            AND confirmation_execution_id IS NOT NULL
+            AND confirmation_inbound_message_id IS NOT NULL)
+        OR (state IN ('expired','superseded')
+            AND resolved_at IS NOT NULL
+            AND confirmation_task_id IS NULL
+            AND confirmation_execution_id IS NULL
+            AND confirmation_inbound_message_id IS NULL
+            AND confirmation_steering_id IS NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_natural_cron_drafts_scope
+    ON natural_cron_drafts(
+        origin_channel,origin_bot_id,origin_external_user_id,
+        origin_session_id,conversation_id,agent_id,state,created_at,draft_id
+    );
+CREATE INDEX IF NOT EXISTS idx_natural_cron_drafts_expiry
+    ON natural_cron_drafts(state,expires_at,draft_id);
+CREATE INDEX IF NOT EXISTS idx_natural_cron_drafts_source
+    ON natural_cron_drafts(source_task_id,source_execution_id,draft_id);
+"""
+
+
+_LATEST_SCHEMA_VERSION = 41
 
 
 @contextmanager
@@ -3657,11 +4152,10 @@ def _transaction(conn: sqlite3.Connection):
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
+        conn.commit()
     except BaseException:
         conn.rollback()
         raise
-    else:
-        conn.commit()
 
 
 def _executescript_atomic(conn: sqlite3.Connection, script: str) -> None:
@@ -3842,6 +4336,8 @@ class SQLiteStore:
         ),
         max_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
         max_global_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+        max_account_queue: int | None = None,
+        max_account_agent_queue: int | None = None,
         mailbox_maintenance_authority: MailboxMaintenanceAuthority | None = None,
     ) -> None:
         raw_path = str(path)
@@ -3890,13 +4386,39 @@ class SQLiteStore:
         try:
             self.max_agent_queue = int(max_agent_queue)
             self.max_global_queue = int(max_global_queue)
+            self.max_account_queue = int(
+                max_global_queue
+                if max_account_queue is None
+                else max_account_queue
+            )
+            self.max_account_agent_queue = int(
+                max_agent_queue
+                if max_account_agent_queue is None
+                else max_account_agent_queue
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError("Agent queue limits must be positive integers") from exc
-        if self.max_agent_queue <= 0 or self.max_global_queue <= 0:
+        if any(
+            value <= 0
+            for value in (
+                self.max_agent_queue,
+                self.max_global_queue,
+                self.max_account_queue,
+                self.max_account_agent_queue,
+            )
+        ):
             raise ValueError("Agent queue limits must be positive integers")
         if self.max_agent_queue > self.max_global_queue:
             raise ValueError(
                 "max_agent_queue cannot exceed max_global_queue"
+            )
+        if self.max_account_queue > self.max_global_queue:
+            raise ValueError(
+                "max_account_queue cannot exceed max_global_queue"
+            )
+        if self.max_account_agent_queue > self.max_agent_queue:
+            raise ValueError(
+                "max_account_agent_queue cannot exceed max_agent_queue"
             )
         if (
             mailbox_maintenance_authority is not None
@@ -4824,11 +5346,907 @@ class SQLiteStore:
                     conn,
                     allow_create=False,
                 )
+        if current < 36 and v35_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v36_multichannel_identity_tx(
+                    conn,
+                    allow_create=True,
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (36, _utc_text()),
+                )
+        v36_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=36"
+        ).fetchone()
+        if v36_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v36_multichannel_identity_tx(
+                    conn,
+                    allow_create=False,
+                )
+        if current < 37 and v36_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v37_principal_conversations_tx(
+                    conn,
+                    allow_create=True,
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (37, _utc_text()),
+                )
+        v37_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=37"
+        ).fetchone()
+        if v37_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v37_principal_conversations_tx(
+                    conn,
+                    allow_create=False,
+                )
+        if current < 38 and v37_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v38_task_steering_tx(
+                    conn,
+                    allow_create=True,
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (38, _utc_text()),
+                )
+        v38_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=38"
+        ).fetchone()
+        if v38_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v38_task_steering_tx(
+                    conn,
+                    allow_create=False,
+                )
+        if current < 39 and v38_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v39_cron_jobs_tx(
+                    conn,
+                    allow_create=True,
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (39, _utc_text()),
+                )
+        v39_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=39"
+        ).fetchone()
+        # The v39 validator describes its required eager-reminder schema.
+        # Once v40 is present its superset validator owns the nullable
+        # result-only firing shape instead.
+        if v39_applied is not None and current < 40:
+            with _transaction(conn):
+                self._apply_schema_v39_cron_jobs_tx(
+                    conn,
+                    allow_create=False,
+                )
+        if current < 40 and v39_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v40_cron_result_delivery_tx(
+                    conn,
+                    allow_migrate=True,
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (40, _utc_text()),
+                )
+        v40_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=40"
+        ).fetchone()
+        if v40_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v40_cron_result_delivery_tx(
+                    conn,
+                    allow_migrate=False,
+                )
+        if current < 41 and v40_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v41_natural_cron_drafts_tx(
+                    conn,
+                    allow_create=True,
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    (41, _utc_text()),
+                )
+        v41_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=41"
+        ).fetchone()
+        if v41_applied is not None:
+            with _transaction(conn):
+                self._apply_schema_v41_natural_cron_drafts_tx(
+                    conn,
+                    allow_create=False,
+                )
         self._finish_initialize_sync(
             conn,
             current=current,
             recover_startup_state=recover_startup_state,
         )
+
+    @classmethod
+    def _apply_schema_v41_natural_cron_drafts_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        allow_create: bool,
+    ) -> None:
+        """Create and validate durable, task-scoped cron proposals."""
+
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='natural_cron_drafts'"
+        ).fetchone()
+        if table is None:
+            if not allow_create:
+                raise StoreError(
+                    "schema v41 marker exists without natural cron drafts"
+                )
+            _executescript_atomic(conn, _MIGRATION_41)
+        else:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_natural_cron_drafts_scope "
+                "ON natural_cron_drafts(origin_channel,origin_bot_id,"
+                "origin_external_user_id,origin_session_id,conversation_id,"
+                "agent_id,state,created_at,draft_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_natural_cron_drafts_expiry "
+                "ON natural_cron_drafts(state,expires_at,draft_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_natural_cron_drafts_source "
+                "ON natural_cron_drafts(source_task_id,source_execution_id,draft_id)"
+            )
+        required = {
+            "draft_id", "job_id", "source_task_id", "source_execution_id",
+            "source_inbound_message_id", "principal_id",
+            "principal_account_id", "principal_mapping_revision",
+            "origin_channel", "origin_bot_id", "origin_external_user_id",
+            "origin_conversation_subject_id",
+            "origin_conversation_subject_scope", "origin_session_id",
+            "origin_reply_target_json", "conversation_id", "agent_id",
+            "agent_incarnation", "task_template_json", "schedule_kind",
+            "schedule_expression", "timezone_name", "prompt",
+            "next_fire_at", "state", "created_at", "updated_at",
+            "expires_at", "resolved_at", "confirmation_task_id",
+            "confirmation_execution_id", "confirmation_inbound_message_id",
+            "confirmation_steering_id",
+        }
+        column_rows = {
+            str(row["name"]): row
+            for row in conn.execute("PRAGMA table_info(natural_cron_drafts)")
+        }
+        if set(column_rows) != required:
+            raise StoreError("schema v41 natural cron draft storage is incomplete")
+        if int(column_rows["draft_id"]["pk"]) != 1:
+            raise StoreError("schema v41 natural cron draft primary key is invalid")
+        expected_not_null = {
+            "job_id", "source_task_id", "source_execution_id",
+            "source_inbound_message_id", "origin_channel", "origin_bot_id",
+            "origin_external_user_id", "origin_conversation_subject_scope",
+            "origin_session_id", "origin_reply_target_json", "conversation_id",
+            "agent_id", "agent_incarnation", "task_template_json",
+            "schedule_kind", "schedule_expression", "timezone_name", "prompt",
+            "next_fire_at", "state", "created_at", "updated_at", "expires_at",
+        }
+        if any(
+            int(row["notnull"]) != int(name in expected_not_null)
+            for name, row in column_rows.items()
+            if name != "draft_id"
+        ):
+            raise StoreError("schema v41 natural cron draft nullability is invalid")
+
+        def normalized_sql(value: Any) -> str:
+            return " ".join(str(value or "").split()).casefold().replace(
+                "create table if not exists", "create table"
+            )
+
+        expected_table_sql = _MIGRATION_41.partition(
+            "\nCREATE INDEX IF NOT EXISTS idx_natural_cron_drafts_scope"
+        )[0].strip().rstrip(";")
+        table_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='natural_cron_drafts'"
+        ).fetchone()
+        if (
+            table_sql is None
+            or normalized_sql(table_sql["sql"])
+            != normalized_sql(expected_table_sql)
+        ):
+            raise StoreError("schema v41 natural cron draft constraints are invalid")
+
+        expected_indexes = {
+            "idx_natural_cron_drafts_scope": (
+                "origin_channel", "origin_bot_id", "origin_external_user_id",
+                "origin_session_id", "conversation_id", "agent_id", "state",
+                "created_at", "draft_id",
+            ),
+            "idx_natural_cron_drafts_expiry": (
+                "state", "expires_at", "draft_id",
+            ),
+            "idx_natural_cron_drafts_source": (
+                "source_task_id", "source_execution_id", "draft_id",
+            ),
+        }
+        index_rows = {
+            str(row["name"]): row
+            for row in conn.execute("PRAGMA index_list(natural_cron_drafts)")
+        }
+        for name, columns in expected_indexes.items():
+            descriptor = index_rows.get(name)
+            actual_columns = tuple(
+                str(row["name"])
+                for row in conn.execute(f"PRAGMA index_info({name})")
+            )
+            if (
+                descriptor is None
+                or int(descriptor["unique"]) != 0
+                or int(descriptor["partial"]) != 0
+                or actual_columns != columns
+            ):
+                raise StoreError(
+                    f"schema v41 natural cron draft index is invalid: {name}"
+                )
+        unique_columns = {
+            tuple(
+                str(info["name"])
+                for info in conn.execute(
+                    f"PRAGMA index_info({str(row['name'])})"
+                )
+            )
+            for row in index_rows.values()
+            if int(row["unique"]) == 1
+        }
+        if not {
+            ("job_id",),
+            ("confirmation_inbound_message_id",),
+            ("confirmation_steering_id",),
+        }.issubset(unique_columns):
+            raise StoreError("schema v41 natural cron uniqueness is invalid")
+
+        expected_foreign_keys = {
+            ("source_task_id", "tasks", "task_id"),
+            ("source_execution_id", "task_executions", "execution_id"),
+            ("source_inbound_message_id", "inbound_messages", "message_id"),
+            ("principal_id", "principals", "principal_id"),
+            ("principal_account_id", "principal_accounts", "principal_account_id"),
+            (
+                "origin_conversation_subject_id",
+                "conversation_subjects",
+                "conversation_subject_id",
+            ),
+            ("conversation_id", "conversations", "conversation_id"),
+            ("agent_id", "agent_lifecycle", "agent_id"),
+            ("agent_incarnation", "agent_lifecycle", "agent_incarnation"),
+            ("confirmation_task_id", "tasks", "task_id"),
+            (
+                "confirmation_execution_id",
+                "task_executions",
+                "execution_id",
+            ),
+            (
+                "confirmation_inbound_message_id",
+                "inbound_messages",
+                "message_id",
+            ),
+            ("confirmation_steering_id", "task_steering", "steering_id"),
+        }
+        foreign_key_rows = list(
+            conn.execute("PRAGMA foreign_key_list(natural_cron_drafts)")
+        )
+        actual_foreign_keys = {
+            (str(row["from"]), str(row["table"]), str(row["to"]))
+            for row in foreign_key_rows
+        }
+        if actual_foreign_keys != expected_foreign_keys or any(
+            str(row["on_delete"]).casefold() != "restrict"
+            for row in foreign_key_rows
+        ):
+            raise StoreError("schema v41 natural cron foreign keys are invalid")
+        invalid = conn.execute(
+            """SELECT draft.draft_id
+                 FROM natural_cron_drafts AS draft
+                 LEFT JOIN tasks AS source
+                   ON source.task_id=draft.source_task_id
+                 LEFT JOIN task_executions AS execution
+                   ON execution.execution_id=draft.source_execution_id
+                  AND execution.task_id=draft.source_task_id
+                 LEFT JOIN inbound_messages AS inbound
+                   ON inbound.message_id=draft.source_inbound_message_id
+                 LEFT JOIN conversation_subjects AS subject
+                   ON subject.conversation_subject_id=
+                      draft.origin_conversation_subject_id
+                 LEFT JOIN agent_lifecycle AS lifecycle
+                   ON lifecycle.agent_id=draft.agent_id
+                  AND lifecycle.agent_incarnation=draft.agent_incarnation
+                 LEFT JOIN tasks AS confirmation_task
+                   ON confirmation_task.task_id=draft.confirmation_task_id
+                 LEFT JOIN task_executions AS confirmation_execution
+                   ON confirmation_execution.execution_id=
+                      draft.confirmation_execution_id
+                  AND confirmation_execution.task_id=draft.confirmation_task_id
+                 LEFT JOIN inbound_messages AS confirmation_inbound
+                   ON confirmation_inbound.message_id=
+                      draft.confirmation_inbound_message_id
+                 LEFT JOIN task_steering AS confirmation_steering
+                   ON confirmation_steering.steering_id=
+                      draft.confirmation_steering_id
+                 LEFT JOIN cron_jobs AS job ON job.job_id=draft.job_id
+                WHERE source.task_id IS NULL OR execution.execution_id IS NULL
+                   OR inbound.message_id IS NULL OR lifecycle.agent_id IS NULL
+                   OR source.inbound_message_id<>draft.source_inbound_message_id
+                   OR inbound.task_id<>draft.source_task_id
+                   OR source.parent_task_id IS NOT NULL OR source.child_depth<>0
+                   OR source.agent_id<>draft.agent_id
+                   OR source.agent_incarnation<>draft.agent_incarnation
+                   OR source.conversation_id<>draft.conversation_id
+                   OR execution.agent_id<>draft.agent_id
+                   OR execution.agent_incarnation<>draft.agent_incarnation
+                   OR source.channel<>draft.origin_channel
+                   OR source.bot_id<>draft.origin_bot_id
+                   OR source.actor_external_user_id<>
+                      draft.origin_external_user_id
+                   OR source.session_id<>draft.origin_session_id
+                   OR source.conversation_subject_id<>
+                      draft.origin_conversation_subject_id
+                   OR COALESCE(source.principal_id,'')<>
+                      COALESCE(draft.principal_id,'')
+                   OR COALESCE(source.principal_account_id,'')<>
+                      COALESCE(draft.principal_account_id,'')
+                   OR inbound.channel<>draft.origin_channel
+                   OR inbound.bot_id<>draft.origin_bot_id
+                   OR inbound.external_user_id<>
+                      draft.origin_external_user_id
+                   OR inbound.session_id<>draft.origin_session_id
+                   OR inbound.conversation_subject_id<>
+                      draft.origin_conversation_subject_id
+                   OR COALESCE(inbound.principal_id,'')<>
+                      COALESCE(draft.principal_id,'')
+                   OR COALESCE(inbound.principal_account_id,'')<>
+                      COALESCE(draft.principal_account_id,'')
+                   OR subject.conversation_subject_id IS NULL
+                   OR subject.channel<>draft.origin_channel
+                   OR subject.bot_id<>draft.origin_bot_id
+                   OR subject.scope_key<>
+                      draft.origin_conversation_subject_scope
+                   OR (draft.state='confirmed' AND job.job_id IS NULL)
+                   OR (draft.state<>'confirmed' AND job.job_id IS NOT NULL)
+                   OR (draft.state IN ('confirmed','cancelled') AND (
+                       confirmation_task.task_id IS NULL
+                       OR confirmation_execution.execution_id IS NULL
+                       OR confirmation_inbound.message_id IS NULL
+                       OR confirmation_task.agent_id<>draft.agent_id
+                       OR confirmation_task.agent_incarnation<>
+                          draft.agent_incarnation
+                       OR confirmation_task.conversation_id<>
+                          draft.conversation_id
+                   ))
+                   OR (draft.confirmation_steering_id IS NULL
+                       AND draft.state IN ('confirmed','cancelled')
+                       AND (
+                           confirmation_task.inbound_message_id<>
+                              draft.confirmation_inbound_message_id
+                           OR confirmation_inbound.task_id<>
+                              draft.confirmation_task_id
+                       ))
+                   OR (draft.confirmation_steering_id IS NOT NULL AND (
+                       confirmation_steering.steering_id IS NULL
+                       OR confirmation_steering.state<>'applied'
+                       OR confirmation_steering.inbound_message_id<>
+                          draft.confirmation_inbound_message_id
+                       OR confirmation_steering.target_task_id<>
+                          draft.confirmation_task_id
+                       OR confirmation_steering.target_execution_id<>
+                          draft.confirmation_execution_id
+                       OR confirmation_steering.agent_id<>draft.agent_id
+                       OR confirmation_steering.agent_incarnation<>
+                          draft.agent_incarnation
+                       OR confirmation_steering.conversation_id<>
+                          draft.conversation_id
+                   ))
+                LIMIT 1"""
+        ).fetchone()
+        if invalid is not None:
+            raise StoreError("schema v41 natural cron draft row is invalid")
+        for draft in conn.execute(
+            "SELECT * FROM natural_cron_drafts ORDER BY draft_id"
+        ).fetchall():
+            try:
+                cls._validate_natural_cron_draft_snapshot_tx(conn, draft)
+            except StoreError:
+                raise
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StoreError(
+                    "schema v41 natural cron draft snapshot is invalid: "
+                    f"{draft['draft_id']}"
+                ) from exc
+        violations = conn.execute(
+            "PRAGMA foreign_key_check(natural_cron_drafts)"
+        ).fetchall()
+        if violations:
+            raise StoreError("schema v41 foreign-key validation failed")
+
+    @staticmethod
+    def _apply_schema_v40_cron_result_delivery_tx(
+        conn: sqlite3.Connection,
+        *,
+        allow_migrate: bool,
+    ) -> None:
+        """Stop eager prompt echoes and permit result-only cron firings.
+
+        Schema v39 linked every firing to a separately deliverable outbox
+        containing the raw prompt.  Suppress any such row that was not
+        already sent before rebuilding the audit table with an optional
+        legacy outbox reference.  Existing sent rows remain intact as audit
+        evidence; new occurrences create only an Agent task and return that
+        task's eventual result through normal reply projection.
+        """
+
+        required_columns = {
+            "cron_jobs": {
+                "job_id", "principal_id", "principal_account_id",
+                "origin_channel", "origin_bot_id", "origin_external_user_id",
+                "origin_conversation_subject_id",
+                "origin_conversation_subject_scope", "origin_session_id",
+                "origin_reply_target_json", "agent_id", "agent_incarnation",
+                "task_template_json", "schedule_kind", "schedule_expression",
+                "timezone_name", "prompt", "enabled", "created_at",
+                "updated_at", "next_fire_at", "last_fired_at", "expires_at",
+                "disabled_at", "disabled_reason",
+            },
+            "cron_firings": {
+                "firing_id", "job_id", "scheduled_for", "task_id",
+                "outbox_id", "fired_at",
+            },
+        }
+        existing = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if not set(required_columns).issubset(existing):
+            raise StoreError("schema v40 requires complete cron storage")
+        table_columns: dict[str, dict[str, sqlite3.Row]] = {}
+        for table_name, required in required_columns.items():
+            actual = {
+                str(row[1]): row
+                for row in conn.execute(f"PRAGMA table_info({table_name})")
+            }
+            if not required.issubset(actual):
+                raise StoreError(
+                    f"schema v40 {table_name} storage is incomplete"
+                )
+            table_columns[table_name] = actual
+        outbox_column = table_columns["cron_firings"]["outbox_id"]
+
+        if allow_migrate:
+            malformed_reminder = conn.execute(
+                """SELECT firing.firing_id
+                     FROM cron_firings AS firing
+                     JOIN cron_jobs AS job ON job.job_id=firing.job_id
+                     JOIN user_outbox AS outbox
+                       ON outbox.outbox_id=firing.outbox_id
+                    WHERE outbox.state<>'sent'
+                      AND NOT (
+                          outbox.task_id IS NULL
+                          AND outbox.event_id IS NULL
+                          AND outbox.channel=job.origin_channel
+                          AND outbox.bot_id=job.origin_bot_id
+                          AND outbox.external_user_id=
+                              job.origin_external_user_id
+                          AND outbox.session_id=job.origin_session_id
+                          AND outbox.agent_id=job.agent_id
+                          AND outbox.content=job.prompt
+                          AND outbox.attachments_json='[]'
+                          AND outbox.priority=2
+                          AND outbox.delivery_mode='push_eligible'
+                          AND outbox.foreground=0
+                      )
+                    LIMIT 1"""
+            ).fetchone()
+            if malformed_reminder is not None:
+                raise StoreError(
+                    "schema v39 cron reminder identity is invalid"
+                )
+            # Gateway startup recovery runs after migrations.  Terminalizing
+            # each safely identified retryable legacy reminder here prevents
+            # raw prompts from being requeued after the upgrade.  Sent rows
+            # remain intact; delivery-unknown retains that uncertainty state
+            # but is hidden and made permanently non-pushable.
+            conn.execute(
+                """UPDATE user_outbox
+                      SET state=CASE
+                              WHEN state='delivery_unknown' THEN state
+                              ELSE 'failed_permanent'
+                          END,
+                          delivery_mode='inbox_only',notify_enabled=0,
+                          presentation='acknowledged',claimed_by=NULL,
+                          claim_token=NULL,lease_expires_at=NULL,
+                          next_attempt_at=NULL,
+                          last_error=COALESCE(
+                              last_error,
+                              'legacy cron prompt reminder suppressed by schema v40'
+                          ),
+                          acknowledged_at=COALESCE(acknowledged_at,?)
+                    WHERE outbox_id IN (
+                              SELECT outbox_id FROM cron_firings
+                               WHERE outbox_id IS NOT NULL
+                          )
+                      AND state<>'sent'""",
+                (_utc_text(),),
+            )
+            # v39 completion projections were treated as background replies
+            # and may be stuck pending with notify disabled.  Repair only
+            # unseen, non-silent, safely retryable result rows; never revive
+            # a presented, terminal, or delivery-unknown response.
+            conn.execute(
+                """UPDATE user_outbox
+                      SET notify_enabled=1
+                    WHERE task_id IN (
+                              SELECT task_id FROM cron_firings
+                          )
+                      AND outbox_id NOT IN (
+                              SELECT outbox_id FROM cron_firings
+                               WHERE outbox_id IS NOT NULL
+                          )
+                      AND priority>0
+                      AND delivery_mode='push_eligible'
+                      AND presentation='unseen'
+                      AND state IN (
+                          'pending','claimed','sending','retry_wait'
+                      )"""
+            )
+
+        if int(outbox_column[3]) != 0:
+            if not allow_migrate:
+                raise StoreError(
+                    "schema v40 marker exists with a required cron prompt outbox"
+                )
+            _executescript_atomic(conn, _MIGRATION_40)
+            firing_columns = {
+                str(row[1]): row
+                for row in conn.execute("PRAGMA table_info(cron_firings)")
+            }
+            outbox_column = firing_columns.get("outbox_id")
+
+        if outbox_column is None or int(outbox_column[3]) != 0:
+            raise StoreError("schema v40 cron firing outbox must be optional")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cron_firings_job "
+            "ON cron_firings(job_id, scheduled_for, firing_id)"
+        )
+        invalid = conn.execute(
+            """SELECT firing.firing_id
+                 FROM cron_firings AS firing
+                 LEFT JOIN cron_jobs AS job ON job.job_id=firing.job_id
+                 LEFT JOIN tasks AS task ON task.task_id=firing.task_id
+                 LEFT JOIN user_outbox AS outbox
+                   ON outbox.outbox_id=firing.outbox_id
+                WHERE job.job_id IS NULL OR task.task_id IS NULL
+                   OR (firing.outbox_id IS NOT NULL
+                       AND outbox.outbox_id IS NULL)
+                LIMIT 1"""
+        ).fetchone()
+        if invalid is not None:
+            raise StoreError("schema v40 cron firing row is invalid")
+        deliverable_legacy_prompt = conn.execute(
+            """SELECT firing.firing_id
+                 FROM cron_firings AS firing
+                 JOIN user_outbox AS outbox
+                   ON outbox.outbox_id=firing.outbox_id
+                WHERE outbox.state NOT IN (
+                          'sent','failed_permanent','delivery_unknown'
+                      )
+                   OR (outbox.state IN (
+                              'failed_permanent','delivery_unknown'
+                          )
+                       AND (outbox.notify_enabled<>0
+                            OR outbox.presentation<>'acknowledged'
+                            OR outbox.delivery_mode<>'inbox_only'))
+                LIMIT 1"""
+        ).fetchone()
+        if deliverable_legacy_prompt is not None:
+            raise StoreError("schema v40 retains a deliverable cron prompt reminder")
+        invalid_job = conn.execute(
+            """SELECT job.job_id
+                 FROM cron_jobs AS job
+                 LEFT JOIN agent_lifecycle AS lifecycle
+                   ON lifecycle.agent_id=job.agent_id
+                  AND lifecycle.agent_incarnation=job.agent_incarnation
+                 LEFT JOIN principals AS principal
+                   ON principal.principal_id=job.principal_id
+                 LEFT JOIN principal_accounts AS account
+                   ON account.principal_account_id=job.principal_account_id
+                 LEFT JOIN conversation_subjects AS subject
+                   ON subject.conversation_subject_id=
+                      job.origin_conversation_subject_id
+                WHERE lifecycle.agent_id IS NULL
+                   OR (job.principal_id IS NOT NULL AND (
+                       principal.principal_id IS NULL
+                       OR account.principal_account_id IS NULL
+                       OR account.principal_id<>job.principal_id
+                   ))
+                   OR (job.origin_conversation_subject_id IS NOT NULL
+                       AND subject.conversation_subject_id IS NULL)
+                LIMIT 1"""
+        ).fetchone()
+        if invalid_job is not None:
+            raise StoreError("schema v40 cron job row is invalid")
+        violations = [
+            *conn.execute("PRAGMA foreign_key_check(cron_jobs)").fetchall(),
+            *conn.execute("PRAGMA foreign_key_check(cron_firings)").fetchall(),
+        ]
+        if violations:
+            raise StoreError("schema v40 foreign-key validation failed")
+
+    @staticmethod
+    def _apply_schema_v39_cron_jobs_tx(
+        conn: sqlite3.Connection,
+        *,
+        allow_create: bool,
+    ) -> None:
+        """Create and validate durable scheduled prompt storage."""
+
+        required_tables = {"cron_jobs", "cron_firings"}
+        existing = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if not required_tables.issubset(existing):
+            if not allow_create:
+                missing = sorted(required_tables - existing)
+                raise StoreError(
+                    "schema v39 marker exists without cron storage: "
+                    + ", ".join(missing)
+                )
+            _executescript_atomic(conn, _MIGRATION_39)
+        else:
+            # These indexes are projections of authoritative rows and are
+            # safe to repair on every open.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cron_jobs_due "
+                "ON cron_jobs(enabled, next_fire_at, job_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cron_jobs_owner "
+                "ON cron_jobs(principal_id, origin_channel, origin_bot_id, "
+                "origin_external_user_id, created_at, job_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cron_jobs_agent "
+                "ON cron_jobs(agent_id, agent_incarnation, enabled)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cron_firings_job "
+                "ON cron_firings(job_id, scheduled_for, firing_id)"
+            )
+
+        required_columns = {
+            "cron_jobs": {
+                "job_id", "principal_id", "principal_account_id",
+                "origin_channel", "origin_bot_id", "origin_external_user_id",
+                "origin_conversation_subject_id",
+                "origin_conversation_subject_scope", "origin_session_id",
+                "origin_reply_target_json", "agent_id", "agent_incarnation",
+                "task_template_json", "schedule_kind",
+                "schedule_expression", "timezone_name", "prompt", "enabled",
+                "created_at", "updated_at", "next_fire_at", "last_fired_at",
+                "expires_at", "disabled_at", "disabled_reason",
+            },
+            "cron_firings": {
+                "firing_id", "job_id", "scheduled_for", "task_id",
+                "outbox_id", "fired_at",
+            },
+        }
+        for table_name, required in required_columns.items():
+            actual = {
+                str(row[1])
+                for row in conn.execute(f"PRAGMA table_info({table_name})")
+            }
+            if not required.issubset(actual):
+                raise StoreError(
+                    f"schema v39 {table_name} storage is incomplete"
+                )
+
+        invalid = conn.execute(
+            """SELECT job.job_id
+                 FROM cron_jobs AS job
+                 LEFT JOIN agent_lifecycle AS lifecycle
+                   ON lifecycle.agent_id=job.agent_id
+                  AND lifecycle.agent_incarnation=job.agent_incarnation
+                 LEFT JOIN principals AS principal
+                   ON principal.principal_id=job.principal_id
+                 LEFT JOIN principal_accounts AS account
+                   ON account.principal_account_id=job.principal_account_id
+                 LEFT JOIN conversation_subjects AS subject
+                   ON subject.conversation_subject_id=
+                      job.origin_conversation_subject_id
+                WHERE lifecycle.agent_id IS NULL
+                   OR (job.principal_id IS NOT NULL AND (
+                       principal.principal_id IS NULL
+                       OR account.principal_account_id IS NULL
+                       OR account.principal_id<>job.principal_id
+                   ))
+                   OR (job.origin_conversation_subject_id IS NOT NULL
+                       AND subject.conversation_subject_id IS NULL)
+                LIMIT 1"""
+        ).fetchone()
+        if invalid is not None:
+            raise StoreError("schema v39 cron job row is invalid")
+        invalid_firing = conn.execute(
+            """SELECT firing.firing_id
+                 FROM cron_firings AS firing
+                 LEFT JOIN cron_jobs AS job ON job.job_id=firing.job_id
+                 LEFT JOIN tasks AS task ON task.task_id=firing.task_id
+                 LEFT JOIN user_outbox AS outbox
+                   ON outbox.outbox_id=firing.outbox_id
+                WHERE job.job_id IS NULL OR task.task_id IS NULL
+                   OR (firing.outbox_id IS NOT NULL
+                       AND outbox.outbox_id IS NULL)
+                LIMIT 1"""
+        ).fetchone()
+        if invalid_firing is not None:
+            raise StoreError("schema v39 cron firing row is invalid")
+
+    @staticmethod
+    def _apply_schema_v38_task_steering_tx(
+        conn: sqlite3.Connection,
+        *,
+        allow_create: bool,
+    ) -> None:
+        """Create and validate ordered active-turn steering storage."""
+
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='task_steering'"
+        ).fetchone()
+        if table is None:
+            if not allow_create:
+                raise StoreError(
+                    "schema v38 marker exists without task steering storage"
+                )
+            _executescript_atomic(conn, _MIGRATION_38)
+        else:
+            # All indexes are derived and can be repaired safely on open.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_steering_delivery "
+                "ON task_steering(target_task_id, target_execution_id, state, sequence)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_steering_pending "
+                "ON task_steering(state, updated_at, steering_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_steering_promoted "
+                "ON task_steering(promoted_task_id) "
+                "WHERE promoted_task_id IS NOT NULL"
+            )
+        required = {
+            "steering_id",
+            "inbound_message_id",
+            "target_task_id",
+            "target_execution_id",
+            "agent_id",
+            "agent_incarnation",
+            "conversation_id",
+            "sequence",
+            "task_snapshot_json",
+            "state",
+            "claimed_by",
+            "claim_token",
+            "lease_expires_at",
+            "fallback_task_id",
+            "promoted_task_id",
+            "created_at",
+            "updated_at",
+            "applied_at",
+            "promoted_at",
+        }
+        actual = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(task_steering)")
+        }
+        if not required.issubset(actual):
+            raise StoreError("schema v38 task steering storage is incomplete")
+        invalid = conn.execute(
+            """SELECT steering.steering_id
+                 FROM task_steering AS steering
+                 LEFT JOIN inbound_messages AS inbound
+                   ON inbound.message_id=steering.inbound_message_id
+                 LEFT JOIN tasks AS task
+                   ON task.task_id=steering.target_task_id
+                 LEFT JOIN task_executions AS execution
+                   ON execution.execution_id=steering.target_execution_id
+                  AND execution.task_id=steering.target_task_id
+                  AND execution.agent_id=steering.agent_id
+                  AND execution.agent_incarnation=steering.agent_incarnation
+                 LEFT JOIN conversations AS conversation
+                   ON conversation.conversation_id=steering.conversation_id
+                WHERE inbound.message_id IS NULL
+                   OR task.task_id IS NULL
+                   OR execution.execution_id IS NULL
+                   OR conversation.conversation_id IS NULL
+                   OR task.agent_id<>steering.agent_id
+                   OR task.agent_incarnation<>steering.agent_incarnation
+                   OR task.conversation_id<>steering.conversation_id
+                LIMIT 1"""
+        ).fetchone()
+        if invalid is not None:
+            raise StoreError("schema v38 task steering row is invalid")
+
+    @staticmethod
+    def _apply_schema_v37_principal_conversations_tx(
+        conn: sqlite3.Connection,
+        *,
+        allow_create: bool,
+    ) -> None:
+        """Create and validate canonical-principal provider-history anchors."""
+
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='principal_conversation_bindings'"
+        ).fetchone()
+        if table is None:
+            if not allow_create:
+                raise StoreError(
+                    "schema v37 marker exists without principal conversation storage"
+                )
+            _executescript_atomic(conn, _MIGRATION_37)
+        else:
+            # The index is derivable and safe to repair on every open.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_principal_conversation_anchor "
+                "ON principal_conversation_bindings(conversation_id)"
+            )
+        required = {
+            "principal_id",
+            "agent_id",
+            "session_id",
+            "conversation_id",
+            "binding_kind",
+            "configured_by",
+            "created_at",
+        }
+        actual = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(principal_conversation_bindings)"
+            )
+        }
+        if not required.issubset(actual):
+            raise StoreError(
+                "schema v37 principal conversation storage is incomplete"
+            )
+        invalid = conn.execute(
+            """SELECT binding.principal_id, binding.agent_id, binding.session_id
+                 FROM principal_conversation_bindings AS binding
+                 LEFT JOIN principals AS principal
+                   ON principal.principal_id=binding.principal_id
+                 LEFT JOIN conversations AS conversation
+                   ON conversation.conversation_id=binding.conversation_id
+                WHERE principal.principal_id IS NULL
+                   OR conversation.conversation_id IS NULL
+                   OR conversation.agent_id<>binding.agent_id
+                   OR conversation.session_id<>binding.session_id
+                LIMIT 1"""
+        ).fetchone()
+        if invalid is not None:
+            raise StoreError("schema v37 principal conversation binding is invalid")
 
     @staticmethod
     def _apply_schema_v35_codex_config_profile_tx(
@@ -4884,6 +6302,416 @@ class SQLiteStore:
                     "schema v35 Codex config profile value is not canonical: "
                     f"{row['agent_id']}@{row['profile_version']}"
                 )
+
+    @staticmethod
+    def _ensure_schema_v36_unique_indexes_tx(conn: sqlite3.Connection) -> None:
+        """Validate or rebuild the partial indexes protecting live identity.
+
+        SQLite index names are schema-global and ``CREATE INDEX IF NOT EXISTS``
+        accepts an existing same-name index without checking its definition.
+        Inspect the complete definition before trusting these authorization and
+        profile-identity fences; a malformed replacement is rebuilt inside the
+        migration transaction, and duplicate rows therefore fail closed when
+        the UNIQUE index cannot be restored.
+        """
+
+        definitions = (
+            (
+                "idx_principal_accounts_one_active",
+                "principal_accounts",
+                ("channel", "bot_id", "external_user_id"),
+                "CREATE UNIQUE INDEX idx_principal_accounts_one_active "
+                "ON principal_accounts(channel, bot_id, external_user_id) "
+                "WHERE active = 1",
+            ),
+            (
+                "idx_bot_profiles_live_account",
+                "bot_profiles",
+                ("channel", "bot_id"),
+                "CREATE UNIQUE INDEX idx_bot_profiles_live_account "
+                "ON bot_profiles(channel, bot_id) WHERE removed_at IS NULL",
+            ),
+            (
+                "idx_bot_profiles_live_config_dir",
+                "bot_profiles",
+                ("config_dir",),
+                "CREATE UNIQUE INDEX idx_bot_profiles_live_config_dir "
+                "ON bot_profiles(config_dir) WHERE removed_at IS NULL",
+            ),
+            (
+                "idx_bot_profiles_live_config_identity",
+                "bot_profiles",
+                ("config_dir_identity",),
+                "CREATE UNIQUE INDEX idx_bot_profiles_live_config_identity "
+                "ON bot_profiles(config_dir_identity) WHERE removed_at IS NULL",
+            ),
+        )
+
+        def normalized_sql(value: Any) -> str:
+            return " ".join(str(value or "").split()).casefold()
+
+        def is_exact(
+            index_name: str,
+            table_name: str,
+            columns: tuple[str, ...],
+            definition: str,
+        ) -> bool:
+            schema_row = conn.execute(
+                "SELECT tbl_name, sql FROM sqlite_master "
+                "WHERE type='index' AND name=?",
+                (index_name,),
+            ).fetchone()
+            if schema_row is None or str(schema_row["tbl_name"]) != table_name:
+                return False
+            index_row = next(
+                (
+                    row
+                    for row in conn.execute(f"PRAGMA index_list({table_name})")
+                    if str(row["name"]) == index_name
+                ),
+                None,
+            )
+            if (
+                index_row is None
+                or int(index_row["unique"]) != 1
+                or int(index_row["partial"]) != 1
+            ):
+                return False
+            actual_columns = tuple(
+                str(row["name"])
+                for row in conn.execute(f"PRAGMA index_info({index_name})")
+            )
+            return actual_columns == columns and normalized_sql(
+                schema_row["sql"]
+            ) == normalized_sql(definition)
+
+        for index_name, table_name, columns, definition in definitions:
+            if is_exact(index_name, table_name, columns, definition):
+                continue
+            conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+            try:
+                conn.execute(definition)
+            except sqlite3.IntegrityError as exc:
+                raise StoreError(
+                    "schema v36 live identity uniqueness is violated: "
+                    f"{index_name}"
+                ) from exc
+            if not is_exact(index_name, table_name, columns, definition):
+                raise StoreError(
+                    f"schema v36 unique index is invalid: {index_name}"
+                )
+
+    @staticmethod
+    def _validate_schema_v36_profile_status_tx(conn: sqlite3.Connection) -> None:
+        """Require exactly one durable status row for every bot profile."""
+
+        missing = conn.execute(
+            """SELECT profile.profile_id
+                 FROM bot_profiles AS profile
+                 LEFT JOIN bot_profile_status AS status
+                   ON status.profile_id=profile.profile_id
+                WHERE status.profile_id IS NULL
+                LIMIT 1"""
+        ).fetchone()
+        if missing is not None:
+            raise StoreError(
+                "schema v36 bot profile is missing its status row: "
+                f"{missing['profile_id']}"
+            )
+        orphan = conn.execute(
+            """SELECT status.profile_id
+                 FROM bot_profile_status AS status
+                 LEFT JOIN bot_profiles AS profile
+                   ON profile.profile_id=status.profile_id
+                WHERE profile.profile_id IS NULL
+                LIMIT 1"""
+        ).fetchone()
+        if orphan is not None:
+            raise StoreError(
+                "schema v36 bot profile status is orphaned: "
+                f"{orphan['profile_id']}"
+            )
+
+    @classmethod
+    def _apply_schema_v36_multichannel_identity_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        allow_create: bool,
+    ) -> None:
+        """Create and validate additive multi-channel identity foundations."""
+
+        required_tables = {
+            "account_admission_counters",
+            "agent_account_admission_counters",
+            "principals",
+            "principal_accounts",
+            "conversation_subjects",
+            "bot_profiles",
+            "bot_profile_status",
+        }
+        existing_tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if not required_tables.issubset(existing_tables):
+            if not allow_create:
+                missing = sorted(required_tables - existing_tables)
+                raise StoreError(
+                    "schema v36 marker exists without identity storage: "
+                    + ", ".join(missing)
+                )
+            _executescript_atomic(conn, _MIGRATION_36)
+        else:
+            # Indexes are derivable and safe to repair on every open.
+            _executescript_atomic(conn, _MIGRATION_36)
+
+        required_table_columns = {
+            "account_admission_counters": {
+                "channel", "bot_id", "unfinished_count", "updated_at",
+            },
+            "agent_account_admission_counters": {
+                "agent_id", "agent_incarnation", "channel", "bot_id",
+                "unfinished_count", "last_served_ordinal", "updated_at",
+            },
+            "principals": {
+                "principal_id", "display_name", "enabled", "metadata_json",
+                "created_at", "updated_at",
+            },
+            "principal_accounts": {
+                "principal_account_id", "principal_id", "channel", "bot_id",
+                "external_user_id", "identifier_kind", "mapping_revision",
+                "active", "configured_by", "created_at", "retired_at",
+            },
+            "conversation_subjects": {
+                "conversation_subject_id", "channel", "bot_id", "subject_kind",
+                "scope_key", "external_chat_id", "external_thread_id",
+                "parent_subject_id", "provenance_json", "created_at",
+            },
+            "bot_profiles": {
+                "profile_id", "channel", "bot_id", "brand", "config_dir",
+                "config_dir_identity", "cli_version", "credential_ref", "enabled",
+                "mention_policy", "access_policy", "restart_policy_json",
+                "created_at", "updated_at", "removed_at",
+            },
+            "bot_profile_status": {
+                "profile_id", "onboarding_state", "connection_state", "generation",
+                "last_ready_at", "retry_after", "last_error_code", "updated_at",
+            },
+        }
+        for table_name, required in required_table_columns.items():
+            actual = {
+                str(row[1])
+                for row in conn.execute(f"PRAGMA table_info({table_name})")
+            }
+            if not required.issubset(actual):
+                raise StoreError(f"schema v36 {table_name} storage is incomplete")
+
+        cls._ensure_schema_v36_unique_indexes_tx(conn)
+        cls._validate_schema_v36_profile_status_tx(conn)
+
+        additive_columns: dict[str, tuple[tuple[str, str], ...]] = {
+            "inbound_messages": (
+                ("principal_id", "TEXT"),
+                ("principal_account_id", "TEXT"),
+                ("conversation_subject_id", "TEXT"),
+                ("identity_snapshot_json", "TEXT"),
+            ),
+            "tasks": (
+                ("actor_external_user_id", "TEXT"),
+                ("principal_id", "TEXT"),
+                ("principal_account_id", "TEXT"),
+                ("conversation_subject_id", "TEXT"),
+                ("identity_snapshot_json", "TEXT"),
+            ),
+            "command_receipts": (
+                ("actor_external_user_id", "TEXT"),
+                ("principal_id", "TEXT"),
+                ("principal_account_id", "TEXT"),
+                ("conversation_subject_id", "TEXT"),
+                ("identity_snapshot_json", "TEXT"),
+            ),
+            "conversations": (("conversation_subject_id", "TEXT"),),
+            "user_outbox": (
+                ("transport_idempotency_key", "TEXT"),
+                ("sender_json", "TEXT"),
+                ("delivery_address_json", "TEXT"),
+                ("transport_metadata_json", "TEXT"),
+                ("remote_delivery_id", "TEXT"),
+            ),
+            "agent_invocations": (
+                ("account_channel", "TEXT"),
+                ("account_bot_id", "TEXT"),
+            ),
+        }
+        for table_name, additions in additive_columns.items():
+            actual = {
+                str(row[1])
+                for row in conn.execute(f"PRAGMA table_info({table_name})")
+            }
+            for column_name, definition in additions:
+                if column_name in actual:
+                    continue
+                if not allow_create:
+                    raise StoreError(
+                        f"schema v36 marker exists without {table_name}.{column_name}"
+                    )
+                conn.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+                )
+
+        cls._backfill_schema_v36_identity_tx(conn)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_invocations_account_fifo "
+            "ON agent_invocations(agent_id, agent_incarnation, "
+            "account_channel, account_bot_id, state, dispatch_backend, "
+            "ready_sequence)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_user_outbox_transport_idempotency "
+            "ON user_outbox(transport_idempotency_key) "
+            "WHERE transport_idempotency_key IS NOT NULL"
+        )
+
+    @classmethod
+    def _backfill_schema_v36_identity_tx(cls, conn: sqlite3.Connection) -> None:
+        """Backfill only new provenance fields; legacy routing IDs never move."""
+
+        now = _utc_text()
+        conn.execute(
+            """UPDATE agent_invocations AS invocation
+                  SET account_channel=COALESCE(
+                          NULLIF(account_channel, ''),
+                          (SELECT NULLIF(task.channel, '') FROM tasks AS task
+                            WHERE task.task_id=invocation.task_id),
+                          (SELECT NULLIF(task.channel, '')
+                             FROM agent_mailbox AS mailbox
+                             JOIN tasks AS task ON task.task_id=mailbox.task_id
+                            WHERE mailbox.mailbox_id=invocation.mailbox_id),
+                          'internal'
+                      ),
+                      account_bot_id=COALESCE(
+                          NULLIF(account_bot_id, ''),
+                          (SELECT NULLIF(task.bot_id, '') FROM tasks AS task
+                            WHERE task.task_id=invocation.task_id),
+                          (SELECT NULLIF(task.bot_id, '')
+                             FROM agent_mailbox AS mailbox
+                             JOIN tasks AS task ON task.task_id=mailbox.task_id
+                            WHERE mailbox.mailbox_id=invocation.mailbox_id),
+                          (SELECT NULLIF(mailbox.source_agent_id, '')
+                             FROM agent_mailbox AS mailbox
+                            WHERE mailbox.mailbox_id=invocation.mailbox_id),
+                          'runtime'
+                      )
+                WHERE length(trim(COALESCE(account_channel, '')))=0
+                   OR length(trim(COALESCE(account_bot_id, '')))=0"""
+        )
+        missing_account = conn.execute(
+            """SELECT invocation_id FROM agent_invocations
+                WHERE length(trim(COALESCE(account_channel, '')))=0
+                   OR length(trim(COALESCE(account_bot_id, '')))=0
+                LIMIT 1"""
+        ).fetchone()
+        if missing_account is not None:
+            raise StoreError(
+                "schema v36 invocation account backfill is incomplete: "
+                f"{missing_account['invocation_id']}"
+            )
+        scopes = conn.execute(
+            """SELECT channel, bot_id, external_user_id FROM inbound_messages
+               UNION SELECT channel, bot_id, external_user_id FROM conversations
+               UNION SELECT channel, bot_id, external_user_id FROM tasks
+               UNION SELECT channel, bot_id, external_user_id FROM command_receipts"""
+        ).fetchall()
+        subject_by_scope: dict[tuple[str, str, str], str] = {}
+        for row in scopes:
+            scope = tuple(str(row[index] or "").strip() for index in range(3))
+            if not all(scope):
+                continue
+            subject = direct_conversation_subject(*scope)
+            subject_by_scope[scope] = subject.conversation_subject_id
+            conn.execute(
+                """INSERT OR IGNORE INTO conversation_subjects
+                       (conversation_subject_id, channel, bot_id, subject_kind,
+                        scope_key, external_chat_id, external_thread_id,
+                        parent_subject_id, provenance_json, created_at)
+                   VALUES (?, ?, ?, 'direct', ?, '', '', NULL, ?, ?)""",
+                (
+                    subject.conversation_subject_id,
+                    subject.channel,
+                    subject.bot_id,
+                    subject.scope_key,
+                    json_dumps({"source": "legacy_v36_backfill"}),
+                    now,
+                ),
+            )
+
+        for table_name, identity_column in (
+            ("inbound_messages", "message_id"),
+            ("tasks", "task_id"),
+            ("command_receipts", "command_id"),
+            ("conversations", "conversation_id"),
+        ):
+            rows = conn.execute(
+                f"SELECT {identity_column}, channel, bot_id, external_user_id, "
+                f"conversation_subject_id FROM {table_name}"
+            ).fetchall()
+            for row in rows:
+                scope = (
+                    str(row["channel"] or "").strip(),
+                    str(row["bot_id"] or "").strip(),
+                    str(row["external_user_id"] or "").strip(),
+                )
+                subject_id = subject_by_scope.get(scope)
+                if not subject_id or row["conversation_subject_id"] is not None:
+                    continue
+                conn.execute(
+                    f"UPDATE {table_name} SET conversation_subject_id=? "
+                    f"WHERE {identity_column}=? AND conversation_subject_id IS NULL",
+                    (subject_id, row[identity_column]),
+                )
+
+        conn.execute(
+            "UPDATE tasks SET actor_external_user_id=external_user_id "
+            "WHERE actor_external_user_id IS NULL"
+        )
+        conn.execute(
+            "UPDATE command_receipts SET actor_external_user_id=external_user_id "
+            "WHERE actor_external_user_id IS NULL"
+        )
+        outbox_rows = conn.execute(
+            "SELECT outbox_id, channel, bot_id, external_user_id, session_id, "
+            "source_message_id, client_id, from_user_id, sender_json, "
+            "delivery_address_json, transport_metadata_json "
+            "FROM user_outbox"
+        ).fetchall()
+        for row in outbox_rows:
+            sender = {
+                "channel": str(row["channel"] or ""),
+                "bot_id": str(row["from_user_id"] or row["bot_id"] or ""),
+            }
+            address = DeliveryAddress(
+                channel=str(row["channel"] or ""),
+                bot_id=str(row["bot_id"] or ""),
+                destination_kind="direct",
+                destination_id=str(row["external_user_id"] or ""),
+                session_id=str(row["session_id"] or "default"),
+                source_message_id=row["source_message_id"],
+            )
+            conn.execute(
+                """UPDATE user_outbox
+                   SET transport_idempotency_key=COALESCE(
+                           transport_idempotency_key, client_id),
+                       sender_json=COALESCE(sender_json, ?),
+                       delivery_address_json=COALESCE(delivery_address_json, ?),
+                       transport_metadata_json=COALESCE(
+                           transport_metadata_json, '{}')
+                   WHERE outbox_id=?""",
+                (json_dumps(sender), json_dumps(address.to_dict()), row["outbox_id"]),
+            )
 
     @classmethod
     def _reply_aggregate_hash(cls, value: Any) -> str:
@@ -6594,6 +8422,20 @@ class SQLiteStore:
                 )
             # Publish diagnostics only after the recovery transaction commits.
             self._startup_recovery_report = startup_report
+        # A child/process boundary makes every in-flight steering delivery
+        # ambiguous even when its wall-clock lease has not elapsed.  Pending
+        # rows whose exact executions became terminal during recovery are then
+        # promoted through their frozen snapshots, subject to admission.
+        with _transaction(conn):
+            self._recover_task_steering_tx(
+                conn,
+                now=self._now(),
+                process_boundary=bool(recover_startup_state),
+                max_agent_queue=self.max_agent_queue,
+                max_global_queue=self.max_global_queue,
+                max_account_queue=self.max_account_queue,
+                max_account_agent_queue=self.max_account_agent_queue,
+            )
         self._conn = conn
 
     @staticmethod
@@ -6702,6 +8544,141 @@ class SQLiteStore:
                    updated_at=excluded.updated_at""",
             (unfinished_total, now_text),
         )
+
+        invocation_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(agent_invocations)")
+        }
+        if not {"account_channel", "account_bot_id"}.issubset(
+            invocation_columns
+        ):
+            return
+        account_projection_tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                "('account_admission_counters',"
+                "'agent_account_admission_counters')"
+            ).fetchall()
+        }
+        if account_projection_tables != {
+            "account_admission_counters",
+            "agent_account_admission_counters",
+        }:
+            # A migration fixture may intentionally expose an additive column
+            # before the v36 boundary that owns the corresponding projection
+            # tables.  The v36 marker validator rejects an actually incomplete
+            # v36 schema; an older boundary simply has nothing to rebuild yet.
+            return
+        missing_account = conn.execute(
+            """SELECT invocation_id FROM agent_invocations
+                WHERE length(trim(COALESCE(account_channel, '')))=0
+                   OR length(trim(COALESCE(account_bot_id, '')))=0
+                LIMIT 1"""
+        ).fetchone()
+        if missing_account is not None:
+            raise StoreError(
+                "invocation account identity is unavailable: "
+                f"{missing_account['invocation_id']}"
+            )
+
+        account_expected_rows = conn.execute(
+            """SELECT account_channel AS channel, account_bot_id AS bot_id,
+                      SUM(CASE WHEN admission_released_at IS NULL THEN 1 ELSE 0 END)
+                          AS unfinished_count
+                 FROM agent_invocations
+                GROUP BY account_channel, account_bot_id"""
+        ).fetchall()
+        account_expected = {
+            (str(row["channel"]), str(row["bot_id"])): int(
+                row["unfinished_count"] or 0
+            )
+            for row in account_expected_rows
+        }
+        account_existing = {
+            (str(row["channel"]), str(row["bot_id"])): row
+            for row in conn.execute(
+                "SELECT * FROM account_admission_counters"
+            ).fetchall()
+        }
+        for channel, bot_id in sorted(
+            set(account_expected) | set(account_existing)
+        ):
+            conn.execute(
+                """INSERT INTO account_admission_counters
+                       (channel,bot_id,unfinished_count,updated_at)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(channel,bot_id) DO UPDATE SET
+                       unfinished_count=excluded.unfinished_count,
+                       updated_at=excluded.updated_at""",
+                (
+                    channel,
+                    bot_id,
+                    account_expected.get((channel, bot_id), 0),
+                    now_text,
+                ),
+            )
+
+        stream_expected_rows = conn.execute(
+            """SELECT agent_id,agent_incarnation,
+                      account_channel AS channel,account_bot_id AS bot_id,
+                      SUM(CASE WHEN admission_released_at IS NULL THEN 1 ELSE 0 END)
+                          AS unfinished_count
+                 FROM agent_invocations
+                GROUP BY agent_id,agent_incarnation,
+                         account_channel,account_bot_id"""
+        ).fetchall()
+        stream_expected = {
+            (
+                str(row["agent_id"]),
+                int(row["agent_incarnation"]),
+                str(row["channel"]),
+                str(row["bot_id"]),
+            ): int(row["unfinished_count"] or 0)
+            for row in stream_expected_rows
+        }
+        stream_existing = {
+            (
+                str(row["agent_id"]),
+                int(row["agent_incarnation"]),
+                str(row["channel"]),
+                str(row["bot_id"]),
+            ): row
+            for row in conn.execute(
+                "SELECT * FROM agent_account_admission_counters"
+            ).fetchall()
+        }
+        for key in sorted(set(stream_expected) | set(stream_existing)):
+            agent_id, incarnation, channel, bot_id = key
+            prior = stream_existing.get(key)
+            last_served = (
+                int(prior["last_served_ordinal"])
+                if prior is not None
+                else 0
+            )
+            conn.execute(
+                """INSERT INTO agent_account_admission_counters
+                       (agent_id,agent_incarnation,channel,bot_id,
+                        unfinished_count,last_served_ordinal,updated_at)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(agent_id,agent_incarnation,channel,bot_id)
+                   DO UPDATE SET
+                       unfinished_count=excluded.unfinished_count,
+                       last_served_ordinal=MAX(
+                           agent_account_admission_counters.last_served_ordinal,
+                           excluded.last_served_ordinal
+                       ),
+                       updated_at=excluded.updated_at""",
+                (
+                    agent_id,
+                    incarnation,
+                    channel,
+                    bot_id,
+                    stream_expected.get(key, 0),
+                    last_served,
+                    now_text,
+                ),
+            )
 
     def _strong_startup_recovery_tx(
         self,
@@ -7757,8 +9734,14 @@ class SQLiteStore:
         cls,
         conn: sqlite3.Connection,
         row: sqlite3.Row,
-    ) -> sqlite3.Row:
-        """Insert/reuse the sole reply scope for a persisted inbound row."""
+    ) -> sqlite3.Row | None:
+        """Insert/reuse the WeChat reply-quota scope for one inbound row."""
+
+        if str(row["channel"] or "").strip().lower() != "wechat":
+            # Reply scopes model the iLink ten-send allowance.  Exact-account
+            # transports such as Lark own independent rate limiting and must
+            # never create dormant WeChat quota state during ingress/replay.
+            return None
 
         reply_scope_id, source_identity = cls._reply_scope_identity_from_row(row)
         conn.execute(
@@ -7849,31 +9832,19 @@ class SQLiteStore:
             return None
         return cls._ensure_reply_scope_for_inbound_row_tx(conn, inbound)
 
-    @staticmethod
+    @classmethod
     def _reply_target_for_scope_tx(
+        cls,
         conn: sqlite3.Connection,
         scope: sqlite3.Row,
     ) -> ReplyTarget:
         inbound = conn.execute(
-            """SELECT external_message_id, source_sequence, context_token
-               FROM inbound_messages WHERE message_id=?""",
+            "SELECT * FROM inbound_messages WHERE message_id=?",
             (scope["inbound_message_id"],),
         ).fetchone()
         if inbound is None:
             raise StoreError("reply scope has no stored inbound envelope")
-        return ReplyTarget(
-            channel=str(scope["channel"]),
-            bot_id=str(scope["bot_id"]),
-            external_user_id=str(scope["external_user_id"]),
-            session_id=str(scope["session_id"] or "default"),
-            source_message_id=str(inbound["external_message_id"] or "") or None,
-            source_sequence=(
-                int(inbound["source_sequence"])
-                if inbound["source_sequence"] is not None
-                else None
-            ),
-            context_token=inbound["context_token"],
-        )
+        return cls._inbound_from_row(inbound).target()
 
     @staticmethod
     def _backfill_agent_lifecycle_v24_tx(
@@ -9260,6 +11231,106 @@ class SQLiteStore:
     # Row conversion helpers
     # ------------------------------------------------------------------
     @staticmethod
+    def _principal_from_row(row: sqlite3.Row | None) -> PrincipalRecord | None:
+        if row is None:
+            return None
+        return PrincipalRecord(
+            principal_id=str(row["principal_id"]),
+            display_name=str(row["display_name"] or ""),
+            enabled=bool(row["enabled"]),
+            metadata=json_loads(row["metadata_json"], {}) or {},
+            created_at=text_to_datetime(row["created_at"]),
+            updated_at=text_to_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _principal_account_from_row(
+        row: sqlite3.Row | None,
+    ) -> PrincipalAccountRecord | None:
+        if row is None:
+            return None
+        return PrincipalAccountRecord(
+            principal_account_id=str(row["principal_account_id"]),
+            principal_id=str(row["principal_id"]),
+            channel=str(row["channel"]),
+            bot_id=str(row["bot_id"]),
+            external_user_id=str(row["external_user_id"]),
+            identifier_kind=str(row["identifier_kind"]),
+            mapping_revision=int(row["mapping_revision"]),
+            active=bool(row["active"]),
+            configured_by=str(row["configured_by"]),
+            created_at=text_to_datetime(row["created_at"]),
+            retired_at=text_to_datetime(row["retired_at"]),
+            principal_enabled=bool(
+                row["principal_enabled"]
+                if "principal_enabled" in row.keys()
+                else True
+            ),
+        )
+
+    @staticmethod
+    def _conversation_subject_from_row(
+        row: sqlite3.Row | None,
+    ) -> ConversationSubjectRecord | None:
+        if row is None:
+            return None
+        return ConversationSubjectRecord(
+            conversation_subject_id=str(row["conversation_subject_id"]),
+            channel=str(row["channel"]),
+            bot_id=str(row["bot_id"]),
+            subject_kind=str(row["subject_kind"]),
+            scope_key=str(row["scope_key"]),
+            external_chat_id=str(row["external_chat_id"] or ""),
+            external_thread_id=str(row["external_thread_id"] or ""),
+            parent_subject_id=row["parent_subject_id"],
+            provenance=json_loads(row["provenance_json"], {}) or {},
+            created_at=text_to_datetime(row["created_at"]),
+        )
+
+    @staticmethod
+    def _bot_profile_from_row(row: sqlite3.Row | None) -> BotProfileRecord | None:
+        if row is None:
+            return None
+        return BotProfileRecord(
+            profile_id=str(row["profile_id"]),
+            channel=str(row["channel"]),
+            bot_id=str(row["bot_id"]),
+            brand=str(row["brand"]),
+            config_dir=str(row["config_dir"]),
+            config_dir_identity=str(row["config_dir_identity"]),
+            cli_version=str(row["cli_version"]),
+            credential_ref=str(row["credential_ref"]),
+            enabled=bool(row["enabled"]),
+            mention_policy=str(row["mention_policy"]),
+            access_policy=str(row["access_policy"]),
+            restart_policy=json_loads(row["restart_policy_json"], {}) or {},
+            created_at=text_to_datetime(row["created_at"]),
+            updated_at=text_to_datetime(row["updated_at"]),
+            removed_at=text_to_datetime(row["removed_at"]),
+        )
+
+    @staticmethod
+    def _bot_profile_status_from_row(
+        row: sqlite3.Row | None,
+    ) -> BotProfileStatusRecord | None:
+        if row is None:
+            return None
+        return BotProfileStatusRecord(
+            profile_id=str(row["profile_id"]),
+            onboarding_state=str(row["onboarding_state"]),
+            connection_state=str(row["connection_state"]),
+            generation=int(row["generation"]),
+            last_ready_at=text_to_datetime(row["last_ready_at"]),
+            retry_after=text_to_datetime(row["retry_after"]),
+            last_error_code=(
+                str(row["last_error_code"])
+                if row["last_error_code"] is not None
+                else None
+            ),
+            updated_at=text_to_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
     def _task_from_row(row: sqlite3.Row | None) -> TaskRecord | None:
         if row is None:
             return None
@@ -9300,6 +11371,29 @@ class SQLiteStore:
                 if "pending_delivery_reply_scope_id" in row.keys()
                 else None
             ),
+            actor_external_user_id=(
+                str(row["actor_external_user_id"] or "")
+                if "actor_external_user_id" in row.keys()
+                else ""
+            ),
+            principal_id=(
+                row["principal_id"] if "principal_id" in row.keys() else None
+            ),
+            principal_account_id=(
+                row["principal_account_id"]
+                if "principal_account_id" in row.keys()
+                else None
+            ),
+            conversation_subject_id=(
+                row["conversation_subject_id"]
+                if "conversation_subject_id" in row.keys()
+                else None
+            ),
+            identity_snapshot=(
+                json_loads(row["identity_snapshot_json"], {}) or {}
+                if "identity_snapshot_json" in row.keys()
+                else {}
+            ),
         )
 
     @staticmethod
@@ -9334,6 +11428,59 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _task_steering_from_row(
+        row: sqlite3.Row | None,
+    ) -> TaskSteeringRecord | None:
+        if row is None:
+            return None
+        snapshot = json_loads(row["task_snapshot_json"], None)
+        if not isinstance(snapshot, Mapping):
+            raise StoreError(
+                "task steering snapshot is invalid: " + str(row["steering_id"])
+            )
+        return TaskSteeringRecord(
+            steering_id=str(row["steering_id"]),
+            inbound_message_id=str(row["inbound_message_id"]),
+            target_task_id=str(row["target_task_id"]),
+            target_execution_id=str(row["target_execution_id"]),
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            conversation_id=str(row["conversation_id"]),
+            sequence=int(row["sequence"]),
+            state=TaskSteeringState(str(row["state"])),
+            task_snapshot=dict(snapshot),
+            fallback_task_id=str(row["fallback_task_id"]),
+            promoted_task_id=(
+                str(row["promoted_task_id"])
+                if row["promoted_task_id"] is not None
+                else None
+            ),
+            claimed_by=(
+                str(row["claimed_by"])
+                if row["claimed_by"] is not None
+                else None
+            ),
+            claim_token=(
+                str(row["claim_token"])
+                if row["claim_token"] is not None
+                else None
+            ),
+            lease_expires_at=text_to_datetime(row["lease_expires_at"]),
+            created_at=_required_row_datetime(
+                row["created_at"],
+                label="task steering creation",
+                identity=row["steering_id"],
+            ),
+            updated_at=_required_row_datetime(
+                row["updated_at"],
+                label="task steering update",
+                identity=row["steering_id"],
+            ),
+            applied_at=text_to_datetime(row["applied_at"]),
+            promoted_at=text_to_datetime(row["promoted_at"]),
+        )
+
+    @staticmethod
     def _invocation_from_row(
         row: sqlite3.Row | None,
     ) -> AgentInvocationRecord | None:
@@ -9348,6 +11495,16 @@ class SQLiteStore:
             state=InvocationState(str(row["state"])),
             dispatch_backend=DispatchBackend(str(row["dispatch_backend"])),
             ready_sequence=int(row["ready_sequence"]),
+            account_channel=(
+                str(row["account_channel"] or "")
+                if "account_channel" in row.keys()
+                else ""
+            ),
+            account_bot_id=(
+                str(row["account_bot_id"] or "")
+                if "account_bot_id" in row.keys()
+                else ""
+            ),
             task_id=row["task_id"],
             execution_id=row["execution_id"],
             mailbox_id=row["mailbox_id"],
@@ -9432,6 +11589,35 @@ class SQLiteStore:
             agent_incarnation=int(row["agent_incarnation"]),
             unfinished_count=int(row["unfinished_count"]),
             next_ready_sequence=int(row["next_ready_sequence"]),
+            updated_at=text_to_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _account_admission_counter_from_row(
+        row: sqlite3.Row | None,
+    ) -> AccountAdmissionCounterRecord | None:
+        if row is None:
+            return None
+        return AccountAdmissionCounterRecord(
+            channel=str(row["channel"]),
+            bot_id=str(row["bot_id"]),
+            unfinished_count=int(row["unfinished_count"]),
+            updated_at=text_to_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _agent_account_admission_counter_from_row(
+        row: sqlite3.Row | None,
+    ) -> AgentAccountAdmissionCounterRecord | None:
+        if row is None:
+            return None
+        return AgentAccountAdmissionCounterRecord(
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            channel=str(row["channel"]),
+            bot_id=str(row["bot_id"]),
+            unfinished_count=int(row["unfinished_count"]),
+            last_served_ordinal=int(row["last_served_ordinal"]),
             updated_at=text_to_datetime(row["updated_at"]),
         )
 
@@ -9776,6 +11962,170 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _cron_job_from_row(row: sqlite3.Row | None) -> CronJobRecord | None:
+        if row is None:
+            return None
+        template = json_loads(row["task_template_json"], {}) or {}
+        if not isinstance(template, Mapping):
+            raise StoreError(f"cron task template is malformed: {row['job_id']}")
+        return CronJobRecord(
+            job_id=str(row["job_id"]),
+            principal_id=str(row["principal_id"] or ""),
+            principal_account_id=(
+                str(row["principal_account_id"])
+                if row["principal_account_id"] is not None
+                else None
+            ),
+            origin_channel=str(row["origin_channel"]),
+            origin_bot_id=str(row["origin_bot_id"]),
+            origin_external_user_id=str(row["origin_external_user_id"]),
+            origin_conversation_subject_id=(
+                str(row["origin_conversation_subject_id"])
+                if row["origin_conversation_subject_id"] is not None
+                else None
+            ),
+            origin_conversation_subject_scope=str(
+                row["origin_conversation_subject_scope"]
+            ),
+            origin_session_id=str(row["origin_session_id"] or "default"),
+            origin_reply_target=ReplyTarget.from_value(
+                json_loads(row["origin_reply_target_json"], {}) or {}
+            ),
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            schedule_kind=str(row["schedule_kind"]),
+            schedule_expression=str(row["schedule_expression"]),
+            timezone_name=str(row["timezone_name"]),
+            prompt=str(row["prompt"]),
+            enabled=bool(row["enabled"]),
+            created_at=text_to_datetime(row["created_at"]),
+            updated_at=text_to_datetime(row["updated_at"]),
+            next_fire_at=text_to_datetime(row["next_fire_at"]),
+            last_fired_at=text_to_datetime(row["last_fired_at"]),
+            expires_at=text_to_datetime(row["expires_at"]),
+            disabled_at=text_to_datetime(row["disabled_at"]),
+            disabled_reason=(
+                str(row["disabled_reason"])
+                if row["disabled_reason"] is not None
+                else None
+            ),
+            task_template=dict(template),
+            conversation_id=str(template.get("conversation_id") or ""),
+            mode_id=str(template.get("mode_id") or "chat"),
+            profile_version=int(template.get("profile_version") or 1),
+            policy_version=int(template.get("policy_version") or 1),
+            model=str(template.get("model") or ""),
+            reasoning_effort=str(template.get("reasoning_effort") or ""),
+            task_metadata=(
+                dict(template.get("metadata") or {})
+                if isinstance(template.get("metadata"), Mapping)
+                else {}
+            ),
+        )
+
+    @staticmethod
+    def _natural_cron_draft_from_row(
+        row: sqlite3.Row | None,
+    ) -> NaturalCronDraftRecord | None:
+        if row is None:
+            return None
+        template = json_loads(row["task_template_json"], {}) or {}
+        if not isinstance(template, Mapping):
+            raise StoreError(
+                f"natural cron task template is malformed: {row['draft_id']}"
+            )
+        return NaturalCronDraftRecord(
+            draft_id=str(row["draft_id"]),
+            job_id=str(row["job_id"]),
+            source_task_id=str(row["source_task_id"]),
+            source_execution_id=str(row["source_execution_id"]),
+            source_inbound_message_id=str(row["source_inbound_message_id"]),
+            principal_id=(
+                str(row["principal_id"])
+                if row["principal_id"] is not None
+                else None
+            ),
+            principal_account_id=(
+                str(row["principal_account_id"])
+                if row["principal_account_id"] is not None
+                else None
+            ),
+            principal_mapping_revision=(
+                int(row["principal_mapping_revision"])
+                if row["principal_mapping_revision"] is not None
+                else None
+            ),
+            origin_channel=str(row["origin_channel"]),
+            origin_bot_id=str(row["origin_bot_id"]),
+            origin_external_user_id=str(row["origin_external_user_id"]),
+            origin_conversation_subject_id=(
+                str(row["origin_conversation_subject_id"])
+                if row["origin_conversation_subject_id"] is not None
+                else None
+            ),
+            origin_conversation_subject_scope=str(
+                row["origin_conversation_subject_scope"]
+            ),
+            origin_session_id=str(row["origin_session_id"] or "default"),
+            origin_reply_target=ReplyTarget.from_value(
+                json_loads(row["origin_reply_target_json"], {}) or {}
+            ),
+            conversation_id=str(row["conversation_id"]),
+            agent_id=str(row["agent_id"]),
+            agent_incarnation=int(row["agent_incarnation"]),
+            task_template=dict(template),
+            schedule_kind=str(row["schedule_kind"]),
+            schedule_expression=str(row["schedule_expression"]),
+            timezone_name=str(row["timezone_name"]),
+            prompt=str(row["prompt"]),
+            next_fire_at=text_to_datetime(row["next_fire_at"]),
+            state=str(row["state"]),
+            created_at=text_to_datetime(row["created_at"]),
+            updated_at=text_to_datetime(row["updated_at"]),
+            expires_at=text_to_datetime(row["expires_at"]),
+            resolved_at=text_to_datetime(row["resolved_at"]),
+            confirmation_task_id=(
+                str(row["confirmation_task_id"])
+                if row["confirmation_task_id"] is not None
+                else None
+            ),
+            confirmation_execution_id=(
+                str(row["confirmation_execution_id"])
+                if row["confirmation_execution_id"] is not None
+                else None
+            ),
+            confirmation_inbound_message_id=(
+                str(row["confirmation_inbound_message_id"])
+                if row["confirmation_inbound_message_id"] is not None
+                else None
+            ),
+            confirmation_steering_id=(
+                str(row["confirmation_steering_id"])
+                if row["confirmation_steering_id"] is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _cron_firing_from_row(
+        row: sqlite3.Row | None,
+    ) -> CronFiringRecord | None:
+        if row is None:
+            return None
+        return CronFiringRecord(
+            firing_id=str(row["firing_id"]),
+            job_id=str(row["job_id"]),
+            scheduled_for=text_to_datetime(row["scheduled_for"]),
+            task_id=str(row["task_id"]),
+            outbox_id=(
+                str(row["outbox_id"])
+                if row["outbox_id"] is not None
+                else None
+            ),
+            fired_at=text_to_datetime(row["fired_at"]),
+        )
+
+    @staticmethod
     def _outbox_from_row(row: sqlite3.Row | None) -> UserOutboxItem | None:
         if row is None:
             return None
@@ -9852,6 +12202,36 @@ class SQLiteStore:
                 if "active_wire_variant" in row.keys()
                 else "primary"
             ),
+            transport_idempotency_key=(
+                row["transport_idempotency_key"]
+                if "transport_idempotency_key" in row.keys()
+                else row["client_id"]
+            ),
+            sender=(
+                json_loads(row["sender_json"], {}) or {}
+                if "sender_json" in row.keys()
+                else {
+                    "channel": str(row["channel"] or ""),
+                    "bot_id": str(row["from_user_id"] or row["bot_id"] or ""),
+                }
+            ),
+            delivery_address=(
+                DeliveryAddress.from_value(
+                    json_loads(row["delivery_address_json"], None)
+                )
+                if "delivery_address_json" in row.keys()
+                else None
+            ),
+            transport_metadata=(
+                json_loads(row["transport_metadata_json"], {}) or {}
+                if "transport_metadata_json" in row.keys()
+                else {}
+            ),
+            remote_delivery_id=(
+                row["remote_delivery_id"]
+                if "remote_delivery_id" in row.keys()
+                else None
+            ),
         )
 
     @staticmethod
@@ -9920,6 +12300,29 @@ class SQLiteStore:
                 for value in (json_loads(row["command_args_json"], []) or [])
             ),
             "command_text": str(row["command_text"] or ""),
+            "actor_external_user_id": (
+                str(row["actor_external_user_id"] or "")
+                if "actor_external_user_id" in row.keys()
+                else str(row["external_user_id"] or "")
+            ),
+            "principal_id": (
+                row["principal_id"] if "principal_id" in row.keys() else None
+            ),
+            "principal_account_id": (
+                row["principal_account_id"]
+                if "principal_account_id" in row.keys()
+                else None
+            ),
+            "conversation_subject_id": (
+                row["conversation_subject_id"]
+                if "conversation_subject_id" in row.keys()
+                else None
+            ),
+            "identity_snapshot": (
+                json_loads(row["identity_snapshot_json"], {}) or {}
+                if "identity_snapshot_json" in row.keys()
+                else {}
+            ),
             "state": str(row["state"]),
             "response_text": str(row["response_text"] or ""),
             "response_agent_id": str(row["response_agent_id"] or ""),
@@ -9947,6 +12350,25 @@ class SQLiteStore:
             label="inbound receipt",
             identity=row["message_id"],
         )
+        identity_snapshot = (
+            json_loads(row["identity_snapshot_json"], {}) or {}
+            if "identity_snapshot_json" in row.keys()
+            else {}
+        )
+        subject_snapshot = (
+            identity_snapshot.get("conversation_subject", {})
+            if isinstance(identity_snapshot, Mapping)
+            else {}
+        )
+        destination_snapshot = (
+            identity_snapshot.get("destination", {})
+            if isinstance(identity_snapshot, Mapping)
+            else {}
+        )
+        if not isinstance(subject_snapshot, Mapping):
+            subject_snapshot = {}
+        if not isinstance(destination_snapshot, Mapping):
+            destination_snapshot = {}
         return InboundMessage(
             channel=row["channel"],
             bot_id=row["bot_id"],
@@ -9961,6 +12383,37 @@ class SQLiteStore:
             message_id=row["message_id"],
             status=InboundState(row["status"]),
             task_id=row["task_id"],
+            principal_id=(
+                row["principal_id"] if "principal_id" in row.keys() else None
+            ),
+            principal_account_id=(
+                row["principal_account_id"]
+                if "principal_account_id" in row.keys()
+                else None
+            ),
+            conversation_subject_id=(
+                row["conversation_subject_id"]
+                if "conversation_subject_id" in row.keys()
+                else None
+            ),
+            conversation_subject_kind=str(
+                subject_snapshot.get("kind") or "direct"
+            ),
+            conversation_subject_scope=str(
+                subject_snapshot.get("scope_key") or ""
+            ),
+            destination_kind=str(destination_snapshot.get("kind") or ""),
+            destination_id=str(destination_snapshot.get("id") or ""),
+            thread_id=str(destination_snapshot.get("thread_id") or ""),
+            root_message_id=str(destination_snapshot.get("root_message_id") or ""),
+            transport_metadata=(
+                dict(destination_snapshot.get("transport_metadata") or {})
+                if isinstance(
+                    destination_snapshot.get("transport_metadata"), Mapping
+                )
+                else {}
+            ),
+            identity_snapshot=identity_snapshot,
         )
 
     @classmethod
@@ -10049,7 +12502,12 @@ class SQLiteStore:
                 for name in (
                     "channel", "bot_id", "external_user_id", "external_message_id",
                     "text", "session_id", "source_sequence", "context_token",
-                    "received_at", "payload", "message_id",
+                    "received_at", "payload", "message_id", "principal_id",
+                    "principal_account_id", "conversation_subject_id",
+                    "conversation_subject_kind", "conversation_subject_scope",
+                    "destination_kind", "destination_id", "thread_id",
+                    "root_message_id", "transport_metadata",
+                    "identity_snapshot",
                 ):
                     if hasattr(value, name):
                         data[name] = getattr(value, name)
@@ -10183,6 +12641,60 @@ class SQLiteStore:
         if stored_payload != incoming_payload:
             raise StoreError(
                 "inbound identity conflicts with immutable envelope (payload)"
+            )
+        identity_snapshot = (
+            json_loads(row["identity_snapshot_json"], {}) or {}
+            if "identity_snapshot_json" in row.keys()
+            else {}
+        )
+        subject_snapshot = (
+            identity_snapshot.get("conversation_subject", {})
+            if isinstance(identity_snapshot, Mapping)
+            else {}
+        )
+        destination_snapshot = (
+            identity_snapshot.get("destination", {})
+            if isinstance(identity_snapshot, Mapping)
+            else {}
+        )
+        if not isinstance(subject_snapshot, Mapping):
+            subject_snapshot = {}
+        if not isinstance(destination_snapshot, Mapping):
+            destination_snapshot = {}
+        supplied_subject = str(message.conversation_subject_id or "").strip()
+        if supplied_subject and supplied_subject not in {
+            str(subject_snapshot.get("conversation_subject_id") or ""),
+            str(subject_snapshot.get("scope_key") or ""),
+        }:
+            raise StoreError(
+                "inbound identity conflicts with immutable envelope "
+                "(conversation_subject_id)"
+            )
+        supplied_kind = str(message.conversation_subject_kind or "direct").strip().lower()
+        stored_kind = str(subject_snapshot.get("kind") or "direct").strip().lower()
+        if supplied_kind != stored_kind:
+            raise StoreError(
+                "inbound identity conflicts with immutable envelope "
+                "(conversation_subject_kind)"
+            )
+        for label, supplied, stored in (
+            ("destination_kind", message.destination_kind, destination_snapshot.get("kind")),
+            ("destination_id", message.destination_id, destination_snapshot.get("id")),
+            ("thread_id", message.thread_id, destination_snapshot.get("thread_id")),
+        ):
+            if supplied and str(supplied) != str(stored or ""):
+                raise StoreError(
+                    "inbound identity conflicts with immutable envelope "
+                    f"({label})"
+                )
+        if message.transport_metadata and cls._json_snapshot(
+            dict(message.transport_metadata)
+        ) != cls._json_snapshot(
+            destination_snapshot.get("transport_metadata") or {}
+        ):
+            raise StoreError(
+                "inbound identity conflicts with immutable envelope "
+                "(transport_metadata)"
             )
 
     @classmethod
@@ -10391,6 +12903,25 @@ class SQLiteStore:
                     else fallback.source_sequence
                 ),
                 context_token=target.context_token or fallback.context_token,
+                conversation_subject_id=(
+                    target.conversation_subject_id
+                    or fallback.conversation_subject_id
+                ),
+                conversation_subject_scope=(
+                    target.conversation_subject_scope
+                    or fallback.conversation_subject_scope
+                ),
+                destination_kind=(
+                    target.destination_kind or fallback.destination_kind
+                ),
+                destination_id=target.destination_id or fallback.destination_id,
+                thread_id=target.thread_id or fallback.thread_id,
+                root_message_id=target.root_message_id or fallback.root_message_id,
+                transport_metadata=(
+                    dict(target.transport_metadata)
+                    if target.transport_metadata
+                    else dict(fallback.transport_metadata)
+                ),
             )
         return target
 
@@ -10419,7 +12950,23 @@ class SQLiteStore:
             # not an attempted override of a non-default inbound session.
             if field == "session_id" and supplied == "default" and not target_has_scope:
                 continue
-            if supplied and owner and str(supplied) != str(owner):
+            subject_owns_route = (
+                field == "external_user_id"
+                and bool(
+                    target.conversation_subject_scope
+                    or target.conversation_subject_id
+                )
+                and str(
+                    target.conversation_subject_scope
+                    or target.conversation_subject_id
+                ) == str(owner)
+            )
+            if (
+                supplied
+                and owner
+                and str(supplied) != str(owner)
+                and not subject_owns_route
+            ):
                 raise StoreError(f"reply target conflicts with inbound ownership ({field})")
 
     @staticmethod
@@ -10448,6 +12995,9 @@ class SQLiteStore:
                     "mode_id", "profile_version", "policy_version", "model", "reasoning_effort",
                     "reply_target", "inputs", "request_id", "inbound_message_id", "dedupe_key",
                     "parent_task_id", "child_depth", "metadata",
+                    "actor_external_user_id", "principal_id",
+                    "principal_account_id", "conversation_subject_id",
+                    "identity_snapshot",
                 ):
                     if hasattr(value, name):
                         data[name] = getattr(value, name)
@@ -10476,6 +13026,11 @@ class SQLiteStore:
         data.setdefault("parent_task_id", None)
         data.setdefault("child_depth", 0)
         data.setdefault("metadata", {})
+        data.setdefault("actor_external_user_id", "")
+        data.setdefault("principal_id", None)
+        data.setdefault("principal_account_id", None)
+        data.setdefault("conversation_subject_id", None)
+        data.setdefault("identity_snapshot", {})
         # Channel/runtime adapters may provide their own immutable
         # ReplyTarget dataclass.  Normalize by attributes/as_dict before the
         # domain model conversion instead of silently dropping the snapshot.
@@ -10518,10 +13073,18 @@ class SQLiteStore:
         *,
         agent_id: str,
         agent_incarnation: int,
+        account_channel: str,
+        account_bot_id: str,
         now: str,
         max_agent_queue: int,
         max_global_queue: int,
+        max_account_queue: int,
+        max_account_agent_queue: int,
     ) -> int:
+        channel_value = str(account_channel or "").strip()
+        bot_value = str(account_bot_id or "").strip()
+        if not channel_value or not bot_value:
+            raise StoreError("invocation account identity is required")
         conn.execute(
             """INSERT INTO agent_admission_counters
                    (agent_id,agent_incarnation,unfinished_count,
@@ -10534,6 +13097,25 @@ class SQLiteStore:
                    (singleton,unfinished_count,updated_at) VALUES (1,0,?)
                ON CONFLICT(singleton) DO NOTHING""",
             (now,),
+        )
+        conn.execute(
+            """INSERT INTO account_admission_counters
+                   (channel,bot_id,unfinished_count,updated_at)
+               VALUES (?,?,0,?) ON CONFLICT DO NOTHING""",
+            (channel_value, bot_value, now),
+        )
+        conn.execute(
+            """INSERT INTO agent_account_admission_counters
+                   (agent_id,agent_incarnation,channel,bot_id,
+                    unfinished_count,last_served_ordinal,updated_at)
+               VALUES (?,?,?,?,0,0,?) ON CONFLICT DO NOTHING""",
+            (
+                agent_id,
+                int(agent_incarnation),
+                channel_value,
+                bot_value,
+                now,
+            ),
         )
         row = conn.execute(
             "SELECT unfinished_count,next_ready_sequence "
@@ -10549,10 +13131,35 @@ class SQLiteStore:
         ).fetchone()
         if global_row is None:
             raise StoreError("global Agent admission counter is unavailable")
+        account_row = conn.execute(
+            "SELECT unfinished_count FROM account_admission_counters "
+            "WHERE channel=? AND bot_id=?",
+            (channel_value, bot_value),
+        ).fetchone()
+        stream_row = conn.execute(
+            "SELECT unfinished_count FROM agent_account_admission_counters "
+            "WHERE agent_id=? AND agent_incarnation=? AND channel=? AND bot_id=?",
+            (
+                agent_id,
+                int(agent_incarnation),
+                channel_value,
+                bot_value,
+            ),
+        ).fetchone()
+        if account_row is None or stream_row is None:
+            raise StoreError("account admission counter is unavailable")
         if int(global_row["unfinished_count"]) >= int(max_global_queue):
             raise QueueFullError("global", int(max_global_queue))
+        if int(account_row["unfinished_count"]) >= int(max_account_queue):
+            raise QueueFullError("account", int(max_account_queue))
         if int(row["unfinished_count"]) >= int(max_agent_queue):
             raise QueueFullError("agent", int(max_agent_queue))
+        if int(stream_row["unfinished_count"]) >= int(
+            max_account_agent_queue
+        ):
+            raise QueueFullError(
+                "account_agent", int(max_account_agent_queue)
+            )
         sequence = int(row["next_ready_sequence"])
         conn.execute(
             """UPDATE agent_admission_counters
@@ -10571,6 +13178,30 @@ class SQLiteStore:
             # durable counter was corrupted or a future caller bypassed the
             # admission check.  Roll the whole acceptance transaction back.
             raise QueueFullError("global", int(max_global_queue))
+        if conn.execute(
+            """UPDATE account_admission_counters
+               SET unfinished_count=unfinished_count+1,updated_at=?
+               WHERE channel=? AND bot_id=? AND unfinished_count < ?""",
+            (now, channel_value, bot_value, int(max_account_queue)),
+        ).rowcount != 1:
+            raise QueueFullError("account", int(max_account_queue))
+        if conn.execute(
+            """UPDATE agent_account_admission_counters
+               SET unfinished_count=unfinished_count+1,updated_at=?
+               WHERE agent_id=? AND agent_incarnation=?
+                 AND channel=? AND bot_id=? AND unfinished_count < ?""",
+            (
+                now,
+                agent_id,
+                int(agent_incarnation),
+                channel_value,
+                bot_value,
+                int(max_account_agent_queue),
+            ),
+        ).rowcount != 1:
+            raise QueueFullError(
+                "account_agent", int(max_account_agent_queue)
+            )
         return sequence
 
     @classmethod
@@ -10584,7 +13215,8 @@ class SQLiteStore:
         last_error: str | None = None,
     ) -> bool:
         row = conn.execute(
-            "SELECT agent_id,agent_incarnation,admission_released_at "
+            "SELECT agent_id,agent_incarnation,account_channel,account_bot_id,"
+            "admission_released_at "
             "FROM agent_invocations WHERE invocation_id=?",
             (invocation_id,),
         ).fetchone()
@@ -10615,6 +13247,27 @@ class SQLiteStore:
             (now,),
         ).rowcount != 1:
             raise StoreError("global Agent admission counter underflow")
+        if conn.execute(
+            """UPDATE account_admission_counters
+               SET unfinished_count=unfinished_count-1,updated_at=?
+               WHERE channel=? AND bot_id=? AND unfinished_count>0""",
+            (now, row["account_channel"], row["account_bot_id"]),
+        ).rowcount != 1:
+            raise StoreError("account admission counter underflow")
+        if conn.execute(
+            """UPDATE agent_account_admission_counters
+               SET unfinished_count=unfinished_count-1,updated_at=?
+               WHERE agent_id=? AND agent_incarnation=?
+                 AND channel=? AND bot_id=? AND unfinished_count>0""",
+            (
+                now,
+                row["agent_id"],
+                row["agent_incarnation"],
+                row["account_channel"],
+                row["account_bot_id"],
+            ),
+        ).rowcount != 1:
+            raise StoreError("Agent-account admission counter underflow")
         return True
 
     @classmethod
@@ -10679,6 +13332,8 @@ class SQLiteStore:
         now: str,
         max_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
         max_global_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+        max_account_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+        max_account_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
     ) -> str:
         task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         if task is None:
@@ -10703,9 +13358,13 @@ class SQLiteStore:
             conn,
             agent_id=str(task["agent_id"]),
             agent_incarnation=int(task["agent_incarnation"]),
+            account_channel=str(task["channel"] or "internal"),
+            account_bot_id=str(task["bot_id"] or "runtime"),
             now=now,
             max_agent_queue=max_agent_queue,
             max_global_queue=max_global_queue,
+            max_account_queue=max_account_queue,
+            max_account_agent_queue=max_account_agent_queue,
         )
         conn.execute(
             """INSERT INTO task_executions
@@ -10722,12 +13381,14 @@ class SQLiteStore:
             """INSERT INTO agent_invocations
                    (invocation_id,work_kind,work_id,agent_id,agent_incarnation,
                     state,dispatch_backend,ready_sequence,task_id,execution_id,
-                    next_attempt_at,created_at,updated_at)
-               VALUES (?,'task',?,?,?,'queued','compatibility',?,?,?,?,?,?)""",
+                    next_attempt_at,created_at,updated_at,
+                    account_channel,account_bot_id)
+               VALUES (?,'task',?,?,?,'queued','compatibility',?,?,?,?,?,?,?,?)""",
             (
                 execution_id, execution_id, task["agent_id"],
                 task["agent_incarnation"], sequence, task_id, execution_id,
                 task["next_attempt_at"], now, now,
+                task["channel"] or "internal", task["bot_id"] or "runtime",
             ),
         )
         conn.execute(
@@ -10745,6 +13406,8 @@ class SQLiteStore:
         now: str,
         max_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
         max_global_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+        max_account_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+        max_account_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
     ) -> str:
         row = conn.execute(
             "SELECT * FROM agent_mailbox WHERE mailbox_id=?", (mailbox_id,)
@@ -10753,25 +13416,45 @@ class SQLiteStore:
             raise StoreError("mailbox disappeared before invocation creation")
         if row["current_invocation_id"]:
             return str(row["current_invocation_id"])
+        account = conn.execute(
+            "SELECT channel,bot_id FROM tasks WHERE task_id=?",
+            (row["task_id"],),
+        ).fetchone()
+        account_channel = (
+            str(account["channel"])
+            if account is not None and str(account["channel"] or "").strip()
+            else "internal"
+        )
+        account_bot_id = (
+            str(account["bot_id"])
+            if account is not None and str(account["bot_id"] or "").strip()
+            else str(row["source_agent_id"] or "runtime")
+        )
         invocation_id = _uuid()
         sequence = cls._reserve_invocation_admission_tx(
             conn,
             agent_id=str(row["destination_agent_id"]),
             agent_incarnation=int(row["destination_agent_incarnation"]),
+            account_channel=account_channel,
+            account_bot_id=account_bot_id,
             now=now,
             max_agent_queue=max_agent_queue,
             max_global_queue=max_global_queue,
+            max_account_queue=max_account_queue,
+            max_account_agent_queue=max_account_agent_queue,
         )
         conn.execute(
             """INSERT INTO agent_invocations
                    (invocation_id,work_kind,work_id,agent_id,agent_incarnation,
                     state,dispatch_backend,ready_sequence,mailbox_id,
-                    next_attempt_at,created_at,updated_at,expires_at)
-               VALUES (?,'mailbox',?,?,?,'queued','compatibility',?,?,?,?,?,?)""",
+                    next_attempt_at,created_at,updated_at,expires_at,
+                    account_channel,account_bot_id)
+               VALUES (?,'mailbox',?,?,?,'queued','compatibility',?,?,?,?,?,?,?,?)""",
             (
                 invocation_id, row["message_id"], row["destination_agent_id"],
                 row["destination_agent_incarnation"], sequence, mailbox_id,
                 row["next_attempt_at"], now, now, row["expires_at"],
+                account_channel, account_bot_id,
             ),
         )
         conn.execute(
@@ -10784,6 +13467,600 @@ class SQLiteStore:
     def _fetch_task_tx(cls, conn: sqlite3.Connection, task_id: str) -> TaskRecord | None:
         row = conn.execute(f"{cls._task_select_sql()} WHERE t.task_id = ?", (task_id,)).fetchone()
         return cls._task_from_row(row)
+
+    @staticmethod
+    def _steering_principal_compatible(
+        active: sqlite3.Row,
+        snapshot: AgentTask,
+    ) -> bool:
+        """Keep steering inside one authenticated actor/principal boundary."""
+
+        active_principal = str(active["principal_id"] or "")
+        incoming_principal = str(snapshot.principal_id or "")
+        if active_principal or incoming_principal:
+            return bool(
+                active_principal
+                and incoming_principal
+                and active_principal == incoming_principal
+            )
+        return bool(
+            str(active["actor_external_user_id"] or "")
+            == str(snapshot.actor_external_user_id or "")
+        )
+
+    @classmethod
+    def _steering_context_compatible(
+        cls,
+        active: sqlite3.Row,
+        snapshot: AgentTask,
+        *,
+        conversation_id: str,
+        thread_id: str | None,
+        agent_incarnation: int,
+    ) -> bool:
+        """Compare every execution-authority value relevant to live input."""
+
+        scalar_matches = (
+            str(active["agent_id"]) == str(snapshot.agent_id),
+            int(active["agent_incarnation"]) == int(agent_incarnation),
+            str(active["conversation_id"]) == str(conversation_id),
+            str(active["thread_id"] or "") == str(thread_id or ""),
+            str(active["mode_id"]) == str(snapshot.mode_id),
+            int(active["profile_version"]) == int(snapshot.profile_version),
+            int(active["policy_version"]) == int(snapshot.policy_version),
+            str(active["model"] or "") == str(snapshot.model or ""),
+            str(active["reasoning_effort"] or "")
+            == str(snapshot.reasoning_effort or ""),
+        )
+        if not all(scalar_matches) or not cls._steering_principal_compatible(
+            active, snapshot
+        ):
+            return False
+        active_metadata = json_loads(active["metadata_json"], {}) or {}
+        incoming_metadata = _snapshot_value(snapshot.metadata, text_key="value")
+        if not isinstance(active_metadata, Mapping) or not isinstance(
+            incoming_metadata, Mapping
+        ):
+            return False
+        # ``front_agent_id_at_acceptance`` is route provenance, not execution
+        # authority. Skills are per-input data accepted by the runner's
+        # steering contract, so their descriptors may differ as well. Policy,
+        # role, workspace, and every other context field remain exact-match
+        # requirements.
+        ignored = {
+            "front_agent_id_at_acceptance",
+            "skill",
+            "skill_id",
+            "skill_version",
+            "skill_hash",
+        }
+        active_context = {
+            key: value
+            for key, value in active_metadata.items()
+            if key not in ignored
+        }
+        incoming_context = {
+            key: value
+            for key, value in incoming_metadata.items()
+            if key not in ignored
+        }
+        return json_dumps(active_context) == json_dumps(incoming_context)
+
+    @staticmethod
+    def _task_snapshot_for_steering(
+        snapshot: AgentTask,
+        *,
+        inbound: InboundMessage,
+        route_external_user_id: str,
+        conversation_id: str,
+        thread_id: str | None,
+        agent_incarnation: int,
+        reply_target: ReplyTarget,
+    ) -> dict[str, Any]:
+        """Freeze the normal queued-task projection used by race fallback."""
+
+        return {
+            "inbound_message_id": inbound.message_id,
+            "dedupe_key": snapshot.dedupe_key
+            or f"inbound:{inbound.message_id}",
+            "channel": inbound.channel,
+            "bot_id": inbound.bot_id,
+            "external_user_id": str(route_external_user_id),
+            "session_id": inbound.session_id or "default",
+            "agent_id": snapshot.agent_id,
+            "agent_incarnation": int(agent_incarnation),
+            "conversation_id": conversation_id,
+            "thread_id": thread_id,
+            "mode_id": snapshot.mode_id,
+            "profile_version": int(snapshot.profile_version),
+            "policy_version": int(snapshot.policy_version),
+            "model": snapshot.model,
+            "reasoning_effort": snapshot.reasoning_effort,
+            "reply_target": reply_target.to_dict(),
+            "inputs": _snapshot_value(snapshot.inputs),
+            "metadata": _snapshot_value(snapshot.metadata, text_key="value"),
+            "actor_external_user_id": snapshot.actor_external_user_id,
+            "principal_id": snapshot.principal_id,
+            "principal_account_id": snapshot.principal_account_id,
+            "conversation_subject_id": snapshot.conversation_subject_id,
+            "identity_snapshot": _snapshot_value(snapshot.identity_snapshot),
+            "parent_task_id": snapshot.parent_task_id,
+            "child_depth": int(snapshot.child_depth),
+            "request_id": snapshot.request_id,
+        }
+
+    @classmethod
+    def _insert_steering_fallback_task_tx(
+        cls,
+        conn: sqlite3.Connection,
+        steering: sqlite3.Row,
+        *,
+        now: str,
+        max_agent_queue: int,
+        max_global_queue: int,
+        max_account_queue: int,
+        max_account_agent_queue: int,
+    ) -> tuple[TaskRecord, str]:
+        """Materialize one frozen steering snapshot as an ordinary task."""
+
+        values = json_loads(steering["task_snapshot_json"], None)
+        if not isinstance(values, Mapping):
+            raise StoreError("task steering fallback snapshot is invalid")
+        values = dict(values)
+        fallback_task_id = str(steering["fallback_task_id"] or "")
+        inbound_message_id = str(steering["inbound_message_id"] or "")
+        if not fallback_task_id or not inbound_message_id:
+            raise StoreError("task steering fallback identity is incomplete")
+        existing = cls._fetch_task_tx(conn, fallback_task_id)
+        if existing is not None:
+            if str(existing.inbound_message_id or "") != inbound_message_id:
+                raise StoreError("task steering fallback identity conflicts")
+            if not existing.execution_id:
+                raise StoreError("task steering fallback has no execution")
+            return existing, str(existing.execution_id)
+        foreign = conn.execute(
+            "SELECT task_id FROM tasks WHERE inbound_message_id=?",
+            (inbound_message_id,),
+        ).fetchone()
+        if foreign is not None:
+            raise StoreError("task steering inbound already owns another task")
+        inbound_row = conn.execute(
+            "SELECT * FROM inbound_messages WHERE message_id=?",
+            (inbound_message_id,),
+        ).fetchone()
+        if inbound_row is None:
+            raise StoreError("task steering inbound message is unavailable")
+
+        required_text = (
+            "channel",
+            "bot_id",
+            "external_user_id",
+            "session_id",
+            "agent_id",
+            "conversation_id",
+            "mode_id",
+        )
+        if any(not str(values.get(name) or "").strip() for name in required_text):
+            raise StoreError("task steering fallback snapshot is incomplete")
+        if (
+            str(values.get("agent_id")) != str(steering["agent_id"])
+            or int(values.get("agent_incarnation") or 0)
+            != int(steering["agent_incarnation"])
+            or str(values.get("conversation_id"))
+            != str(steering["conversation_id"])
+            or str(values.get("inbound_message_id")) != inbound_message_id
+        ):
+            raise StoreError("task steering fallback ownership conflicts")
+        target_owner = conn.execute(
+            """SELECT thread_id,conversation_id,mode_id,profile_version,
+                      policy_version,agent_id,agent_incarnation
+                 FROM tasks WHERE task_id=?""",
+            (str(steering["target_task_id"]),),
+        ).fetchone()
+        if target_owner is None:
+            raise StoreError("task steering fallback target is unavailable")
+        if (
+            str(target_owner["conversation_id"]) != str(values["conversation_id"])
+            or str(target_owner["mode_id"]) != str(values["mode_id"])
+            or int(target_owner["profile_version"])
+            != int(values.get("profile_version") or 1)
+            or int(target_owner["policy_version"])
+            != int(values.get("policy_version") or 1)
+            or str(target_owner["agent_id"]) != str(values["agent_id"])
+            or int(target_owner["agent_incarnation"])
+            != int(values["agent_incarnation"])
+        ):
+            raise StoreError("task steering fallback context changed")
+        frozen_thread = str(values.get("thread_id") or "")
+        target_thread = str(target_owner["thread_id"] or "")
+        if frozen_thread and target_thread and frozen_thread != target_thread:
+            raise StoreError("task steering fallback thread binding conflicts")
+        # The provider thread can be learned only after the active turn starts.
+        # Inheriting that one compatible binding preserves the running turn's
+        # context without accepting any later policy/role/workspace mutation.
+        values["thread_id"] = target_thread or frozen_thread or None
+        reply_target = cls._coerce_reply_target(values.get("reply_target"))
+        cls._validate_reply_target_scope(
+            reply_target,
+            channel=str(inbound_row["channel"] or ""),
+            bot_id=str(inbound_row["bot_id"] or ""),
+            external_user_id=str(inbound_row["external_user_id"] or ""),
+            session_id=str(inbound_row["session_id"] or "default"),
+        )
+        inputs = values.get("inputs", {})
+        dedupe_key = str(
+            values.get("dedupe_key") or f"inbound:{inbound_message_id}"
+        )
+        conn.execute(
+            """INSERT INTO tasks
+               (task_id, dedupe_key, inbound_message_id, channel, bot_id,
+                external_user_id, session_id, agent_id, agent_incarnation,
+                conversation_id, thread_id, mode_id, profile_version,
+                policy_version, model, reasoning_effort, reply_target_json,
+                inputs_json, metadata_json, actor_external_user_id,
+                principal_id, principal_account_id, conversation_subject_id,
+                identity_snapshot_json, state, attempts, next_attempt_at,
+                parent_task_id, child_depth, request_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, ?, ?, ?, ?, ?)""",
+            (
+                fallback_task_id,
+                dedupe_key,
+                inbound_message_id,
+                str(values["channel"]),
+                str(values["bot_id"]),
+                str(values["external_user_id"]),
+                str(values["session_id"] or "default"),
+                str(values["agent_id"]),
+                int(values["agent_incarnation"]),
+                str(values["conversation_id"]),
+                values.get("thread_id"),
+                str(values["mode_id"]),
+                int(values.get("profile_version") or 1),
+                int(values.get("policy_version") or 1),
+                str(values.get("model") or ""),
+                str(values.get("reasoning_effort") or ""),
+                json_dumps(reply_target.to_dict()),
+                json_dumps(_snapshot_value(inputs)),
+                json_dumps(
+                    _snapshot_value(values.get("metadata", {}), text_key="value")
+                ),
+                str(values.get("actor_external_user_id") or ""),
+                values.get("principal_id"),
+                values.get("principal_account_id"),
+                values.get("conversation_subject_id"),
+                json_dumps(_snapshot_value(values.get("identity_snapshot", {}))),
+                values.get("parent_task_id"),
+                int(values.get("child_depth") or 0),
+                values.get("request_id"),
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            "UPDATE inbound_messages SET task_id=?,status='task_queued',stored_at=? "
+            "WHERE message_id=?",
+            (fallback_task_id, now, inbound_message_id),
+        )
+        cls._validate_task_input_attachment_access_tx(
+            conn,
+            task_id=fallback_task_id,
+            inbound_message_id=inbound_message_id,
+            inputs=inputs,
+            agent_id=str(values["agent_id"]),
+            channel=str(values["channel"]),
+            bot_id=str(values["bot_id"]),
+            external_user_id=str(values["external_user_id"]),
+            session_id=str(values["session_id"] or "default"),
+        )
+        cls._retain_task_input_attachments_tx(
+            conn,
+            task_id=fallback_task_id,
+            inputs=inputs,
+            created_at=now,
+        )
+        execution_id = cls._create_queued_task_invocation_tx(
+            conn,
+            task_id=fallback_task_id,
+            now=now,
+            max_agent_queue=max_agent_queue,
+            max_global_queue=max_global_queue,
+            max_account_queue=max_account_queue,
+            max_account_agent_queue=max_account_agent_queue,
+        )
+        created = cls._fetch_task_tx(conn, fallback_task_id)
+        if created is None:
+            raise StoreError("task steering fallback task disappeared")
+        return created, execution_id
+
+    @classmethod
+    def _promote_task_steering_row_tx(
+        cls,
+        conn: sqlite3.Connection,
+        steering: sqlite3.Row,
+        *,
+        now: str,
+        max_agent_queue: int,
+        max_global_queue: int,
+        max_account_queue: int,
+        max_account_agent_queue: int,
+    ) -> tuple[TaskSteeringRecord, TaskRecord]:
+        """Promote one head row and attach its ordered tail to the fallback."""
+
+        steering_id = str(steering["steering_id"])
+        original_task_id = str(steering["target_task_id"])
+        original_execution_id = str(steering["target_execution_id"])
+        sequence = int(steering["sequence"])
+        fallback, fallback_execution_id = cls._insert_steering_fallback_task_tx(
+            conn,
+            steering,
+            now=now,
+            max_agent_queue=max_agent_queue,
+            max_global_queue=max_global_queue,
+            max_account_queue=max_account_queue,
+            max_account_agent_queue=max_account_agent_queue,
+        )
+        changed = conn.execute(
+            """UPDATE task_steering
+                  SET state='promoted',promoted_task_id=?,promoted_at=?,
+                      updated_at=?,claimed_by=NULL,claim_token=NULL,
+                      lease_expires_at=NULL
+                WHERE steering_id=? AND state='pending'""",
+            (fallback.task_id, now, now, steering_id),
+        ).rowcount
+        if changed != 1:
+            raise InvalidTransition("task steering promotion lost its state fence")
+
+        # Later pending ordinals become input to the one fallback turn instead
+        # of each consuming another queue/admission slot.  Applied, delivering,
+        # and uncertain rows retain their original immutable execution fence.
+        tail_rows = conn.execute(
+            """SELECT steering_id,inbound_message_id
+                 FROM task_steering
+                WHERE target_task_id=? AND target_execution_id=?
+                  AND state='pending' AND sequence>?
+                ORDER BY sequence,steering_id""",
+            (original_task_id, original_execution_id, sequence),
+        ).fetchall()
+        if tail_rows:
+            tail_ids = [str(row["steering_id"]) for row in tail_rows]
+            placeholders = ",".join("?" for _ in tail_ids)
+            conn.execute(
+                f"""UPDATE task_steering
+                       SET target_task_id=?,target_execution_id=?,updated_at=?
+                     WHERE steering_id IN ({placeholders}) AND state='pending'""",
+                (
+                    fallback.task_id,
+                    fallback_execution_id,
+                    now,
+                    *tail_ids,
+                ),
+            )
+            inbound_ids = [str(row["inbound_message_id"]) for row in tail_rows]
+            inbound_placeholders = ",".join("?" for _ in inbound_ids)
+            conn.execute(
+                f"""UPDATE inbound_messages
+                       SET task_id=?,status='task_queued',stored_at=?
+                     WHERE message_id IN ({inbound_placeholders})""",
+                (fallback.task_id, now, *inbound_ids),
+            )
+        promoted = cls._task_steering_from_row(
+            conn.execute(
+                "SELECT * FROM task_steering WHERE steering_id=?",
+                (steering_id,),
+            ).fetchone()
+        )
+        if promoted is None:
+            raise StoreError("promoted task steering disappeared")
+        refreshed_fallback = cls._fetch_task_tx(conn, fallback.task_id)
+        if refreshed_fallback is None:
+            raise StoreError("promoted fallback task disappeared")
+        return promoted, refreshed_fallback
+
+    @classmethod
+    def _promote_pending_steering_for_execution_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        task_id: str,
+        execution_id: str,
+        now: str,
+        max_agent_queue: int,
+        max_global_queue: int,
+        max_account_queue: int,
+        max_account_agent_queue: int,
+        suppress_queue_full: bool = True,
+    ) -> tuple[TaskSteeringRecord, TaskRecord] | None:
+        """Promote only an unambiguous pending head after an execution ends."""
+
+        head = conn.execute(
+            """SELECT * FROM task_steering
+                WHERE target_task_id=? AND target_execution_id=?
+                  AND state IN ('pending','delivering')
+                ORDER BY sequence,steering_id LIMIT 1""",
+            (str(task_id), str(execution_id)),
+        ).fetchone()
+        if head is None or str(head["state"]) != TaskSteeringState.PENDING.value:
+            return None
+        conn.execute("SAVEPOINT promote_task_steering")
+        try:
+            result = cls._promote_task_steering_row_tx(
+                conn,
+                head,
+                now=now,
+                max_agent_queue=max_agent_queue,
+                max_global_queue=max_global_queue,
+                max_account_queue=max_account_queue,
+                max_account_agent_queue=max_account_agent_queue,
+            )
+        except QueueFullError:
+            conn.execute("ROLLBACK TO SAVEPOINT promote_task_steering")
+            conn.execute("RELEASE SAVEPOINT promote_task_steering")
+            if not suppress_queue_full:
+                raise
+            return None
+        except BaseException:
+            conn.execute("ROLLBACK TO SAVEPOINT promote_task_steering")
+            conn.execute("RELEASE SAVEPOINT promote_task_steering")
+            raise
+        conn.execute("RELEASE SAVEPOINT promote_task_steering")
+        return result
+
+    @classmethod
+    def _promote_terminal_steering_predecessors_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str,
+        agent_incarnation: int,
+        conversation_id: str,
+        now: str,
+        max_agent_queue: int,
+        max_global_queue: int,
+        max_account_queue: int,
+        max_account_agent_queue: int,
+    ) -> int:
+        """Publish older terminal-turn input before admitting newer work.
+
+        Completion normally promotes a pending steer immediately.  If that
+        promotion temporarily hit an admission limit, the durable row remains
+        pending.  A later inbound in the same conversation must not acquire an
+        earlier ready sequence merely because it arrived before reconciliation.
+        Running this targeted repair inside the inbound transaction makes the
+        older fallback win, or propagates the exact queue-limit failure so both
+        the repair and newer inbound roll back together.
+        """
+
+        predecessors = conn.execute(
+            """SELECT steering.target_task_id,steering.target_execution_id,
+                      MIN(steering.created_at) AS first_created_at
+                 FROM task_steering AS steering
+                 JOIN tasks AS task
+                   ON task.task_id=steering.target_task_id
+                 JOIN task_executions AS execution
+                   ON execution.execution_id=steering.target_execution_id
+                  AND execution.task_id=steering.target_task_id
+                WHERE steering.agent_id=?
+                  AND steering.agent_incarnation=?
+                  AND steering.conversation_id=?
+                  AND steering.state='pending'
+                  AND task.state NOT IN
+                      ('queued','dispatching','running','cancel_requested')
+                  AND execution.state NOT IN
+                      ('queued','dispatching','running','cancel_requested')
+                  AND execution.finished_at IS NOT NULL
+                GROUP BY steering.target_task_id,
+                         steering.target_execution_id
+                ORDER BY MIN(steering.created_at),
+                         steering.target_execution_id""",
+            (str(agent_id), int(agent_incarnation), str(conversation_id)),
+        ).fetchall()
+        promoted = 0
+        for predecessor in predecessors:
+            result = cls._promote_pending_steering_for_execution_tx(
+                conn,
+                task_id=str(predecessor["target_task_id"]),
+                execution_id=str(predecessor["target_execution_id"]),
+                now=now,
+                max_agent_queue=max_agent_queue,
+                max_global_queue=max_global_queue,
+                max_account_queue=max_account_queue,
+                max_account_agent_queue=max_account_agent_queue,
+                suppress_queue_full=False,
+            )
+            if result is None:
+                # A lower delivering ordinal is still ambiguous.  Refuse to
+                # let newer work overtake it; lease recovery will eventually
+                # fence that delivery and make the pending tail promotable.
+                raise InvalidTransition(
+                    "terminal task steering predecessor is still delivering"
+                )
+            promoted += 1
+        return promoted
+
+    @classmethod
+    def _recover_task_steering_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        now: str,
+        process_boundary: bool,
+        max_agent_queue: int,
+        max_global_queue: int,
+        max_account_queue: int,
+        max_account_agent_queue: int,
+        limit: int = 100,
+    ) -> int:
+        """Fence abandoned claims and promote terminal-target pending heads."""
+
+        # Migration tests and interrupted-development recovery may
+        # deliberately stop before schema v38 is installed. There is no
+        # steering state to recover at that older boundary.
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='task_steering'"
+        ).fetchone() is None:
+            return 0
+
+        if process_boundary:
+            conn.execute(
+                """UPDATE task_steering
+                      SET state='delivery_unknown',claimed_by=NULL,
+                          claim_token=NULL,lease_expires_at=NULL,updated_at=?
+                    WHERE state='delivering'""",
+                (now,),
+            )
+        else:
+            conn.execute(
+                """UPDATE task_steering
+                      SET state='delivery_unknown',claimed_by=NULL,
+                          claim_token=NULL,lease_expires_at=NULL,updated_at=?
+                    WHERE state='delivering' AND lease_expires_at<=?""",
+                (now, now),
+            )
+        candidates = conn.execute(
+            """SELECT pending.target_task_id,pending.target_execution_id,
+                      MIN(pending.sequence) AS first_pending_sequence
+                 FROM task_steering AS pending
+                 JOIN tasks AS task
+                   ON task.task_id=pending.target_task_id
+                 JOIN task_executions AS execution
+                   ON execution.execution_id=pending.target_execution_id
+                  AND execution.task_id=pending.target_task_id
+                WHERE pending.state='pending'
+                  AND task.state NOT IN
+                      ('queued','dispatching','running','cancel_requested')
+                  AND execution.state NOT IN
+                      ('queued','dispatching','running','cancel_requested')
+                  AND execution.finished_at IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_steering AS delivering
+                       WHERE delivering.target_task_id=pending.target_task_id
+                         AND delivering.target_execution_id=
+                             pending.target_execution_id
+                         AND delivering.state='delivering'
+                         AND delivering.sequence<pending.sequence
+                  )
+                GROUP BY pending.target_task_id,pending.target_execution_id
+                ORDER BY MIN(pending.created_at),pending.target_execution_id
+                LIMIT ?""",
+            (max(0, int(limit)),),
+        ).fetchall()
+        promoted_count = 0
+        for candidate in candidates:
+            result = cls._promote_pending_steering_for_execution_tx(
+                conn,
+                task_id=str(candidate["target_task_id"]),
+                execution_id=str(candidate["target_execution_id"]),
+                now=now,
+                max_agent_queue=max_agent_queue,
+                max_global_queue=max_global_queue,
+                max_account_queue=max_account_queue,
+                max_account_agent_queue=max_account_agent_queue,
+            )
+            if result is not None:
+                promoted_count += 1
+        return promoted_count
 
     @classmethod
     def _fetch_task_by_dedupe_tx(cls, conn: sqlite3.Connection, dedupe_key: str | None) -> TaskRecord | None:
@@ -10823,23 +14100,82 @@ class SQLiteStore:
         inbound = None
         if inbound_id:
             inbound = conn.execute(
-                "SELECT external_message_id, source_sequence, context_token, text, payload_json, task_id "
-                "FROM inbound_messages WHERE message_id=?",
+                "SELECT * FROM inbound_messages WHERE message_id=?",
                 (inbound_id,),
             ).fetchone()
 
-        original_target = ReplyTarget(
+        if inbound is not None:
+            persisted_inbound = cls._inbound_from_row(inbound)
+            original_target = persisted_inbound.target()
+            identity_snapshot = dict(persisted_inbound.identity_snapshot or {})
+            principal_id = persisted_inbound.principal_id
+            principal_account_id = persisted_inbound.principal_account_id
+            conversation_subject_id = persisted_inbound.conversation_subject_id
+            actor_external_user_id = persisted_inbound.external_user_id
+        else:
+            # Standalone compatibility candidates predate durable inbound
+            # ownership.  Give their eventual task the same direct bot-local
+            # subject a normal ingress would receive, while leaving canonical
+            # principal identity explicitly unmapped.
+            direct_subject = direct_conversation_subject(
+                route["channel"], route["bot_id"], route["external_user_id"]
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO conversation_subjects
+                       (conversation_subject_id, channel, bot_id, subject_kind,
+                        scope_key, external_chat_id, external_thread_id,
+                        parent_subject_id, provenance_json, created_at)
+                   VALUES (?, ?, ?, 'direct', ?, '', '', NULL, ?, ?)""",
+                (
+                    direct_subject.conversation_subject_id,
+                    direct_subject.channel,
+                    direct_subject.bot_id,
+                    direct_subject.scope_key,
+                    json_dumps({"source": "confirmation_compatibility"}),
+                    str(candidate["created_at"] or _utc_text()),
+                ),
+            )
+            actor_external_user_id = route["external_user_id"]
+            principal_id = None
+            principal_account_id = None
+            conversation_subject_id = direct_subject.conversation_subject_id
+            identity_snapshot = {
+                "actor": {
+                    "channel": route["channel"],
+                    "bot_id": route["bot_id"],
+                    "external_user_id": actor_external_user_id,
+                },
+                "principal": {
+                    "principal_id": None,
+                    "principal_account_id": None,
+                    "mapping_revision": None,
+                    "source": "unmapped",
+                },
+                "conversation_subject": {
+                    "conversation_subject_id": conversation_subject_id,
+                    "kind": "direct",
+                    "scope_key": direct_subject.scope_key,
+                    "parent_subject_id": None,
+                },
+                "destination": {
+                    "kind": "",
+                    "id": "",
+                    "thread_id": "",
+                    "root_message_id": "",
+                    "transport_metadata": {},
+                },
+            }
+            original_target = ReplyTarget(**route)
+
+        subject_snapshot = identity_snapshot.get("conversation_subject", {})
+        if not isinstance(subject_snapshot, Mapping):
+            subject_snapshot = {}
+        conversation_route = {
             **route,
-            source_message_id=(
-                inbound["external_message_id"] if inbound is not None else None
+            "external_user_id": str(
+                subject_snapshot.get("scope_key") or route["external_user_id"]
             ),
-            source_sequence=(
-                inbound["source_sequence"] if inbound is not None else None
-            ),
-            context_token=(
-                inbound["context_token"] if inbound is not None else None
-            ),
-        )
+        }
 
         # Keep only normalized media references.  The inbound payload also
         # contains wire diagnostics and sender metadata which must not become
@@ -10883,6 +14219,7 @@ class SQLiteStore:
         )
         return {
             "route": route,
+            "conversation_route": conversation_route,
             "inbound_id": inbound_id or None,
             "inbound_task_id": (
                 str(inbound["task_id"] or "") if inbound is not None else ""
@@ -10897,6 +14234,11 @@ class SQLiteStore:
                 else None
             ),
             "target": original_target,
+            "actor_external_user_id": actor_external_user_id,
+            "principal_id": principal_id,
+            "principal_account_id": principal_account_id,
+            "conversation_subject_id": conversation_subject_id,
+            "identity_snapshot": cls._json_snapshot(identity_snapshot),
             "agent_id": agent_id,
             "mode_id": mode_id,
             "profile_version": profile_version,
@@ -10904,10 +14246,10 @@ class SQLiteStore:
             "metadata": cls._json_snapshot(dict(metadata)),
             "inputs": cls._json_snapshot(inputs),
             "conversation_id": canonical_conversation_id(
-                route["channel"],
-                route["bot_id"],
-                route["external_user_id"],
-                route["session_id"],
+                conversation_route["channel"],
+                conversation_route["bot_id"],
+                conversation_route["external_user_id"],
+                conversation_route["session_id"],
                 agent_id,
             ),
         }
@@ -10930,8 +14272,11 @@ class SQLiteStore:
         """
 
         route = snapshot["route"]
+        conversation_route = snapshot.get("conversation_route", route)
         raw = conn.execute(
-            "SELECT channel, bot_id, external_user_id, session_id, inbound_message_id "
+            "SELECT channel, bot_id, external_user_id, session_id, inbound_message_id, "
+            "actor_external_user_id, principal_id, principal_account_id, "
+            "conversation_subject_id, identity_snapshot_json "
             "FROM tasks WHERE task_id=?",
             (existing.task_id,),
         ).fetchone()
@@ -10944,8 +14289,12 @@ class SQLiteStore:
                 raise StoreError(
                     f"confirmation task identity conflicts ({field})"
                 )
+            expected_conversation = str(
+                conversation_route.get(field)
+                or ("default" if field == "session_id" else "")
+            )
             stored = str(raw[field] or ("default" if field == "session_id" else ""))
-            if stored != expected:
+            if stored != expected_conversation:
                 raise StoreError(
                     f"confirmation task identity conflicts ({field})"
                 )
@@ -10960,10 +14309,10 @@ class SQLiteStore:
             raise StoreError("confirmation task identity conflicts (policy_version)")
         if not conversation_id_matches(
             existing.conversation_id,
-            route["channel"],
-            route["bot_id"],
-            route["external_user_id"],
-            route["session_id"],
+            conversation_route["channel"],
+            conversation_route["bot_id"],
+            conversation_route["external_user_id"],
+            conversation_route["session_id"],
             snapshot["agent_id"],
         ):
             raise StoreError("confirmation task identity conflicts (conversation_id)")
@@ -10988,6 +14337,23 @@ class SQLiteStore:
             raise StoreError("confirmation task identity conflicts (inputs)")
         if cls._json_snapshot(existing.metadata) != cls._json_snapshot(snapshot["metadata"]):
             raise StoreError("confirmation task identity conflicts (metadata)")
+        for field in (
+            "actor_external_user_id",
+            "principal_id",
+            "principal_account_id",
+            "conversation_subject_id",
+        ):
+            expected_identity = snapshot.get(field)
+            if str(raw[field] or "") != str(expected_identity or ""):
+                raise StoreError(
+                    f"confirmation task identity conflicts ({field})"
+                )
+        if cls._json_snapshot(
+            json_loads(raw["identity_snapshot_json"], {}) or {}
+        ) != cls._json_snapshot(snapshot.get("identity_snapshot", {})):
+            raise StoreError(
+                "confirmation task identity conflicts (identity_snapshot)"
+            )
 
         # A confirmed task is never a child task.  For a multi-candidate
         # inbound, only the first candidate may claim the inbound FK; a replay
@@ -11245,6 +14611,17 @@ class SQLiteStore:
         snapshot = dict(snapshot)
         snapshot.pop("context_token", None)
         snapshot.pop("contextToken", None)
+        if str(snapshot.get("channel") or "").lower() == "wechat":
+            for field in (
+                "conversation_subject_id",
+                "conversation_subject_scope",
+                "destination_kind",
+                "destination_id",
+                "thread_id",
+                "root_message_id",
+                "transport_metadata",
+            ):
+                snapshot.pop(field, None)
         return snapshot
 
     @classmethod
@@ -11636,7 +15013,7 @@ class SQLiteStore:
         )
 
     @classmethod
-    def _ensure_conversation_tx(
+    def _ensure_transport_conversation_tx(
         cls,
         conn: sqlite3.Connection,
         task: AgentTask,
@@ -11646,7 +15023,7 @@ class SQLiteStore:
         external_user_id: str,
         session_id: str,
         now: str,
-    ) -> tuple[str, bool]:
+    ) -> str:
         session_id = session_id or "default"
         conversation_id = task.conversation_id
         if not conversation_id:
@@ -11664,7 +15041,8 @@ class SQLiteStore:
         )
         existing = conn.execute(
             "SELECT channel, bot_id, external_user_id, session_id, agent_id, mode_id, "
-            "profile_version, policy_version FROM conversations WHERE conversation_id=?",
+            "profile_version, policy_version, conversation_subject_id "
+            "FROM conversations WHERE conversation_id=?",
             (conversation_id,),
         ).fetchone()
         if existing is not None:
@@ -11680,6 +15058,19 @@ class SQLiteStore:
                     raise StoreError(
                         f"conversation identity conflicts: {conversation_id} ({column})"
                     )
+            supplied_subject = str(task.conversation_subject_id or "").strip()
+            stored_subject = str(existing["conversation_subject_id"] or "").strip()
+            if supplied_subject and stored_subject and supplied_subject != stored_subject:
+                raise StoreError(
+                    f"conversation identity conflicts: {conversation_id} "
+                    "(conversation_subject_id)"
+                )
+            if supplied_subject and not stored_subject:
+                conn.execute(
+                    "UPDATE conversations SET conversation_subject_id=? "
+                    "WHERE conversation_id=? AND conversation_subject_id IS NULL",
+                    (supplied_subject, conversation_id),
+                )
             return conversation_id
         candidate_ids = conversation_id_candidates(
             channel, bot_id, external_user_id, session_id, task.agent_id
@@ -11710,8 +15101,8 @@ class SQLiteStore:
             """INSERT OR IGNORE INTO conversations
                (conversation_id, channel, bot_id, external_user_id, session_id,
                 agent_id, mode_id, profile_version, policy_version, thread_id,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                created_at, updated_at, conversation_subject_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 conversation_id,
                 channel,
@@ -11725,13 +15116,15 @@ class SQLiteStore:
                 task.thread_id,
                 now,
                 now,
+                task.conversation_subject_id,
             ),
         )
         # ``INSERT OR IGNORE`` can only lose a race after the validation above;
         # re-read and fail closed if another writer inserted a different scope.
         created = conn.execute(
             "SELECT channel, bot_id, external_user_id, session_id, agent_id, mode_id, "
-            "profile_version, policy_version FROM conversations WHERE conversation_id=?",
+            "profile_version, policy_version, conversation_subject_id "
+            "FROM conversations WHERE conversation_id=?",
             (conversation_id,),
         ).fetchone()
         if created is None:
@@ -11746,6 +15139,236 @@ class SQLiteStore:
             if str(created[column]) != str(expected):
                 raise StoreError(f"conversation identity conflicts: {conversation_id} ({column})")
         return conversation_id
+
+    @staticmethod
+    def _verified_direct_principal_tx(
+        conn: sqlite3.Connection,
+        task: AgentTask,
+        *,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+    ) -> str | None:
+        """Return a store-proven principal only for an exact direct account."""
+
+        principal_id = str(task.principal_id or "").strip()
+        account_id = str(task.principal_account_id or "").strip()
+        actor_id = str(task.actor_external_user_id or "").strip()
+        if not principal_id and not account_id:
+            return None
+        if not principal_id or not account_id or not actor_id:
+            raise StoreError("task principal identity is incomplete")
+        mapping = conn.execute(
+            """SELECT pa.principal_id, pa.principal_account_id
+                 FROM principal_accounts AS pa
+                 JOIN principals AS p ON p.principal_id=pa.principal_id
+                WHERE pa.channel=? AND pa.bot_id=? AND pa.external_user_id=?
+                  AND pa.active=1 AND p.enabled=1""",
+            (str(channel), str(bot_id), actor_id),
+        ).fetchone()
+        if mapping is None or (
+            str(mapping["principal_id"]) != principal_id
+            or str(mapping["principal_account_id"]) != account_id
+        ):
+            raise StoreError(
+                "task principal does not match the authenticated account mapping"
+            )
+        # Group and thread routes intentionally use a chat/topic scope instead
+        # of the actor.  Requiring the exact actor here prevents a mapped user
+        # from carrying private history into either shared subject.
+        if str(external_user_id) != actor_id:
+            return None
+        subject_id = str(task.conversation_subject_id or "").strip()
+        if not subject_id:
+            return None
+        subject = conn.execute(
+            """SELECT subject_kind, channel, bot_id, scope_key
+                 FROM conversation_subjects
+                WHERE conversation_subject_id=?""",
+            (subject_id,),
+        ).fetchone()
+        if subject is None:
+            raise StoreError("task conversation subject is unavailable")
+        if (
+            str(subject["subject_kind"]) != "direct"
+            or str(subject["channel"]) != str(channel)
+            or str(subject["bot_id"]) != str(bot_id)
+            or str(subject["scope_key"]) != actor_id
+        ):
+            return None
+        return principal_id
+
+    @classmethod
+    def _ensure_principal_conversation_binding_tx(
+        cls,
+        conn: sqlite3.Connection,
+        task: AgentTask,
+        *,
+        principal_id: str,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str,
+        now: str,
+    ) -> str:
+        """Resolve or create one canonical provider-history anchor."""
+
+        session_value = str(session_id or "default")
+        existing = conn.execute(
+            """SELECT conversation_id
+                 FROM principal_conversation_bindings
+                WHERE principal_id=? AND agent_id=? AND session_id=?""",
+            (principal_id, task.agent_id, session_value),
+        ).fetchone()
+        if existing is not None:
+            anchor = str(existing["conversation_id"])
+            row = conn.execute(
+                "SELECT agent_id, session_id FROM conversations "
+                "WHERE conversation_id=?",
+                (anchor,),
+            ).fetchone()
+            if row is None or (
+                str(row["agent_id"]) != str(task.agent_id)
+                or str(row["session_id"]) != session_value
+            ):
+                raise StoreError("principal conversation anchor is invalid")
+            return anchor
+
+        anchor = principal_conversation_id(
+            principal_id,
+            session_value,
+            task.agent_id,
+        )
+        row = conn.execute(
+            "SELECT agent_id, session_id FROM conversations WHERE conversation_id=?",
+            (anchor,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """INSERT INTO conversations
+                       (conversation_id, channel, bot_id, external_user_id,
+                        session_id, agent_id, mode_id, profile_version,
+                        policy_version, thread_id, created_at, updated_at,
+                        conversation_subject_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    anchor,
+                    str(channel),
+                    str(bot_id),
+                    str(external_user_id),
+                    session_value,
+                    str(task.agent_id),
+                    str(task.mode_id),
+                    int(task.profile_version),
+                    int(task.policy_version),
+                    task.thread_id,
+                    now,
+                    now,
+                    task.conversation_subject_id,
+                ),
+            )
+        elif (
+            str(row["agent_id"]) != str(task.agent_id)
+            or str(row["session_id"]) != session_value
+        ):
+            raise StoreError("principal conversation identity conflicts")
+        try:
+            conn.execute(
+                """INSERT INTO principal_conversation_bindings
+                       (principal_id, agent_id, session_id, conversation_id,
+                        binding_kind, configured_by, created_at)
+                   VALUES (?, ?, ?, ?, 'canonical',
+                           'runtime:verified-principal', ?)""",
+                (
+                    principal_id,
+                    str(task.agent_id),
+                    session_value,
+                    anchor,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise StoreError("principal conversation binding conflicts") from exc
+        return anchor
+
+    @classmethod
+    def _ensure_conversation_tx(
+        cls,
+        conn: sqlite3.Connection,
+        task: AgentTask,
+        *,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str,
+        now: str,
+    ) -> str:
+        """Ensure transport provenance, then select trusted provider history."""
+
+        session_value = str(session_id or "default")
+        principal_id = cls._verified_direct_principal_tx(
+            conn,
+            task,
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+        )
+        if principal_id is None:
+            return cls._ensure_transport_conversation_tx(
+                conn,
+                task,
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_value,
+                now=now,
+            )
+
+        binding = conn.execute(
+            """SELECT conversation_id
+                 FROM principal_conversation_bindings
+                WHERE principal_id=? AND agent_id=? AND session_id=?""",
+            (principal_id, task.agent_id, session_value),
+        ).fetchone()
+        anchor = str(binding["conversation_id"]) if binding is not None else ""
+        local_candidates = conversation_id_candidates(
+            channel,
+            bot_id,
+            external_user_id,
+            session_value,
+            task.agent_id,
+        )
+        requested = str(task.conversation_id or "").strip()
+        if requested and requested not in {*local_candidates, anchor}:
+            raise StoreError(
+                "principal task conversation conflicts with its transport scope"
+            )
+        local_requested = (
+            requested if requested in local_candidates else local_candidates[0]
+        )
+        local_task = cls._coerce_task(
+            task,
+            {"conversation_id": local_requested},
+        )
+        cls._ensure_transport_conversation_tx(
+            conn,
+            local_task,
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+            session_id=session_value,
+            now=now,
+        )
+        return cls._ensure_principal_conversation_binding_tx(
+            conn,
+            task,
+            principal_id=principal_id,
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+            session_id=session_value,
+            now=now,
+        )
 
     @staticmethod
     def _role_snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -12044,6 +15667,230 @@ class SQLiteStore:
             now=now,
         )
 
+    @classmethod
+    def _ensure_inbound_identity_tx(
+        cls,
+        conn: sqlite3.Connection,
+        message: InboundMessage,
+        *,
+        now: str,
+    ) -> dict[str, Any]:
+        """Resolve and persist trusted v36 identity provenance for ingress.
+
+        The transport actor remains ``external_user_id``.  A separately
+        authenticated conversation subject supplies the route scope for group
+        and thread messages, while canonical principals are looked up only by
+        the exact durable account triple.  Caller-supplied principal values
+        are accepted solely when they match that owner-configured mapping.
+        """
+
+        channel = cls._required_store_identity(message.channel, "channel")
+        bot_id = cls._required_store_identity(message.bot_id, "bot_id")
+        actor_id = cls._required_store_identity(
+            message.external_user_id, "external_user_id"
+        )
+        subject_kind = str(message.conversation_subject_kind or "direct").strip().lower()
+        if subject_kind not in {"direct", "group", "thread"}:
+            raise StoreError("conversation subject kind is invalid")
+
+        supplied_subject_id = str(message.conversation_subject_id or "").strip()
+        supplied_subject_scope = str(
+            message.conversation_subject_scope or ""
+        ).strip()
+        existing_subject = None
+        if supplied_subject_id:
+            existing_subject = conn.execute(
+                "SELECT * FROM conversation_subjects "
+                "WHERE conversation_subject_id=?",
+                (supplied_subject_id,),
+            ).fetchone()
+        if existing_subject is not None:
+            if (
+                str(existing_subject["channel"]) != channel
+                or str(existing_subject["bot_id"]) != bot_id
+                or str(existing_subject["subject_kind"]) != subject_kind
+            ):
+                raise StoreError("conversation subject conflicts with inbound ownership")
+            subject_id = str(existing_subject["conversation_subject_id"])
+            route_scope = str(existing_subject["scope_key"])
+            if supplied_subject_scope and supplied_subject_scope != route_scope:
+                raise StoreError(
+                    "conversation subject scope conflicts with inbound ownership"
+                )
+        elif supplied_subject_id:
+            # Channel adapters provide an authenticated, bot-local scope.  It
+            # is intentionally unrelated to principal identity and therefore
+            # safe to retain as both the first durable subject ID and route
+            # scope.  Explicit subject records may use a different opaque ID;
+            # the existing-row branch above recovers their stored scope key.
+            subject_id = supplied_subject_id
+            route_scope = supplied_subject_scope or supplied_subject_id
+        elif supplied_subject_scope:
+            subject_id = supplied_subject_scope
+            route_scope = supplied_subject_scope
+        else:
+            if subject_kind != "direct":
+                raise StoreError(
+                    "group/thread inbound requires an authenticated conversation subject"
+                )
+            direct = direct_conversation_subject(channel, bot_id, actor_id)
+            subject_id = direct.conversation_subject_id
+            route_scope = direct.scope_key
+
+        transport_metadata = (
+            dict(message.transport_metadata)
+            if isinstance(message.transport_metadata, Mapping)
+            else {}
+        )
+        external_chat_id = str(
+            transport_metadata.get("chat_id")
+            or (message.destination_id if subject_kind != "direct" else "")
+            or ""
+        )
+        external_thread_id = str(
+            message.thread_id
+            or transport_metadata.get("thread_id")
+            or transport_metadata.get("root_id")
+            or ""
+        )
+        parent_subject_id: str | None = None
+        if subject_kind == "thread":
+            if not external_thread_id:
+                raise StoreError("thread conversation subject requires a thread ID")
+            if not external_chat_id:
+                raise StoreError("thread conversation subject requires a chat ID")
+            if channel.lower() in {"lark", "feishu"}:
+                parent = group_conversation_subject(
+                    channel, bot_id, external_chat_id
+                )
+                parent_subject_id = parent.conversation_subject_id
+                parent_scope = parent.scope_key
+            else:
+                parent = direct_conversation_subject(
+                    channel, bot_id, external_chat_id
+                )
+                parent_subject_id = parent.conversation_subject_id
+                parent_scope = parent.scope_key
+            conn.execute(
+                """INSERT OR IGNORE INTO conversation_subjects
+                       (conversation_subject_id, channel, bot_id, subject_kind,
+                        scope_key, external_chat_id, external_thread_id,
+                        parent_subject_id, provenance_json, created_at)
+                   VALUES (?, ?, ?, 'group', ?, ?, '', NULL, ?, ?)""",
+                (
+                    parent_subject_id,
+                    channel,
+                    bot_id,
+                    parent_scope,
+                    external_chat_id,
+                    json_dumps({"source": "authenticated_inbound"}),
+                    now,
+                ),
+            )
+
+        conn.execute(
+            """INSERT OR IGNORE INTO conversation_subjects
+                   (conversation_subject_id, channel, bot_id, subject_kind,
+                    scope_key, external_chat_id, external_thread_id,
+                    parent_subject_id, provenance_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                subject_id,
+                channel,
+                bot_id,
+                subject_kind,
+                route_scope,
+                external_chat_id,
+                external_thread_id,
+                parent_subject_id,
+                json_dumps({"source": "authenticated_inbound"}),
+                now,
+            ),
+        )
+        stored_subject = conn.execute(
+            "SELECT * FROM conversation_subjects WHERE conversation_subject_id=?",
+            (subject_id,),
+        ).fetchone()
+        if stored_subject is None:
+            raise StoreError("conversation subject insert failed")
+        for column, expected in (
+            ("channel", channel),
+            ("bot_id", bot_id),
+            ("subject_kind", subject_kind),
+            ("scope_key", route_scope),
+        ):
+            if str(stored_subject[column]) != str(expected):
+                raise StoreError(
+                    f"conversation subject conflicts with inbound ownership ({column})"
+                )
+
+        mapping = conn.execute(
+            """SELECT pa.*, p.enabled AS principal_enabled
+               FROM principal_accounts AS pa
+               JOIN principals AS p ON p.principal_id=pa.principal_id
+               WHERE pa.channel=? AND pa.bot_id=? AND pa.external_user_id=?
+                 AND pa.active=1 AND p.enabled=1""",
+            (channel, bot_id, actor_id),
+        ).fetchone()
+        supplied_principal = str(message.principal_id or "").strip()
+        supplied_account = str(message.principal_account_id or "").strip()
+        if bool(supplied_principal) != bool(supplied_account):
+            raise StoreError(
+                "principal_id and principal_account_id must be supplied together"
+            )
+        if supplied_principal:
+            if mapping is None or (
+                supplied_principal != str(mapping["principal_id"])
+                or supplied_account != str(mapping["principal_account_id"])
+            ):
+                raise StoreError(
+                    "inbound principal does not match the authenticated account mapping"
+                )
+        principal_id = str(mapping["principal_id"]) if mapping is not None else None
+        principal_account_id = (
+            str(mapping["principal_account_id"]) if mapping is not None else None
+        )
+        mapping_revision = (
+            int(mapping["mapping_revision"]) if mapping is not None else None
+        )
+        snapshot = {
+            "actor": {
+                "channel": channel,
+                "bot_id": bot_id,
+                "external_user_id": actor_id,
+            },
+            "principal": {
+                "principal_id": principal_id,
+                "principal_account_id": principal_account_id,
+                "mapping_revision": mapping_revision,
+                "source": "configured" if mapping is not None else "unmapped",
+            },
+            "conversation_subject": {
+                "conversation_subject_id": subject_id,
+                "kind": subject_kind,
+                "scope_key": route_scope,
+                "parent_subject_id": parent_subject_id,
+            },
+            "destination": {
+                "kind": str(message.destination_kind or ""),
+                "id": str(message.destination_id or ""),
+                "thread_id": external_thread_id,
+                "root_message_id": str(
+                    message.root_message_id
+                    or transport_metadata.get("root_id")
+                    or ""
+                ),
+                "transport_metadata": transport_metadata,
+            },
+        }
+        return {
+            "principal_id": principal_id,
+            "principal_account_id": principal_account_id,
+            "conversation_subject_id": subject_id,
+            "route_scope": route_scope,
+            "identity_snapshot": snapshot,
+        }
+
     # ------------------------------------------------------------------
     # Ingress and task creation
     # ------------------------------------------------------------------
@@ -12069,6 +15916,10 @@ class SQLiteStore:
             "channel", "bot_id", "external_user_id", "external_message_id",
             "text", "content", "body", "session_id", "source_sequence",
             "context_token", "payload", "received_at", "message_id",
+            "principal_id", "principal_account_id", "conversation_subject_id",
+            "conversation_subject_kind", "destination_kind", "destination_id",
+            "conversation_subject_scope", "thread_id", "root_message_id",
+            "transport_metadata", "identity_snapshot",
         }
         message = self._coerce_inbound(
             inbound,
@@ -12085,13 +15936,18 @@ class SQLiteStore:
 
         def op(conn: sqlite3.Connection) -> InboundMessage:
             with _transaction(conn):
+                identity = self._ensure_inbound_identity_tx(
+                    conn, message, now=now
+                )
                 insert_cursor = conn.execute(
                     """INSERT OR IGNORE INTO inbound_messages
                        (message_id, channel, bot_id, external_user_id,
                         external_message_id, session_id, source_sequence,
                         context_token, text, payload_json, status,
-                        received_at, stored_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        received_at, stored_at, principal_id,
+                        principal_account_id, conversation_subject_id,
+                        identity_snapshot_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         message.message_id,
                         message.channel,
@@ -12116,6 +15972,10 @@ class SQLiteStore:
                         ),
                         _utc_text(message.received_at),
                         now,
+                        identity["principal_id"],
+                        identity["principal_account_id"],
+                        identity["conversation_subject_id"],
+                        json_dumps(identity["identity_snapshot"]),
                     ),
                 )
                 row = conn.execute(
@@ -12455,12 +16315,16 @@ class SQLiteStore:
 
         def op(conn: sqlite3.Connection) -> TaskRecord | None:
             with _transaction(conn):
-                inbound_id = task_snapshot.inbound_message_id
+                snapshot = task_snapshot
+                inbound_id = snapshot.inbound_message_id
                 inbound_row: sqlite3.Row | None = None
+                inbound_actor_id = ""
                 if inbound_id:
                     inbound_row = conn.execute(
                         "SELECT channel, bot_id, external_user_id, session_id, message_id, "
-                        "external_message_id, source_sequence, context_token "
+                        "external_message_id, source_sequence, context_token, "
+                        "principal_id, principal_account_id, conversation_subject_id, "
+                        "identity_snapshot_json "
                         "FROM inbound_messages WHERE message_id = ?",
                         (inbound_id,),
                     ).fetchone()
@@ -12469,6 +16333,49 @@ class SQLiteStore:
                             f"inbound message not found: {inbound_id}"
                         )
                     if inbound_row is not None:
+                        inbound_actor_id = str(inbound_row["external_user_id"] or "")
+                        inbound_identity = (
+                            json_loads(inbound_row["identity_snapshot_json"], {}) or {}
+                        )
+                        inbound_subject = (
+                            inbound_identity.get("conversation_subject", {})
+                            if isinstance(inbound_identity, Mapping)
+                            else {}
+                        )
+                        if not isinstance(inbound_subject, Mapping):
+                            inbound_subject = {}
+                        inbound_route_user = str(
+                            inbound_subject.get("scope_key")
+                            or inbound_actor_id
+                        )
+                        for supplied, persisted, field in (
+                            (snapshot.actor_external_user_id, inbound_actor_id, "actor_external_user_id"),
+                            (snapshot.principal_id, inbound_row["principal_id"], "principal_id"),
+                            (
+                                snapshot.principal_account_id,
+                                inbound_row["principal_account_id"],
+                                "principal_account_id",
+                            ),
+                            (
+                                snapshot.conversation_subject_id,
+                                inbound_row["conversation_subject_id"],
+                                "conversation_subject_id",
+                            ),
+                        ):
+                            if supplied and str(supplied) != str(persisted or ""):
+                                raise StoreError(
+                                    f"task identity conflicts with inbound ownership ({field})"
+                                )
+                        snapshot = self._coerce_task(
+                            snapshot,
+                            {
+                                "actor_external_user_id": inbound_actor_id,
+                                "principal_id": inbound_row["principal_id"],
+                                "principal_account_id": inbound_row["principal_account_id"],
+                                "conversation_subject_id": inbound_row["conversation_subject_id"],
+                                "identity_snapshot": inbound_identity,
+                            },
+                        )
                         # A linked inbound envelope owns its channel scope.
                         # Explicit convenience fields or a ReplyTarget may
                         # not redirect that durable message, even when the
@@ -12479,7 +16386,7 @@ class SQLiteStore:
                             (bot_id or mapped_bot_id, inbound_row["bot_id"], "bot_id"),
                             (
                                 external_user_id or mapped_user_id,
-                                inbound_row["external_user_id"],
+                                inbound_route_user,
                                 "external_user_id",
                             ),
                             (
@@ -12488,15 +16395,19 @@ class SQLiteStore:
                                 "session_id",
                             ),
                         ):
-                            if supplied and str(supplied) != str(persisted):
+                            if (
+                                supplied
+                                and str(supplied)
+                                not in {str(persisted), inbound_actor_id}
+                            ):
                                 raise StoreError(
                                     f"task scope conflicts with inbound ownership ({field})"
                                 )
                         self._validate_reply_target_scope(
-                            self._coerce_reply_target(task_snapshot.reply_target),
+                            self._coerce_reply_target(snapshot.reply_target),
                             channel=inbound_row["channel"],
                             bot_id=inbound_row["bot_id"],
-                            external_user_id=inbound_row["external_user_id"],
+                            external_user_id=inbound_route_user,
                             session_id=inbound_row["session_id"] or "default",
                         )
                         channel_value = (
@@ -12508,9 +16419,11 @@ class SQLiteStore:
                         user_value = (
                             external_user_id
                             or mapped_user_id
-                            or inbound_row["external_user_id"]
+                            or inbound_route_user
                             or target_route.external_user_id
                         )
+                        if user_value == inbound_actor_id:
+                            user_value = inbound_route_user
                         session_value = (
                             session_id
                             or mapped_session_id
@@ -12532,13 +16445,100 @@ class SQLiteStore:
                         external_user_id or mapped_user_id or target_route.external_user_id,
                         session_id or mapped_session_id or target_route.session_id or "default",
                     )
-                if not task_snapshot.dedupe_key and inbound_id:
+                    subject_data = (
+                        snapshot.identity_snapshot.get("conversation_subject", {})
+                        if isinstance(snapshot.identity_snapshot, Mapping)
+                        else {}
+                    )
+                    if not isinstance(subject_data, Mapping):
+                        subject_data = {}
+                    subject_kind = str(
+                        subject_data.get("kind")
+                        or (
+                            "thread"
+                            if target_route.thread_id
+                            else "group"
+                            if target_route.destination_kind in {"group", "thread"}
+                            else "direct"
+                        )
+                    )
+                    actor_value = str(
+                        snapshot.actor_external_user_id
+                        or target_route.external_user_id
+                        or user_value
+                    )
+                    transport_scope_supplied = any(
+                        str(value or "").strip()
+                        for value in (
+                            channel_value,
+                            bot_value,
+                            user_value,
+                            actor_value,
+                            snapshot.principal_id,
+                            snapshot.principal_account_id,
+                            snapshot.conversation_subject_id,
+                            target_route.conversation_subject_id,
+                            target_route.conversation_subject_scope,
+                            target_route.destination_kind,
+                            target_route.destination_id,
+                            target_route.thread_id,
+                            target_route.root_message_id,
+                        )
+                    )
+                    if transport_scope_supplied:
+                        standalone_identity = self._ensure_inbound_identity_tx(
+                            conn,
+                            InboundMessage(
+                                channel=str(channel_value),
+                                bot_id=str(bot_value),
+                                external_user_id=actor_value,
+                                external_message_id="identity-only",
+                                session_id=str(session_value or "default"),
+                                principal_id=snapshot.principal_id,
+                                principal_account_id=snapshot.principal_account_id,
+                                conversation_subject_id=(
+                                    snapshot.conversation_subject_id
+                                    or target_route.conversation_subject_id
+                                    or None
+                                ),
+                                conversation_subject_scope=(
+                                    target_route.conversation_subject_scope
+                                ),
+                                conversation_subject_kind=subject_kind,
+                                destination_kind=target_route.destination_kind,
+                                destination_id=target_route.destination_id,
+                                thread_id=target_route.thread_id,
+                                root_message_id=target_route.root_message_id,
+                                transport_metadata=target_route.transport_metadata,
+                            ),
+                            now=now,
+                        )
+                        snapshot = self._coerce_task(
+                            snapshot,
+                            {
+                                "actor_external_user_id": actor_value,
+                                "principal_id": standalone_identity[
+                                    "principal_id"
+                                ],
+                                "principal_account_id": standalone_identity[
+                                    "principal_account_id"
+                                ],
+                                "conversation_subject_id": standalone_identity[
+                                    "conversation_subject_id"
+                                ],
+                                "identity_snapshot": standalone_identity[
+                                    "identity_snapshot"
+                                ],
+                            },
+                        )
+                        user_value = str(standalone_identity["route_scope"])
+                if not snapshot.dedupe_key and inbound_id:
                     dedupe = f"inbound:{inbound_id}"
                 else:
-                    dedupe = task_snapshot.dedupe_key
+                    dedupe = snapshot.dedupe_key
                 conversation_id = self._ensure_conversation_tx(
                     conn,
-                    task_snapshot,
+                    snapshot,
                     channel=channel_value,
                     bot_id=bot_value,
                     external_user_id=user_value,
@@ -12547,23 +16547,23 @@ class SQLiteStore:
                 )
                 role_snapshot = self._task_role_snapshot_tx(
                     conn,
-                    metadata=task_snapshot.metadata,
+                    metadata=snapshot.metadata,
                     channel=channel_value,
                     bot_id=bot_value,
                     external_user_id=user_value,
                     session_id=session_value,
-                    agent_id=task_snapshot.agent_id,
+                    agent_id=snapshot.agent_id,
                 )
                 role_version, role_hash, persona_version = role_binding_key(
                     role_snapshot
                 )
                 thread_id = self._resolve_task_thread_tx(
                     conn,
-                    supplied_thread_id=task_snapshot.thread_id,
+                    supplied_thread_id=snapshot.thread_id,
                     conversation_id=conversation_id,
-                    mode_id=task_snapshot.mode_id,
-                    profile_version=task_snapshot.profile_version,
-                    policy_version=task_snapshot.policy_version,
+                    mode_id=snapshot.mode_id,
+                    profile_version=snapshot.profile_version,
+                    policy_version=snapshot.policy_version,
                     role_version=role_version,
                     role_snapshot_hash=role_hash,
                     persona_composition_version=persona_version,
@@ -12576,8 +16576,8 @@ class SQLiteStore:
                         bot_id=bot_value,
                         external_user_id=user_value,
                         session_id=session_value,
-                        agent_id=task_snapshot.agent_id,
-                        parent_task_id=task_snapshot.parent_task_id,
+                        agent_id=snapshot.agent_id,
+                        parent_task_id=snapshot.parent_task_id,
                         conversation_id=conversation_id,
                     )
                     self._retain_task_input_attachments_tx(
@@ -12602,12 +16602,12 @@ class SQLiteStore:
                             bot_id=bot_value,
                             external_user_id=user_value,
                             session_id=session_value,
-                            agent_id=task_snapshot.agent_id,
-                            parent_task_id=task_snapshot.parent_task_id,
+                            agent_id=snapshot.agent_id,
+                            parent_task_id=snapshot.parent_task_id,
                             conversation_id=conversation_id,
                         )
                         return prepare_initial_delivery_tx(conn, existing)
-                task_id = task_snapshot.task_id or _uuid()
+                task_id = snapshot.task_id or _uuid()
                 # Child admission and task insertion must share one durable
                 # transaction.  A process crash between a standalone counter
                 # reservation and INSERT would otherwise leak a child slot
@@ -12615,13 +16615,13 @@ class SQLiteStore:
                 # this block so replaying an already-created child does not
                 # increment the counter a second time.
                 child_parent_id = (
-                    str(task_snapshot.parent_task_id)
-                    if task_snapshot.parent_task_id
+                    str(snapshot.parent_task_id)
+                    if snapshot.parent_task_id
                     else None
                 )
                 if _reserve_child_parent_id is not None:
                     parent_id = str(_reserve_child_parent_id)
-                    if str(task_snapshot.parent_task_id or "") != parent_id:
+                    if str(snapshot.parent_task_id or "") != parent_id:
                         raise StoreError(
                             "child reservation parent does not match task snapshot"
                         )
@@ -12632,7 +16632,7 @@ class SQLiteStore:
                     # not use ``create_child_task``.
                     self._validate_child_parent_tx(
                         conn,
-                        task_snapshot,
+                        snapshot,
                         channel=channel_value,
                         bot_id=bot_value,
                         external_user_id=user_value,
@@ -12668,12 +16668,19 @@ class SQLiteStore:
                             raise PermissionError(
                                 "maximum child-task count exceeded"
                             )
+                identity_destination = (
+                    snapshot.identity_snapshot.get("destination", {})
+                    if isinstance(snapshot.identity_snapshot, Mapping)
+                    else {}
+                )
+                if not isinstance(identity_destination, Mapping):
+                    identity_destination = {}
                 reply_target = self._coerce_reply_target(
-                    task_snapshot.reply_target,
+                    snapshot.reply_target,
                     fallback=ReplyTarget(
                         channel=channel_value,
                         bot_id=bot_value,
-                        external_user_id=user_value,
+                        external_user_id=inbound_actor_id or user_value,
                         session_id=session_value,
                         source_message_id=(
                             inbound_row["external_message_id"]
@@ -12690,6 +16697,33 @@ class SQLiteStore:
                             if inbound_id and inbound_row is not None
                             else None
                         ),
+                        conversation_subject_id=str(
+                            snapshot.conversation_subject_id or ""
+                        ),
+                        conversation_subject_scope=str(user_value or ""),
+                        destination_kind=str(
+                            identity_destination.get("kind") or ""
+                        ),
+                        destination_id=str(
+                            identity_destination.get("id") or ""
+                        ),
+                        thread_id=str(
+                            identity_destination.get("thread_id") or ""
+                        ),
+                        root_message_id=str(
+                            identity_destination.get("root_message_id") or ""
+                        ),
+                        transport_metadata=(
+                            dict(
+                                identity_destination.get("transport_metadata")
+                                or {}
+                            )
+                            if isinstance(
+                                identity_destination.get("transport_metadata"),
+                                Mapping,
+                            )
+                            else {}
+                        ),
                     ),
                 )
                 self._validate_reply_target_scope(
@@ -12701,8 +16735,8 @@ class SQLiteStore:
                 )
                 agent_incarnation = self._current_agent_incarnation_tx(
                     conn,
-                    task_snapshot.agent_id,
-                    int(task_snapshot.profile_version),
+                    snapshot.agent_id,
+                    int(snapshot.profile_version),
                 )
                 conn.execute(
                     """INSERT INTO tasks
@@ -12710,10 +16744,13 @@ class SQLiteStore:
                         external_user_id, session_id, agent_id, agent_incarnation, conversation_id,
                         thread_id, mode_id, profile_version, policy_version,
                         model, reasoning_effort, reply_target_json, inputs_json,
-                        metadata_json,
+                        metadata_json, actor_external_user_id, principal_id,
+                        principal_account_id, conversation_subject_id,
+                        identity_snapshot_json,
                         state, attempts, next_attempt_at, parent_task_id,
                         child_depth, request_id, created_at, updated_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?,
                                'queued', 0, ?, ?, ?, ?, ?, ?)""",
                     (
                         task_id,
@@ -12723,22 +16760,27 @@ class SQLiteStore:
                         bot_value,
                         user_value,
                         session_value,
-                        task_snapshot.agent_id,
+                        snapshot.agent_id,
                         agent_incarnation,
                         conversation_id,
                         thread_id,
-                        task_snapshot.mode_id,
-                        int(task_snapshot.profile_version),
-                        int(task_snapshot.policy_version),
-                        task_snapshot.model,
-                        task_snapshot.reasoning_effort,
+                        snapshot.mode_id,
+                        int(snapshot.profile_version),
+                        int(snapshot.policy_version),
+                        snapshot.model,
+                        snapshot.reasoning_effort,
                         json_dumps(reply_target.to_dict()),
-                        json_dumps(_snapshot_value(task_snapshot.inputs)),
-                        json_dumps(_snapshot_value(task_snapshot.metadata, text_key="value")),
+                        json_dumps(_snapshot_value(snapshot.inputs)),
+                        json_dumps(_snapshot_value(snapshot.metadata, text_key="value")),
+                        snapshot.actor_external_user_id or inbound_actor_id or user_value,
+                        snapshot.principal_id,
+                        snapshot.principal_account_id,
+                        snapshot.conversation_subject_id,
+                        json_dumps(_snapshot_value(snapshot.identity_snapshot)),
                         None,
-                        task_snapshot.parent_task_id,
-                        int(task_snapshot.child_depth),
-                        task_snapshot.request_id,
+                        snapshot.parent_task_id,
+                        int(snapshot.child_depth),
+                        snapshot.request_id,
                         now,
                         now,
                     ),
@@ -12755,8 +16797,8 @@ class SQLiteStore:
                     conn,
                     task_id=task_id,
                     inbound_message_id=inbound_id,
-                    inputs=task_snapshot.inputs,
-                    agent_id=task_snapshot.agent_id,
+                    inputs=snapshot.inputs,
+                    agent_id=snapshot.agent_id,
                     channel=channel_value,
                     bot_id=bot_value,
                     external_user_id=user_value,
@@ -12773,7 +16815,7 @@ class SQLiteStore:
                 self._retain_task_input_attachments_tx(
                     conn,
                     task_id=task_id,
-                    inputs=task_snapshot.inputs,
+                    inputs=snapshot.inputs,
                     created_at=now,
                 )
                 self._create_queued_task_invocation_tx(
@@ -12782,16 +16824,36 @@ class SQLiteStore:
                     now=now,
                     max_agent_queue=self.max_agent_queue,
                     max_global_queue=self.max_global_queue,
+                    max_account_queue=self.max_account_queue,
+                    max_account_agent_queue=self.max_account_agent_queue,
                 )
                 created = self._fetch_task_tx(conn, task_id)
                 if created is None:
                     raise StoreError("failed to create task")
                 return prepare_initial_delivery_tx(conn, created)
 
+        requested_subject = (
+            task_snapshot.identity_snapshot.get("conversation_subject", {})
+            if isinstance(task_snapshot.identity_snapshot, Mapping)
+            else {}
+        )
+        if not isinstance(requested_subject, Mapping):
+            requested_subject = {}
+        requested_user_id = str(
+            requested_subject.get("scope_key")
+            or (
+                target_route.conversation_subject_id
+                if target_route.destination_kind in {"group", "thread"}
+                else ""
+            )
+            or external_user_id
+            or mapped_user_id
+            or target_route.external_user_id
+        )
         requested_scope = (
             channel or mapped_channel or target_route.channel,
             bot_id or mapped_bot_id or target_route.bot_id,
-            external_user_id or mapped_user_id or target_route.external_user_id,
+            requested_user_id,
             session_id or mapped_session_id or target_route.session_id or "default",
         )
         requested_conversation = task_snapshot.conversation_id or canonical_conversation_id(
@@ -12880,6 +16942,10 @@ class SQLiteStore:
             "channel", "bot_id", "external_user_id", "external_message_id",
             "text", "content", "body", "session_id", "source_sequence",
             "context_token", "payload", "received_at", "message_id",
+            "principal_id", "principal_account_id", "conversation_subject_id",
+            "conversation_subject_kind", "destination_kind", "destination_id",
+            "conversation_subject_scope", "thread_id", "root_message_id",
+            "transport_metadata", "identity_snapshot",
         }
         message = self._coerce_inbound(
             inbound,
@@ -12895,7 +16961,8 @@ class SQLiteStore:
         for key in (
             "agent_id", "conversation_id", "thread_id", "mode_id", "profile_version",
             "policy_version", "model", "reasoning_effort", "reply_target", "inputs",
-            "request_id", "dedupe_key",
+            "request_id", "dedupe_key", "actor_external_user_id", "principal_id",
+            "principal_account_id", "conversation_subject_id", "identity_snapshot",
         ):
             if key in kwargs:
                 task_values[key] = kwargs[key]
@@ -12986,13 +17053,18 @@ class SQLiteStore:
 
         def op(conn: sqlite3.Connection) -> InboundAcceptance:
             with _transaction(conn):
+                identity = self._ensure_inbound_identity_tx(
+                    conn, message, now=now
+                )
                 insert_cursor = conn.execute(
                     """INSERT OR IGNORE INTO inbound_messages
                        (message_id, channel, bot_id, external_user_id,
                         external_message_id, session_id, source_sequence,
                         context_token, text, payload_json, status,
-                        received_at, stored_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?)""",
+                        received_at, stored_at, principal_id,
+                        principal_account_id, conversation_subject_id,
+                        identity_snapshot_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?, ?, ?, ?)""",
                     (
                         message.message_id,
                         message.channel,
@@ -13006,6 +17078,10 @@ class SQLiteStore:
                         json_dumps(inbound_payload),
                         _utc_text(message.received_at),
                         now,
+                        identity["principal_id"],
+                        identity["principal_account_id"],
+                        identity["conversation_subject_id"],
+                        json_dumps(identity["identity_snapshot"]),
                     ),
                 )
                 row = conn.execute(
@@ -13132,6 +17208,34 @@ class SQLiteStore:
                         "ORDER BY created_at ASC, confirmation_id ASC",
                         (persisted.message_id,),
                     ).fetchall()
+                    steering_row = conn.execute(
+                        "SELECT * FROM task_steering WHERE inbound_message_id=?",
+                        (persisted.message_id,),
+                    ).fetchone()
+                    if steering_row is not None:
+                        steering = self._task_steering_from_row(steering_row)
+                        linked_task_id = str(persisted.task_id or "")
+                        if not linked_task_id and steering is not None:
+                            linked_task_id = str(
+                                steering.promoted_task_id
+                                or steering.target_task_id
+                            )
+                        linked_task = (
+                            self._fetch_task_tx(conn, linked_task_id)
+                            if linked_task_id
+                            else None
+                        )
+                        if linked_task is None:
+                            raise StoreError(
+                                "task steering replay has no linked task"
+                            )
+                        return InboundAcceptance(
+                            persisted,
+                            linked_task,
+                            created=False,
+                            duplicate=True,
+                            steering=steering,
+                        )
                     if (
                         not create_task
                         or existing_task is not None
@@ -13264,8 +17368,27 @@ class SQLiteStore:
                 task_values.setdefault("dedupe_key", f"inbound:{persisted.message_id}")
                 task_values.setdefault("channel", persisted.channel)
                 task_values.setdefault("bot_id", persisted.bot_id)
-                task_values.setdefault("external_user_id", persisted.external_user_id)
                 task_values.setdefault("session_id", persisted.session_id)
+                subject_snapshot = (
+                    persisted.identity_snapshot.get("conversation_subject", {})
+                    if isinstance(persisted.identity_snapshot, Mapping)
+                    else {}
+                )
+                if not isinstance(subject_snapshot, Mapping):
+                    subject_snapshot = {}
+                route_user_id = str(
+                    subject_snapshot.get("scope_key")
+                    or persisted.external_user_id
+                )
+                task_values["actor_external_user_id"] = persisted.external_user_id
+                task_values["principal_id"] = persisted.principal_id
+                task_values["principal_account_id"] = persisted.principal_account_id
+                task_values["conversation_subject_id"] = (
+                    persisted.conversation_subject_id
+                )
+                task_values["identity_snapshot"] = dict(
+                    persisted.identity_snapshot or {}
+                )
                 if "inputs" not in task_values:
                     fallback_inputs: dict[str, Any] = {"text": persisted.text}
                     for key in ("media", "attachments", "images"):
@@ -13281,7 +17404,7 @@ class SQLiteStore:
                 # ingress, task ownership, and inbound status atomic.
                 channel_value = persisted.channel
                 bot_value = persisted.bot_id
-                user_value = persisted.external_user_id
+                user_value = route_user_id
                 session_value = persisted.session_id
                 conversation_id = self._ensure_conversation_tx(
                     conn,
@@ -13351,16 +17474,214 @@ class SQLiteStore:
                     agent_incarnation = self._current_agent_incarnation_tx(
                         conn, snapshot.agent_id, int(snapshot.profile_version)
                     )
+                    self._promote_terminal_steering_predecessors_tx(
+                        conn,
+                        agent_id=snapshot.agent_id,
+                        agent_incarnation=agent_incarnation,
+                        conversation_id=conversation_id,
+                        now=now,
+                        max_agent_queue=self.max_agent_queue,
+                        max_global_queue=self.max_global_queue,
+                        max_account_queue=self.max_account_queue,
+                        max_account_agent_queue=self.max_account_agent_queue,
+                    )
+                    active_rows = conn.execute(
+                        """SELECT t.*, e.execution_id AS steering_execution_id,
+                                  e.state AS steering_execution_state
+                             FROM tasks AS t
+                             JOIN task_executions AS e
+                               ON e.execution_id=t.current_execution_id
+                              AND e.task_id=t.task_id
+                              AND e.agent_id=t.agent_id
+                              AND e.agent_incarnation=t.agent_incarnation
+                            WHERE t.agent_id=? AND t.agent_incarnation=?
+                              AND t.conversation_id=?
+                              AND t.state IN ('dispatching','running')
+                              AND e.state IN ('dispatching','running')
+                              AND t.claim_token IS NOT NULL
+                              AND e.claim_token=t.claim_token
+                              AND t.lease_expires_at IS NOT NULL
+                              AND e.lease_expires_at IS NOT NULL
+                              AND t.lease_expires_at>?
+                              AND e.lease_expires_at>?
+                            ORDER BY t.created_at,t.task_id""",
+                        (
+                            snapshot.agent_id,
+                            int(agent_incarnation),
+                            conversation_id,
+                            now,
+                            now,
+                        ),
+                    ).fetchall()
+                    compatible_rows = [
+                        row
+                        for row in active_rows
+                        if self._steering_context_compatible(
+                            row,
+                            snapshot,
+                            conversation_id=conversation_id,
+                            thread_id=thread_id,
+                            agent_incarnation=agent_incarnation,
+                        )
+                    ]
+                    # Steering is an in-place continuation of an active turn,
+                    # so it would otherwise jump ahead of an older turn that
+                    # is already waiting in the same canonical conversation.
+                    # Keep this gate conversation-wide (rather than comparing
+                    # mode/model metadata): a context switch queued between
+                    # two compatible chat messages must still retain A-B-C
+                    # ingress order.
+                    has_queued_predecessor = conn.execute(
+                        """SELECT 1
+                             FROM tasks AS queued
+                             JOIN agent_invocations AS invocation
+                               ON invocation.invocation_id=
+                                  queued.current_execution_id
+                              AND invocation.work_kind='task'
+                              AND invocation.task_id=queued.task_id
+                              AND invocation.execution_id=
+                                  queued.current_execution_id
+                              AND invocation.agent_id=queued.agent_id
+                              AND invocation.agent_incarnation=
+                                  queued.agent_incarnation
+                            WHERE queued.agent_id=?
+                              AND queued.agent_incarnation=?
+                              AND queued.conversation_id=?
+                              AND queued.state='queued'
+                              AND invocation.state='queued'
+                            LIMIT 1""",
+                        (
+                            snapshot.agent_id,
+                            int(agent_incarnation),
+                            conversation_id,
+                        ),
+                    ).fetchone() is not None
+                    # A child-task request has explicit orchestration meaning
+                    # and must never be folded into an unrelated live turn.
+                    if (
+                        len(compatible_rows) == 1
+                        and not snapshot.parent_task_id
+                        and not has_queued_predecessor
+                    ):
+                        active = compatible_rows[0]
+                        active_task_id = str(active["task_id"])
+                        active_execution_id = str(
+                            active["steering_execution_id"]
+                        )
+                        steering_id = str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                "codex-task-steering:" + persisted.message_id,
+                            )
+                        )
+                        fallback_task_id = str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                "codex-task-steering-fallback:" + steering_id,
+                            )
+                        )
+                        sequence = int(
+                            conn.execute(
+                                "SELECT COALESCE(MAX(sequence),0)+1 "
+                                "FROM task_steering WHERE target_execution_id=?",
+                                (active_execution_id,),
+                            ).fetchone()[0]
+                        )
+                        frozen_task = self._task_snapshot_for_steering(
+                            snapshot,
+                            inbound=persisted,
+                            route_external_user_id=user_value,
+                            conversation_id=conversation_id,
+                            thread_id=thread_id,
+                            agent_incarnation=agent_incarnation,
+                            reply_target=target,
+                        )
+                        self._validate_task_input_attachment_access_tx(
+                            conn,
+                            task_id=active_task_id,
+                            inbound_message_id=persisted.message_id,
+                            inputs=snapshot.inputs,
+                            agent_id=snapshot.agent_id,
+                            channel=channel_value,
+                            bot_id=bot_value,
+                            external_user_id=user_value,
+                            session_id=session_value,
+                        )
+                        conn.execute(
+                            """INSERT INTO task_steering
+                               (steering_id,inbound_message_id,target_task_id,
+                                target_execution_id,agent_id,agent_incarnation,
+                                conversation_id,sequence,task_snapshot_json,state,
+                                fallback_task_id,created_at,updated_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?,?)""",
+                            (
+                                steering_id,
+                                persisted.message_id,
+                                active_task_id,
+                                active_execution_id,
+                                snapshot.agent_id,
+                                int(agent_incarnation),
+                                conversation_id,
+                                sequence,
+                                json_dumps(frozen_task),
+                                fallback_task_id,
+                                now,
+                                now,
+                            ),
+                        )
+                        self._retain_attachment_refs_tx(
+                            conn,
+                            owner_kind="task_steering",
+                            owner_id=steering_id,
+                            attachments=self._input_attachment_values(
+                                snapshot.inputs
+                            ),
+                            role="input",
+                            created_at=now,
+                        )
+                        self._transition_inbound_tx(
+                            conn,
+                            persisted.message_id,
+                            InboundState.ACCEPTED,
+                            now=now,
+                            task_id=active_task_id,
+                        )
+                        steering = self._task_steering_from_row(
+                            conn.execute(
+                                "SELECT * FROM task_steering WHERE steering_id=?",
+                                (steering_id,),
+                            ).fetchone()
+                        )
+                        active_task = self._fetch_task_tx(conn, active_task_id)
+                        if steering is None or active_task is None:
+                            raise StoreError(
+                                "task steering acceptance disappeared"
+                            )
+                        return InboundAcceptance(
+                            self._inbound_from_row(
+                                conn.execute(
+                                    "SELECT * FROM inbound_messages WHERE message_id=?",
+                                    (persisted.message_id,),
+                                ).fetchone()
+                            ),
+                            active_task,
+                            created=True,
+                            duplicate=False,
+                            steering=steering,
+                        )
                     conn.execute(
                         """INSERT INTO tasks
                            (task_id, dedupe_key, inbound_message_id, channel, bot_id,
                             external_user_id, session_id, agent_id, agent_incarnation, conversation_id,
                             thread_id, mode_id, profile_version, policy_version,
                             model, reasoning_effort, reply_target_json, inputs_json,
-                            metadata_json,
+                            metadata_json, actor_external_user_id, principal_id,
+                            principal_account_id, conversation_subject_id,
+                            identity_snapshot_json,
                             state, attempts, next_attempt_at, parent_task_id,
                             child_depth, request_id, created_at, updated_at)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                   ?, ?, ?, ?, ?,
                                    'queued', 0, ?, ?, ?, ?, ?, ?)""",
                         (
                             task_id, dedupe, persisted.message_id, channel_value,
@@ -13371,6 +17692,11 @@ class SQLiteStore:
                             snapshot.model, snapshot.reasoning_effort,
                             json_dumps(target.to_dict()), json_dumps(_snapshot_value(snapshot.inputs)),
                             json_dumps(_snapshot_value(snapshot.metadata, text_key="value")),
+                            snapshot.actor_external_user_id,
+                            snapshot.principal_id,
+                            snapshot.principal_account_id,
+                            snapshot.conversation_subject_id,
+                            json_dumps(_snapshot_value(snapshot.identity_snapshot)),
                             None, snapshot.parent_task_id, int(snapshot.child_depth),
                             snapshot.request_id, now, now,
                         ),
@@ -13409,6 +17735,8 @@ class SQLiteStore:
                         now=now,
                         max_agent_queue=self.max_agent_queue,
                         max_global_queue=self.max_global_queue,
+                        max_account_queue=self.max_account_queue,
+                        max_account_agent_queue=self.max_account_agent_queue,
                     )
                     existing = self._fetch_task_tx(conn, task_id)
                     return InboundAcceptance(
@@ -13458,13 +17786,25 @@ class SQLiteStore:
             )
             if existing is not None:
                 existing_task = await self.get_task_by_inbound(existing.message_id)
+                existing_steering = await self.get_task_steering_by_inbound(
+                    existing.message_id
+                )
+                if existing_task is None and existing_steering is not None:
+                    existing_task = await self.get_task(
+                        existing_steering.promoted_task_id
+                        or existing_steering.target_task_id
+                    )
                 # A durable inbound row is not proof that the requested task
                 # projection committed.  In the store-then-create recovery
                 # path, an unrelated task constraint (for example a reused
                 # task_id) can fail after the existing inbound was found.  Do
                 # not acknowledge that failure as a harmless duplicate and
                 # strand the message permanently in ``stored``.
-                if create_task and existing_task is None:
+                if (
+                    create_task
+                    and existing_task is None
+                    and existing_steering is None
+                ):
                     raise StoreError(str(exc)) from exc
                 confirmation_ids = await self._call(
                     lambda conn: tuple(
@@ -13483,6 +17823,7 @@ class SQLiteStore:
                     created=False,
                     duplicate=True,
                     confirmation_ids=confirmation_ids,
+                    steering=existing_steering,
                 )
             raise StoreError(str(exc)) from exc
 
@@ -13618,6 +17959,445 @@ class SQLiteStore:
         )
 
     get_task_execution = get_execution
+
+    async def get_task_steering(
+        self, steering_id: str
+    ) -> TaskSteeringRecord | None:
+        return await self._call(
+            lambda conn: self._task_steering_from_row(
+                conn.execute(
+                    "SELECT * FROM task_steering WHERE steering_id=?",
+                    (str(steering_id),),
+                ).fetchone()
+            )
+        )
+
+    async def get_task_steering_by_inbound(
+        self, inbound_message_id: str
+    ) -> TaskSteeringRecord | None:
+        return await self._call(
+            lambda conn: self._task_steering_from_row(
+                conn.execute(
+                    "SELECT * FROM task_steering WHERE inbound_message_id=?",
+                    (str(inbound_message_id),),
+                ).fetchone()
+            )
+        )
+
+    async def list_pending_task_steering(
+        self,
+        *,
+        task_id: str | None = None,
+        execution_id: str | None = None,
+        limit: int = 100,
+    ) -> list[TaskSteeringRecord]:
+        filters = ["state='pending'"]
+        params: list[Any] = []
+        if task_id is not None:
+            filters.append("target_task_id=?")
+            params.append(str(task_id))
+        if execution_id is not None:
+            filters.append("target_execution_id=?")
+            params.append(str(execution_id))
+        params.append(max(0, int(limit)))
+
+        def op(conn: sqlite3.Connection) -> list[TaskSteeringRecord]:
+            rows = conn.execute(
+                "SELECT * FROM task_steering WHERE "
+                + " AND ".join(filters)
+                + " ORDER BY target_execution_id,sequence,steering_id LIMIT ?",
+                params,
+            ).fetchall()
+            return [
+                item
+                for row in rows
+                if (item := self._task_steering_from_row(row)) is not None
+            ]
+
+        return await self._call(op)
+
+    async def claim_next_task_steering(
+        self,
+        task_id: str,
+        execution_id: str,
+        *,
+        task_claim_token: str,
+        claimed_by: str,
+        lease_seconds: float = 60.0,
+        now: datetime | str | None = None,
+    ) -> TaskSteeringClaim | None:
+        """Claim the next FIFO steer under the exact live execution lease."""
+
+        worker = str(claimed_by or "").strip()
+        owner_token = str(task_claim_token or "").strip()
+        try:
+            lease_value = float(lease_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("lease_seconds must be a finite positive number") from exc
+        if not worker or not owner_token:
+            raise ValueError("task steering claim identity is required")
+        if not math.isfinite(lease_value) or lease_value <= 0:
+            raise ValueError("lease_seconds must be a finite positive number")
+        now_text = self._now(now)
+        now_value = text_to_datetime(now_text)
+        assert now_value is not None
+        lease_expires_at = _utc_text(now_value + timedelta(seconds=lease_value))
+
+        def op(conn: sqlite3.Connection) -> TaskSteeringClaim | None:
+            with _transaction(conn):
+                # An expired delivery lease cannot prove whether runner input
+                # crossed the IPC boundary.  Fence it as uncertain forever;
+                # never make it claimable again.
+                conn.execute(
+                    """UPDATE task_steering
+                          SET state='delivery_unknown',claimed_by=NULL,
+                              claim_token=NULL,lease_expires_at=NULL,updated_at=?
+                        WHERE target_task_id=? AND target_execution_id=?
+                          AND state='delivering' AND lease_expires_at<=?""",
+                    (now_text, str(task_id), str(execution_id), now_text),
+                )
+                owner = conn.execute(
+                    """SELECT t.state AS task_state,t.claimed_by AS task_worker,
+                              t.claim_token AS task_token,
+                              t.lease_expires_at AS task_lease,
+                              e.state AS execution_state,
+                              e.worker_id AS execution_worker,
+                              e.claim_token AS execution_token,
+                              e.lease_expires_at AS execution_lease,
+                              e.finished_at
+                         FROM tasks AS t
+                         JOIN task_executions AS e
+                           ON e.execution_id=t.current_execution_id
+                          AND e.task_id=t.task_id
+                        WHERE t.task_id=? AND e.execution_id=?""",
+                    (str(task_id), str(execution_id)),
+                ).fetchone()
+                if owner is None:
+                    return None
+                if (
+                    str(owner["task_state"]) not in {"dispatching", "running"}
+                    or str(owner["execution_state"])
+                    not in {"dispatching", "running"}
+                    or owner["finished_at"] is not None
+                    or str(owner["task_worker"] or "") != worker
+                    or str(owner["execution_worker"] or "") != worker
+                    or str(owner["task_token"] or "") != owner_token
+                    or str(owner["execution_token"] or "") != owner_token
+                    or not self._lease_is_active(owner["task_lease"], now_text)
+                    or not self._lease_is_active(
+                        owner["execution_lease"], now_text
+                    )
+                ):
+                    return None
+                head = conn.execute(
+                    """SELECT * FROM task_steering
+                        WHERE target_task_id=? AND target_execution_id=?
+                          AND state IN
+                              ('pending','delivering','delivery_unknown')
+                        ORDER BY sequence,steering_id LIMIT 1""",
+                    (str(task_id), str(execution_id)),
+                ).fetchone()
+                if head is None or str(head["state"]) != "pending":
+                    return None
+                delivery_token = _uuid()
+                changed = conn.execute(
+                    """UPDATE task_steering
+                          SET state='delivering',claimed_by=?,claim_token=?,
+                              lease_expires_at=?,updated_at=?
+                        WHERE steering_id=? AND state='pending'""",
+                    (
+                        worker,
+                        delivery_token,
+                        lease_expires_at,
+                        now_text,
+                        head["steering_id"],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    return None
+                claimed = self._task_steering_from_row(
+                    conn.execute(
+                        "SELECT * FROM task_steering WHERE steering_id=?",
+                        (head["steering_id"],),
+                    ).fetchone()
+                )
+                if claimed is None:
+                    raise StoreError("claimed task steering disappeared")
+                return TaskSteeringClaim(claimed, delivery_token)
+
+        return await self._call(op)
+
+    async def mark_task_steering_applied(
+        self,
+        steering_id: str,
+        *,
+        claim_token: str,
+        now: datetime | str | None = None,
+    ) -> TaskSteeringRecord:
+        """Commit a positive runner acknowledgement exactly once."""
+
+        token = str(claim_token or "")
+        if not token:
+            raise ValueError("task steering claim token is required")
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> TaskSteeringRecord:
+            with _transaction(conn):
+                row = conn.execute(
+                    "SELECT * FROM task_steering WHERE steering_id=?",
+                    (str(steering_id),),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"task steering not found: {steering_id}")
+                if str(row["state"]) == "applied":
+                    result = self._task_steering_from_row(row)
+                    assert result is not None
+                    return result
+                changed = conn.execute(
+                    """UPDATE task_steering
+                          SET state='applied',applied_at=?,updated_at=?,
+                              claimed_by=NULL,claim_token=NULL,
+                              lease_expires_at=NULL
+                        WHERE steering_id=? AND state='delivering'
+                          AND claim_token=?""",
+                    (now_text, now_text, str(steering_id), token),
+                ).rowcount
+                if changed != 1:
+                    raise InvalidTransition(
+                        "task steering acknowledgement lost its claim fence"
+                    )
+                result = self._task_steering_from_row(
+                    conn.execute(
+                        "SELECT * FROM task_steering WHERE steering_id=?",
+                        (str(steering_id),),
+                    ).fetchone()
+                )
+                if result is None:
+                    raise StoreError("applied task steering disappeared")
+                return result
+
+        return await self._call(op)
+
+    async def release_task_steering(
+        self,
+        steering_id: str,
+        *,
+        claim_token: str,
+        delivery_unknown: bool = False,
+        now: datetime | str | None = None,
+    ) -> TaskSteeringRecord:
+        """Release a proven-unsent claim or permanently fence uncertainty."""
+
+        token = str(claim_token or "")
+        if not token:
+            raise ValueError("task steering claim token is required")
+        now_text = self._now(now)
+        target_state = (
+            TaskSteeringState.DELIVERY_UNKNOWN
+            if delivery_unknown
+            else TaskSteeringState.PENDING
+        )
+
+        def op(conn: sqlite3.Connection) -> TaskSteeringRecord:
+            with _transaction(conn):
+                row = conn.execute(
+                    "SELECT * FROM task_steering WHERE steering_id=?",
+                    (str(steering_id),),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"task steering not found: {steering_id}")
+                if str(row["state"]) == target_state.value:
+                    result = self._task_steering_from_row(row)
+                    assert result is not None
+                    return result
+                changed = conn.execute(
+                    """UPDATE task_steering
+                          SET state=?,claimed_by=NULL,claim_token=NULL,
+                              lease_expires_at=NULL,updated_at=?
+                        WHERE steering_id=? AND state='delivering'
+                          AND claim_token=?""",
+                    (target_state.value, now_text, str(steering_id), token),
+                ).rowcount
+                if changed != 1:
+                    raise InvalidTransition(
+                        "task steering release lost its claim fence"
+                    )
+                if target_state is TaskSteeringState.PENDING:
+                    self._recover_task_steering_tx(
+                        conn,
+                        now=now_text,
+                        process_boundary=False,
+                        max_agent_queue=self.max_agent_queue,
+                        max_global_queue=self.max_global_queue,
+                        max_account_queue=self.max_account_queue,
+                        max_account_agent_queue=self.max_account_agent_queue,
+                    )
+                result = self._task_steering_from_row(
+                    conn.execute(
+                        "SELECT * FROM task_steering WHERE steering_id=?",
+                        (str(steering_id),),
+                    ).fetchone()
+                )
+                if result is None:
+                    raise StoreError("released task steering disappeared")
+                return result
+
+        return await self._call(op)
+
+    async def promote_task_steering(
+        self,
+        steering_id: str,
+        *,
+        claim_token: str | None = None,
+        now: datetime | str | None = None,
+    ) -> InboundAcceptance:
+        """Promote a pending head iff its exact target execution has ended."""
+
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> InboundAcceptance:
+            with _transaction(conn):
+                row = conn.execute(
+                    "SELECT * FROM task_steering WHERE steering_id=?",
+                    (str(steering_id),),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"task steering not found: {steering_id}")
+                if claim_token is not None and row["claim_token"] not in {
+                    None,
+                    str(claim_token),
+                }:
+                    raise InvalidTransition("task steering claim token does not match")
+                current = self._task_steering_from_row(row)
+                assert current is not None
+                linked_task_id = str(
+                    current.promoted_task_id or current.target_task_id
+                )
+                linked_task = self._fetch_task_tx(conn, linked_task_id)
+                inbound_row = conn.execute(
+                    "SELECT * FROM inbound_messages WHERE message_id=?",
+                    (current.inbound_message_id,),
+                ).fetchone()
+                if linked_task is None or inbound_row is None:
+                    raise StoreError("task steering promotion ownership is missing")
+                if current.state is not TaskSteeringState.PENDING:
+                    return InboundAcceptance(
+                        self._inbound_from_row(inbound_row),
+                        linked_task,
+                        created=False,
+                        duplicate=False,
+                        steering=current,
+                    )
+                head = conn.execute(
+                    """SELECT steering_id,state FROM task_steering
+                        WHERE target_task_id=? AND target_execution_id=?
+                          AND state IN ('pending','delivering')
+                        ORDER BY sequence,steering_id LIMIT 1""",
+                    (current.target_task_id, current.target_execution_id),
+                ).fetchone()
+                if (
+                    head is None
+                    or str(head["steering_id"]) != current.steering_id
+                    or str(head["state"]) != "pending"
+                ):
+                    return InboundAcceptance(
+                        self._inbound_from_row(inbound_row),
+                        linked_task,
+                        created=False,
+                        duplicate=False,
+                        steering=current,
+                    )
+                owner = conn.execute(
+                    """SELECT t.state AS task_state,e.state AS execution_state,
+                              e.finished_at
+                         FROM tasks AS t
+                         JOIN task_executions AS e
+                           ON e.execution_id=? AND e.task_id=t.task_id
+                        WHERE t.task_id=?""",
+                    (current.target_execution_id, current.target_task_id),
+                ).fetchone()
+                if owner is None:
+                    raise StoreError("task steering target execution is missing")
+                if (
+                    str(owner["task_state"])
+                    in {"queued", "dispatching", "running", "cancel_requested"}
+                    or str(owner["execution_state"])
+                    in {"queued", "dispatching", "running", "cancel_requested"}
+                    or owner["finished_at"] is None
+                ):
+                    return InboundAcceptance(
+                        self._inbound_from_row(inbound_row),
+                        linked_task,
+                        created=False,
+                        duplicate=False,
+                        steering=current,
+                    )
+                promoted = self._promote_pending_steering_for_execution_tx(
+                    conn,
+                    task_id=current.target_task_id,
+                    execution_id=current.target_execution_id,
+                    now=now_text,
+                    max_agent_queue=self.max_agent_queue,
+                    max_global_queue=self.max_global_queue,
+                    max_account_queue=self.max_account_queue,
+                    max_account_agent_queue=self.max_account_agent_queue,
+                )
+                if promoted is None:
+                    refreshed = self._task_steering_from_row(
+                        conn.execute(
+                            "SELECT * FROM task_steering WHERE steering_id=?",
+                            (current.steering_id,),
+                        ).fetchone()
+                    )
+                    assert refreshed is not None
+                    return InboundAcceptance(
+                        self._inbound_from_row(inbound_row),
+                        linked_task,
+                        created=False,
+                        duplicate=False,
+                        steering=refreshed,
+                    )
+                promoted_record, fallback = promoted
+                promoted_inbound = conn.execute(
+                    "SELECT * FROM inbound_messages WHERE message_id=?",
+                    (promoted_record.inbound_message_id,),
+                ).fetchone()
+                assert promoted_inbound is not None
+                return InboundAcceptance(
+                    self._inbound_from_row(promoted_inbound),
+                    fallback,
+                    created=True,
+                    duplicate=False,
+                    steering=promoted_record,
+                )
+
+        return await self._call(op)
+
+    async def recover_task_steering(
+        self,
+        *,
+        now: datetime | str | None = None,
+        process_boundary: bool = False,
+        limit: int = 100,
+    ) -> int:
+        """Recover expired delivery claims and terminal-target fallbacks."""
+
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> int:
+            with _transaction(conn):
+                return self._recover_task_steering_tx(
+                    conn,
+                    now=now_text,
+                    process_boundary=bool(process_boundary),
+                    max_agent_queue=self.max_agent_queue,
+                    max_global_queue=self.max_global_queue,
+                    max_account_queue=self.max_account_queue,
+                    max_account_agent_queue=self.max_account_agent_queue,
+                    limit=limit,
+                )
+
+        return await self._call(op)
 
     async def get_agent_invocation(
         self, invocation_id: str
@@ -13769,6 +18549,123 @@ class SQLiteStore:
                     "WHERE singleton=1"
                 ).fetchone()
             )
+        )
+
+    async def get_account_admission_counter(
+        self,
+        channel: str,
+        bot_id: str,
+    ) -> AccountAdmissionCounterRecord | None:
+        """Read the global unfinished debit for one exact channel account."""
+
+        account = (
+            self._required_store_identity(channel, "channel"),
+            self._required_store_identity(bot_id, "bot_id"),
+        )
+        return await self._call(
+            lambda conn: self._account_admission_counter_from_row(
+                conn.execute(
+                    "SELECT * FROM account_admission_counters "
+                    "WHERE channel=? AND bot_id=?",
+                    account,
+                ).fetchone()
+            )
+        )
+
+    async def list_account_admission_counters(
+        self,
+        *,
+        channel: str | None = None,
+    ) -> list[AccountAdmissionCounterRecord]:
+        params: tuple[Any, ...] = ()
+        where = ""
+        if channel is not None:
+            where = " WHERE channel=?"
+            params = (self._required_store_identity(channel, "channel"),)
+        return await self._call(
+            lambda conn: [
+                record
+                for row in conn.execute(
+                    "SELECT * FROM account_admission_counters"
+                    + where
+                    + " ORDER BY channel,bot_id",
+                    params,
+                ).fetchall()
+                if (
+                    record := self._account_admission_counter_from_row(row)
+                )
+                is not None
+            ]
+        )
+
+    async def get_agent_account_admission_counter(
+        self,
+        agent_id: str,
+        agent_incarnation: int,
+        channel: str,
+        bot_id: str,
+    ) -> AgentAccountAdmissionCounterRecord | None:
+        scope = (
+            self._process_required_text(agent_id, "agent_id"),
+            self._process_positive_integer(
+                agent_incarnation, "agent_incarnation"
+            ),
+            self._required_store_identity(channel, "channel"),
+            self._required_store_identity(bot_id, "bot_id"),
+        )
+        return await self._call(
+            lambda conn: self._agent_account_admission_counter_from_row(
+                conn.execute(
+                    "SELECT * FROM agent_account_admission_counters "
+                    "WHERE agent_id=? AND agent_incarnation=? "
+                    "AND channel=? AND bot_id=?",
+                    scope,
+                ).fetchone()
+            )
+        )
+
+    async def list_agent_account_admission_counters(
+        self,
+        *,
+        agent_id: str | None = None,
+        agent_incarnation: int | None = None,
+        channel: str | None = None,
+        bot_id: str | None = None,
+    ) -> list[AgentAccountAdmissionCounterRecord]:
+        if agent_incarnation is not None and agent_id is None:
+            raise ValueError("agent_id is required with agent_incarnation")
+        predicates: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("agent_id", agent_id),
+            ("channel", channel),
+            ("bot_id", bot_id),
+        ):
+            if value is not None:
+                predicates.append(f"{column}=?")
+                params.append(self._required_store_identity(value, column))
+        if agent_incarnation is not None:
+            predicates.append("agent_incarnation=?")
+            params.append(
+                self._process_positive_integer(
+                    agent_incarnation, "agent_incarnation"
+                )
+            )
+        where = " WHERE " + " AND ".join(predicates) if predicates else ""
+        return await self._call(
+            lambda conn: [
+                record
+                for row in conn.execute(
+                    "SELECT * FROM agent_account_admission_counters"
+                    + where
+                    + " ORDER BY agent_id,agent_incarnation,channel,bot_id",
+                    params,
+                ).fetchall()
+                if (
+                    record := self._agent_account_admission_counter_from_row(row)
+                )
+                is not None
+            ]
         )
 
     async def get_agent_execution_slot(
@@ -14206,6 +19103,11 @@ class SQLiteStore:
 
                 invocation = conn.execute(
                     """SELECT ai.* FROM agent_invocations AS ai
+                       JOIN agent_account_admission_counters AS fairness
+                         ON fairness.agent_id=ai.agent_id
+                        AND fairness.agent_incarnation=ai.agent_incarnation
+                        AND fairness.channel=ai.account_channel
+                        AND fairness.bot_id=ai.account_bot_id
                        WHERE ai.agent_id=? AND ai.agent_incarnation=?
                          AND ai.state='queued'
                          AND ai.dispatch_backend='child'
@@ -14258,7 +19160,8 @@ class SQLiteStore:
                              )
                            )
                          )
-                       ORDER BY ai.ready_sequence,ai.invocation_id LIMIT 1""",
+                       ORDER BY fairness.last_served_ordinal,
+                                ai.ready_sequence,ai.invocation_id LIMIT 1""",
                     (
                         agent_value,
                         incarnation_value,
@@ -14368,6 +19271,11 @@ class SQLiteStore:
                     ),
                 ).rowcount != 1:
                     raise StoreError("Agent invocation lost its dispatch fence")
+                self._mark_invocation_account_served_tx(
+                    conn,
+                    invocation,
+                    now=created_text,
+                )
                 if conn.execute(
                     """UPDATE agent_processes SET observed_state='busy'
                        WHERE agent_id=? AND agent_incarnation=?
@@ -15354,6 +20262,7 @@ class SQLiteStore:
         state: TaskState | str | None = None,
         agent_id: str | None = None,
         conversation_id: str | None = None,
+        conversation_ids: Iterable[str] | None = None,
         external_user_id: str | None = None,
         channel: str | None = None,
         bot_id: str | None = None,
@@ -15376,9 +20285,40 @@ class SQLiteStore:
                 return []
             filters.append("t.state IN (" + ",".join("?" for _ in state_values) + ")")
             params.extend(state_values)
+        # A candidate set is authoritative when supplied.  TaskManager uses it
+        # to retain exact-account visibility of immutable pre-adoption local
+        # rows alongside the selected principal anchor.  All ordinary account,
+        # session, and Agent predicates below remain in the same SQL query, so
+        # an anchor shared with another channel can never expose that channel's
+        # task IDs.
+        normalized_conversations: tuple[str, ...] | None = None
+        if conversation_ids is not None:
+            raw_conversations: Iterable[Any]
+            if isinstance(conversation_ids, (str, bytes, bytearray)):
+                raw_conversations = (conversation_ids,)
+            else:
+                raw_conversations = conversation_ids
+            normalized_conversations = tuple(
+                dict.fromkeys(
+                    str(value)
+                    for value in raw_conversations
+                    if str(value or "")
+                )
+            )
+            if not normalized_conversations:
+                return []
+            filters.append(
+                "t.conversation_id IN ("
+                + ",".join("?" for _ in normalized_conversations)
+                + ")"
+            )
+            params.extend(normalized_conversations)
         for column, value in (
             ("t.agent_id", agent_id),
-            ("t.conversation_id", conversation_id),
+            (
+                "t.conversation_id",
+                conversation_id if normalized_conversations is None else None,
+            ),
             ("t.external_user_id", external_user_id),
             ("t.channel", channel),
             ("t.bot_id", bot_id),
@@ -15427,7 +20367,7 @@ class SQLiteStore:
 
     @staticmethod
     def _unified_invocation_claim_guard(candidate_alias: str = "ai") -> str:
-        """SQL guard for one active invocation and per-Agent ready FIFO.
+        """SQL guard for one active invocation and account-aware ready FIFO.
 
         The compatibility task and mailbox loops are separate coroutines, so
         source-table ordering alone cannot serialize them.  Both claim paths
@@ -15435,8 +20375,11 @@ class SQLiteStore:
         transaction.  A delayed invocation or a task whose managed inputs are
         not ready is not runnable and therefore does not block later work.
 
-        The returned fragment contains one positional parameter: the current
-        durable timestamp used for the earlier invocation's retry deadline.
+        The returned fragment contains five positional parameters, all the
+        current durable timestamp.  Besides preserving FIFO inside the
+        candidate's account stream, it prevents the compatibility task and
+        mailbox loops from each skipping a runnable invocation owned by the
+        account that is next in the Agent's durable round-robin order.
         """
 
         alias = str(candidate_alias)
@@ -15455,6 +20398,8 @@ class SQLiteStore:
                 SELECT 1 FROM agent_invocations AS earlier
                  WHERE earlier.agent_id={alias}.agent_id
                    AND earlier.agent_incarnation={alias}.agent_incarnation
+                   AND earlier.account_channel={alias}.account_channel
+                   AND earlier.account_bot_id={alias}.account_bot_id
                    AND earlier.ready_sequence<{alias}.ready_sequence
                    AND earlier.state='queued'
                    AND earlier.dispatch_backend='compatibility'
@@ -15507,7 +20452,140 @@ class SQLiteStore:
                        )
                    )
             )
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM agent_invocations AS competitor
+                  JOIN agent_account_admission_counters AS competitor_fairness
+                    ON competitor_fairness.agent_id=competitor.agent_id
+                   AND competitor_fairness.agent_incarnation=
+                       competitor.agent_incarnation
+                   AND competitor_fairness.channel=competitor.account_channel
+                   AND competitor_fairness.bot_id=competitor.account_bot_id
+                  JOIN agent_account_admission_counters AS candidate_fairness
+                    ON candidate_fairness.agent_id={alias}.agent_id
+                   AND candidate_fairness.agent_incarnation=
+                       {alias}.agent_incarnation
+                   AND candidate_fairness.channel={alias}.account_channel
+                   AND candidate_fairness.bot_id={alias}.account_bot_id
+                 WHERE competitor.agent_id={alias}.agent_id
+                   AND competitor.agent_incarnation={alias}.agent_incarnation
+                   AND competitor.invocation_id<>{alias}.invocation_id
+                   AND competitor.state='queued'
+                   AND competitor.dispatch_backend='compatibility'
+                   AND (competitor.next_attempt_at IS NULL
+                        OR competitor.next_attempt_at<=?)
+                   AND (
+                       (
+                           competitor.work_kind='task'
+                           AND EXISTS (
+                               SELECT 1
+                                 FROM tasks AS competitor_task
+                                WHERE competitor_task.task_id=
+                                      competitor.task_id
+                                  AND competitor_task.current_execution_id=
+                                      competitor.invocation_id
+                                  AND competitor_task.agent_id=
+                                      competitor.agent_id
+                                  AND competitor_task.agent_incarnation=
+                                      competitor.agent_incarnation
+                                  AND competitor_task.state='queued'
+                                  AND (competitor_task.next_attempt_at IS NULL
+                                       OR competitor_task.next_attempt_at<=?)
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                        FROM attachment_refs AS competitor_ref
+                                        LEFT JOIN attachments AS competitor_attachment
+                                          ON competitor_attachment.attachment_id=
+                                             competitor_ref.attachment_id
+                                       WHERE competitor_ref.owner_kind='task'
+                                         AND competitor_ref.owner_id=
+                                             competitor_task.task_id
+                                         AND (
+                                             competitor_attachment.attachment_id
+                                                 IS NULL
+                                             OR competitor_attachment.state<>'ready'
+                                         )
+                                  )
+                           )
+                       )
+                       OR (
+                           competitor.work_kind='mailbox'
+                           AND EXISTS (
+                               SELECT 1
+                                 FROM agent_mailbox AS competitor_mailbox
+                                WHERE competitor_mailbox.mailbox_id=
+                                      competitor.mailbox_id
+                                  AND competitor_mailbox.current_invocation_id=
+                                      competitor.invocation_id
+                                  AND competitor_mailbox.message_id=
+                                      competitor.work_id
+                                  AND competitor_mailbox.destination_agent_id=
+                                      competitor.agent_id
+                                  AND competitor_mailbox.destination_agent_incarnation=
+                                      competitor.agent_incarnation
+                                  AND competitor_mailbox.state='pending'
+                                  AND competitor_mailbox.expires_at>?
+                                  AND competitor.expires_at=
+                                      competitor_mailbox.expires_at
+                                  AND (competitor_mailbox.next_attempt_at IS NULL
+                                       OR competitor_mailbox.next_attempt_at<=?)
+                           )
+                       )
+                   )
+                   AND (
+                       competitor_fairness.last_served_ordinal<
+                           candidate_fairness.last_served_ordinal
+                       OR (
+                           competitor_fairness.last_served_ordinal=
+                               candidate_fairness.last_served_ordinal
+                           AND (
+                               competitor.ready_sequence<
+                                   {alias}.ready_sequence
+                               OR (
+                                   competitor.ready_sequence=
+                                       {alias}.ready_sequence
+                                   AND competitor.invocation_id<
+                                       {alias}.invocation_id
+                               )
+                           )
+                       )
+                   )
+            )
         """
+
+    @classmethod
+    def _mark_invocation_account_served_tx(
+        cls,
+        conn: sqlite3.Connection,
+        invocation: sqlite3.Row,
+        *,
+        now: str,
+    ) -> None:
+        """Advance one stream to the back of its Agent's durable RR queue."""
+
+        changed = conn.execute(
+            """UPDATE agent_account_admission_counters
+                  SET last_served_ordinal=(
+                          SELECT COALESCE(MAX(peer.last_served_ordinal), 0) + 1
+                            FROM agent_account_admission_counters AS peer
+                           WHERE peer.agent_id=?
+                             AND peer.agent_incarnation=?
+                      ),
+                      updated_at=?
+                WHERE agent_id=? AND agent_incarnation=?
+                  AND channel=? AND bot_id=? AND unfinished_count>0""",
+            (
+                invocation["agent_id"],
+                invocation["agent_incarnation"],
+                now,
+                invocation["agent_id"],
+                invocation["agent_incarnation"],
+                invocation["account_channel"],
+                invocation["account_bot_id"],
+            ),
+        ).rowcount
+        if changed != 1:
+            raise StoreError("Agent-account fairness counter is unavailable")
 
     @classmethod
     def _claim_selected_task_tx(
@@ -15571,7 +20649,7 @@ class SQLiteStore:
             "SELECT 1 FROM agent_invocations AS ai "
             "WHERE ai.invocation_id=? AND "
             + cls._unified_invocation_claim_guard("ai"),
-            (execution_id, now),
+            (execution_id, now, now, now, now, now),
         ).fetchone()
         if claimable is None:
             return None
@@ -15632,6 +20710,11 @@ class SQLiteStore:
         ).rowcount
         if execution_changed != 1 or invocation_changed != 1:
             raise StoreError("task dispatch projection could not be claimed")
+        cls._mark_invocation_account_served_tx(
+            conn,
+            invocation_row,
+            now=now,
+        )
         task = cls._fetch_task_tx(conn, task_id)
         execution = cls._execution_from_row(
             conn.execute("SELECT * FROM task_executions WHERE execution_id = ?", (execution_id,)).fetchone()
@@ -15702,7 +20785,7 @@ class SQLiteStore:
                     )"""
                 )
                 filters.append(self._unified_invocation_claim_guard("ai"))
-                params.append(now_text)
+                params.extend((now_text,) * 5)
                 row = conn.execute(
                     """SELECT t.* FROM tasks AS t
                        JOIN agent_invocations AS ai
@@ -15710,9 +20793,15 @@ class SQLiteStore:
                        JOIN agent_lifecycle AS lifecycle
                          ON lifecycle.agent_id=t.agent_id
                         AND lifecycle.agent_incarnation=t.agent_incarnation
+                       JOIN agent_account_admission_counters AS fairness
+                         ON fairness.agent_id=ai.agent_id
+                        AND fairness.agent_incarnation=ai.agent_incarnation
+                        AND fairness.channel=ai.account_channel
+                        AND fairness.bot_id=ai.account_bot_id
                        WHERE """
                     + " AND ".join(filters)
-                    + " ORDER BY ai.created_at ASC, ai.ready_sequence ASC, "
+                    + " ORDER BY fairness.last_served_ordinal ASC, "
+                      "ai.ready_sequence ASC, "
                       "t.task_id ASC LIMIT 1",
                     params,
                 ).fetchone()
@@ -15802,7 +20891,7 @@ class SQLiteStore:
                     )"""
                 )
                 filters.append(self._unified_invocation_claim_guard("ai"))
-                params.append(now_text)
+                params.extend((now_text,) * 5)
                 row = conn.execute(
                     """SELECT t.* FROM tasks AS t
                        JOIN agent_invocations AS ai
@@ -16312,6 +21401,8 @@ class SQLiteStore:
                         now=now_text,
                         max_agent_queue=self.max_agent_queue,
                         max_global_queue=self.max_global_queue,
+                        max_account_queue=self.max_account_queue,
+                        max_account_agent_queue=self.max_account_agent_queue,
                     )
                     return True
                 # Active state transitions are execution-owned.  Keep the
@@ -16463,6 +21554,8 @@ class SQLiteStore:
                         allow_compatibility_final=user_visible,
                         max_agent_queue=self.max_agent_queue,
                         max_global_queue=self.max_global_queue,
+                        max_account_queue=self.max_account_queue,
+                        max_account_agent_queue=self.max_account_agent_queue,
                         reply_aggregation_max_age_seconds=(
                             self.reply_aggregation_max_age_seconds
                         ),
@@ -17152,6 +22245,7 @@ class SQLiteStore:
                 else None
             ),
             client_id=(str(parent["client_id"] or "") if parent is not None else ""),
+            content=(str(parent["content"] or "") if parent is not None else ""),
             contextless_client_id=(
                 parent["contextless_client_id"] if parent is not None else None
             ),
@@ -17170,6 +22264,33 @@ class SQLiteStore:
                 json_loads(parent["reply_target_json"], {}) or {}
                 if parent is not None
                 else {}
+            ),
+            delivery_address=(
+                DeliveryAddress.from_value(
+                    json_loads(parent["delivery_address_json"], None)
+                )
+                if parent is not None
+                and "delivery_address_json" in parent.keys()
+                else None
+            ),
+            transport_metadata=(
+                json_loads(parent["transport_metadata_json"], {}) or {}
+                if parent is not None
+                and "transport_metadata_json" in parent.keys()
+                else {}
+            ),
+            outbox_claim_token=(
+                parent["claim_token"] if parent is not None else None
+            ),
+            outbox_lease_expires_at=(
+                text_to_datetime(parent["lease_expires_at"])
+                if parent is not None
+                else None
+            ),
+            outbox_state=(
+                OutboxState(str(parent["state"]))
+                if parent is not None
+                else None
             ),
         )
 
@@ -18382,6 +23503,8 @@ class SQLiteStore:
         allow_compatibility_final: bool = False,
         max_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
         max_global_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+        max_account_queue: int = DEFAULT_MAX_GLOBAL_AGENT_QUEUE,
+        max_account_agent_queue: int = DEFAULT_MAX_AGENT_QUEUE,
         reply_aggregation_max_age_seconds: float = (
             DEFAULT_REPLY_AGGREGATION_MAX_AGE_SECONDS
         ),
@@ -18546,6 +23669,8 @@ class SQLiteStore:
                 now=mailbox_created_at,
                 max_agent_queue=max_agent_queue,
                 max_global_queue=max_global_queue,
+                max_account_queue=max_account_queue,
+                max_account_agent_queue=max_account_agent_queue,
             )
             # Keep managed attachments alive for the mailbox lifetime.  The
             # event payload still retains unknown/channel-only references, but
@@ -18579,9 +23704,18 @@ class SQLiteStore:
         route = conn.execute(
             """SELECT active_agent_id FROM routes WHERE channel = ? AND bot_id = ?
                AND external_user_id = ? AND session_id = ?""",
-            (target.channel, target.bot_id, target.external_user_id, target.session_id),
+            (target.channel, target.bot_id, owner["external_user_id"], target.session_id),
         ).fetchone()
         metadata = task.metadata if isinstance(task.metadata, Mapping) else {}
+        # Scheduled turns have no contemporaneous inbound row, but their
+        # authenticated cron firing is an explicit request for a future
+        # result.  Use the immutable firing relationship rather than mutable
+        # metadata to grant proactive delivery.  Keep ``foreground`` false:
+        # this is a push result, not an interactive reply to a live message.
+        cron_result = conn.execute(
+            "SELECT 1 FROM cron_firings WHERE task_id=? LIMIT 1",
+            (str(task.task_id),),
+        ).fetchone() is not None
         raw_content = str(event.content or "")
         sender_format = "none-v1"
         sender_prefix = ""
@@ -18628,6 +23762,8 @@ class SQLiteStore:
             # audit/inbox event, however, and must not become an automatic
             # channel send merely because it came from the foreground.
             notify_enabled = event.priority > EventPriority.SILENT
+        elif cron_result:
+            notify_enabled = event.priority > EventPriority.SILENT
         elif notify_enabled is None:
             pref = conn.execute(
                 """SELECT notify_enabled FROM notification_preferences
@@ -18636,7 +23772,7 @@ class SQLiteStore:
                 (
                     target.channel,
                     target.bot_id,
-                    target.external_user_id,
+                    owner["external_user_id"],
                     target.session_id,
                     task.agent_id,
                 ),
@@ -18656,7 +23792,10 @@ class SQLiteStore:
             ).fetchone()
             if execution_scope_row is not None:
                 execution_scope = execution_scope_row["delivery_reply_scope_id"]
-        resolved_scope = (
+        # Reply scopes, ten-slot allocation, and 3,000-character aggregation
+        # are the WeChat/iLink projection.  Peer channels persist an ordinary
+        # exact-account outbox row and never consume that allowance.
+        resolved_scope = None if str(target.channel).lower() != "wechat" else (
             conn.execute(
                 "SELECT * FROM reply_scopes WHERE reply_scope_id=?",
                 (execution_scope,),
@@ -18891,8 +24030,33 @@ class SQLiteStore:
                 preserve_existing_delivery_snapshot=True,
             )
             return
-        outbox_id = _uuid()
-        client_id = str(uuid.uuid4())
+        if str(target.channel).lower() == "wechat":
+            outbox_id = _uuid()
+            client_id = str(uuid.uuid4())
+        else:
+            outbox_id = compound_id(
+                "account-outbox", (target.channel, target.bot_id, event.event_id)
+            )
+            client_id = str(
+                uuid.uuid5(uuid.NAMESPACE_URL, "codex-account-outbox:" + outbox_id)
+            )
+        address = DeliveryAddress(
+            channel=str(target.channel),
+            bot_id=str(target.bot_id),
+            destination_kind=str(target.destination_kind or "direct"),
+            destination_id=str(target.destination_id or target.external_user_id),
+            session_id=str(target.session_id or "default"),
+            source_message_id=target.source_message_id,
+            thread_id=str(target.thread_id or "") or None,
+            root_message_id=str(
+                target.root_message_id
+                or target.transport_metadata.get("root_id")
+                or ""
+                if isinstance(target.transport_metadata, Mapping)
+                else target.root_message_id or ""
+            ) or None,
+            transport_metadata=dict(target.transport_metadata or {}),
+        )
         conn.execute(
             """INSERT OR IGNORE INTO user_outbox
                (outbox_id, event_id, task_id, channel, bot_id,
@@ -18900,9 +24064,10 @@ class SQLiteStore:
                 source_sequence, context_token, reply_target_json, content,
                 attachments_json, priority, delivery_mode, notify_enabled, foreground,
                 state, presentation, client_id, attempts, created_at,
-                from_user_id)
+                from_user_id, transport_idempotency_key, sender_json,
+                delivery_address_json, transport_metadata_json)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       'pending', 'unseen', ?, 0, ?, ?)""",
+                       'pending', 'unseen', ?, 0, ?, ?, ?, ?, ?, ?)""",
             (
                 outbox_id,
                 event.event_id,
@@ -18925,6 +24090,10 @@ class SQLiteStore:
                 client_id,
                 _utc_text(event.created_at),
                 target.bot_id,
+                client_id,
+                json_dumps({"channel": target.channel, "bot_id": target.bot_id}),
+                json_dumps(address.to_dict()),
+                json_dumps(dict(target.transport_metadata or {})),
             ),
         )
         # Attachment IDs remain on the immutable event/outbox snapshots for
@@ -19251,6 +24420,8 @@ class SQLiteStore:
                         task=task,
                         max_agent_queue=self.max_agent_queue,
                         max_global_queue=self.max_global_queue,
+                        max_account_queue=self.max_account_queue,
+                        max_account_agent_queue=self.max_account_agent_queue,
                         reply_aggregation_max_age_seconds=(
                             self.reply_aggregation_max_age_seconds
                         ),
@@ -19741,6 +24912,8 @@ class SQLiteStore:
                         ),
                         max_agent_queue=self.max_agent_queue,
                         max_global_queue=self.max_global_queue,
+                        max_account_queue=self.max_account_queue,
+                        max_account_agent_queue=self.max_account_agent_queue,
                         reply_aggregation_max_age_seconds=(
                             self.reply_aggregation_max_age_seconds
                         ),
@@ -19824,6 +24997,21 @@ class SQLiteStore:
                         raise StoreError(
                             "task completion invocation was already released"
                         )
+                # Finish fencing and fallback publication share this
+                # transaction.  A pending follow-up accepted just before the
+                # terminal write therefore becomes either runner-applied or
+                # exactly one queued fallback; it cannot disappear between
+                # those outcomes.  Admission failure is isolated by a
+                # savepoint and remains durably pending for later recovery.
+                self._recover_task_steering_tx(
+                    conn,
+                    now=now_text,
+                    process_boundary=False,
+                    max_agent_queue=self.max_agent_queue,
+                    max_global_queue=self.max_global_queue,
+                    max_account_queue=self.max_account_queue,
+                    max_account_agent_queue=self.max_account_agent_queue,
+                )
                 refreshed = self._fetch_task_tx(conn, task_id)
                 if refreshed is None:
                     raise StoreError("completed task disappeared")
@@ -19972,6 +25160,8 @@ class SQLiteStore:
                     now=now_text,
                     max_agent_queue=self.max_agent_queue,
                     max_global_queue=self.max_global_queue,
+                    max_account_queue=self.max_account_queue,
+                    max_account_agent_queue=self.max_account_agent_queue,
                 )
                 return self._fetch_task_tx(conn, task_id)
 
@@ -20023,6 +25213,9 @@ class SQLiteStore:
         command_name: str,
         command_args: Iterable[Any] = (),
         command_text: str = "",
+        principal_id: str | None = None,
+        principal_account_id: str | None = None,
+        conversation_subject_id: str | None = None,
         now: datetime | str | None = None,
     ) -> dict[str, Any]:
         """Reserve one control command for at-most-once effect execution.
@@ -20054,12 +25247,101 @@ class SQLiteStore:
 
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
             with _transaction(conn):
+                inbound_identity_row = conn.execute(
+                    """SELECT principal_id, principal_account_id,
+                              conversation_subject_id, identity_snapshot_json
+                       FROM inbound_messages
+                       WHERE channel=? AND bot_id=? AND external_message_id=?
+                         AND external_user_id=? AND session_id=?""",
+                    (values[0], values[1], values[4], values[2], values[3]),
+                ).fetchone()
+                if inbound_identity_row is not None:
+                    resolved_principal_id = inbound_identity_row["principal_id"]
+                    resolved_account_id = inbound_identity_row["principal_account_id"]
+                    resolved_subject_id = inbound_identity_row[
+                        "conversation_subject_id"
+                    ]
+                    resolved_snapshot = (
+                        json_loads(
+                            inbound_identity_row["identity_snapshot_json"], {}
+                        )
+                        or {}
+                    )
+                    subject_snapshot = (
+                        resolved_snapshot.get("conversation_subject", {})
+                        if isinstance(resolved_snapshot, Mapping)
+                        else {}
+                    )
+                    allowed_subjects = {
+                        str(resolved_subject_id or ""),
+                        str(
+                            subject_snapshot.get("scope_key") or ""
+                            if isinstance(subject_snapshot, Mapping)
+                            else ""
+                        ),
+                    }
+                    for supplied, persisted, label in (
+                        (principal_id, resolved_principal_id, "principal_id"),
+                        (
+                            principal_account_id,
+                            resolved_account_id,
+                            "principal_account_id",
+                        ),
+                    ):
+                        if supplied and str(supplied) != str(persisted or ""):
+                            raise StoreError(
+                                f"command receipt identity conflicts: {command_id} ({label})"
+                            )
+                    if (
+                        conversation_subject_id
+                        and str(conversation_subject_id) not in allowed_subjects
+                    ):
+                        raise StoreError(
+                            f"command receipt identity conflicts: {command_id} "
+                            "(conversation_subject_id)"
+                        )
+                else:
+                    existing_subject = (
+                        conn.execute(
+                            "SELECT subject_kind FROM conversation_subjects "
+                            "WHERE conversation_subject_id=?",
+                            (str(conversation_subject_id),),
+                        ).fetchone()
+                        if conversation_subject_id
+                        else None
+                    )
+                    identity = self._ensure_inbound_identity_tx(
+                        conn,
+                        InboundMessage(
+                            channel=values[0],
+                            bot_id=values[1],
+                            external_user_id=values[2],
+                            external_message_id=values[4],
+                            session_id=values[3],
+                            principal_id=principal_id,
+                            principal_account_id=principal_account_id,
+                            conversation_subject_id=conversation_subject_id,
+                            conversation_subject_kind=(
+                                str(existing_subject["subject_kind"])
+                                if existing_subject is not None
+                                else "direct"
+                            ),
+                        ),
+                        now=now_text,
+                    )
+                    resolved_principal_id = identity["principal_id"]
+                    resolved_account_id = identity["principal_account_id"]
+                    resolved_subject_id = identity["conversation_subject_id"]
+                    resolved_snapshot = identity["identity_snapshot"]
                 inserted = conn.execute(
                     """INSERT OR IGNORE INTO command_receipts
                        (command_id, channel, bot_id, external_user_id,
                         session_id, external_message_id, command_name,
-                        command_args_json, command_text, state, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?)""",
+                        command_args_json, command_text, state, created_at,
+                        actor_external_user_id, principal_id,
+                        principal_account_id, conversation_subject_id,
+                        identity_snapshot_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?, ?)""",
                     (
                         command_id,
                         values[0],
@@ -20071,6 +25353,11 @@ class SQLiteStore:
                         json_dumps(list(values[6])),
                         values[7],
                         now_text,
+                        values[2],
+                        resolved_principal_id,
+                        resolved_account_id,
+                        resolved_subject_id,
+                        json_dumps(resolved_snapshot),
                     ),
                 )
                 row = conn.execute(
@@ -23232,6 +28519,12 @@ class SQLiteStore:
         client_id: str | None = None,
         contextless_client_id: str | None = None,
         from_user_id: str | None = None,
+        transport_idempotency_key: str | None = None,
+        idempotency_key: str | None = None,
+        sender: Mapping[str, Any] | None = None,
+        sender_account: Mapping[str, Any] | None = None,
+        delivery_address: DeliveryAddress | Mapping[str, Any] | None = None,
+        transport_metadata: Mapping[str, Any] | None = None,
         reply_scope_id: str | None = None,
         source_key: str | None = None,
         outbox_id: str | None = None,
@@ -23239,6 +28532,7 @@ class SQLiteStore:
         present_outbox_ids: Iterable[str] | None = None,
         notify_enabled: bool | None = None,
         foreground: bool | None = None,
+        bypass_channel_reply_scope: bool = False,
         now: datetime | str | None = None,
     ) -> UserOutboxItem | ReplyProjectionResult:
         """Persist an explicit user delivery projection.
@@ -23259,7 +28553,8 @@ class SQLiteStore:
                 "priority", "delivery_mode", "client_id", "delivery_id", "outbox_id",
                 "contextless_client_id", "from_user_id", "reply_scope_id", "source_key",
                 "attachments", "notify_enabled",
-                "foreground",
+                "foreground", "transport_idempotency_key", "idempotency_key",
+                "sender", "sender_account", "delivery_address", "transport_metadata",
             ):
                 if hasattr(delivery, name):
                     data[name] = getattr(delivery, name)
@@ -23288,6 +28583,13 @@ class SQLiteStore:
             source_message_id=target.source_message_id,
             source_sequence=target.source_sequence,
             context_token=target.context_token,
+            conversation_subject_id=target.conversation_subject_id,
+            conversation_subject_scope=target.conversation_subject_scope,
+            destination_kind=target.destination_kind,
+            destination_id=target.destination_id,
+            thread_id=target.thread_id,
+            root_message_id=target.root_message_id,
+            transport_metadata=dict(target.transport_metadata),
         )
         # Reject a caller-provided target that disagrees with explicit scope
         # fields before any foreign-key projection is written.
@@ -23299,8 +28601,13 @@ class SQLiteStore:
             session_id=str(session_value or "default"),
         )
         content_value = content if content is not None else data.get("content", data.get("text", ""))
-        if not str(content_value or ""):
-            raise ValueError("user outbox content is empty")
+        attachment_values = tuple(
+            attachments
+            if attachments is not None
+            else data.get("attachments", ()) or ()
+        )
+        if not str(content_value or "") and not attachment_values:
+            raise ValueError("user outbox content and attachments are empty")
         event_value = event_id if event_id is not None else data.get("event_id")
         task_value = task_id if task_id is not None else data.get("task_id")
         # Channel-facing delivery values commonly serialize optional foreign
@@ -23337,6 +28644,15 @@ class SQLiteStore:
         outbox_value = str(outbox_id or data.get("outbox_id") or data.get("delivery_id") or _uuid())
         identity = "\x1f".join((str(channel_value), str(bot_value), str(user_value), str(session_value), outbox_value, str(event_value or ""), str(content_value)))
         client_value = str(client_id or data.get("client_id") or uuid.uuid5(uuid.NAMESPACE_URL, "codex-outbox:" + identity))
+        transport_idempotency_value = str(
+            transport_idempotency_key
+            or idempotency_key
+            or data.get("transport_idempotency_key")
+            or data.get("idempotency_key")
+            or client_value
+        ).strip()
+        if not transport_idempotency_value:
+            raise ValueError("transport idempotency key is required")
         contextless_value = (
             contextless_client_id
             if contextless_client_id is not None
@@ -23354,6 +28670,49 @@ class SQLiteStore:
         )
         if from_user_value != str(target.bot_id or ""):
             raise StoreError("outbox sender identity conflicts with reply target bot")
+        sender_value = dict(
+            sender
+            or sender_account
+            or data.get("sender")
+            or data.get("sender_account")
+            or {"channel": target.channel, "bot_id": from_user_value}
+        )
+        if (
+            str(sender_value.get("channel") or target.channel) != str(target.channel)
+            or str(sender_value.get("bot_id") or from_user_value) != from_user_value
+        ):
+            raise StoreError("outbox sender account conflicts with reply target")
+        transport_metadata_value = dict(
+            transport_metadata
+            if transport_metadata is not None
+            else data.get("transport_metadata")
+            or target.transport_metadata
+            or {}
+        )
+        address_value = DeliveryAddress.from_value(
+            delivery_address
+            if delivery_address is not None
+            else data.get("delivery_address")
+        ) or DeliveryAddress(
+            channel=str(target.channel),
+            bot_id=str(target.bot_id),
+            destination_kind=str(target.destination_kind or "direct"),
+            destination_id=str(target.destination_id or target.external_user_id),
+            session_id=str(target.session_id or "default"),
+            source_message_id=target.source_message_id,
+            thread_id=str(target.thread_id or "") or None,
+            root_message_id=str(
+                target.root_message_id
+                or transport_metadata_value.get("root_id")
+                or ""
+            ) or None,
+            transport_metadata=transport_metadata_value,
+        )
+        if (
+            str(address_value.channel) != str(target.channel)
+            or str(address_value.bot_id) != str(target.bot_id)
+        ):
+            raise StoreError("delivery address conflicts with outbox account")
         scope_value = str(
             reply_scope_id
             if reply_scope_id is not None
@@ -23364,7 +28723,6 @@ class SQLiteStore:
             if source_key is not None
             else data.get("source_key") or f"outbox:{outbox_value}"
         )
-        attachment_values = tuple(attachments if attachments is not None else data.get("attachments", ()) or ())
         presentation_values = tuple(
             dict.fromkeys(str(item) for item in (present_outbox_ids or ()) if item)
         )
@@ -23437,7 +28795,10 @@ class SQLiteStore:
                     external_user_id=target.external_user_id,
                     session_id=target.session_id,
                 )
-                resolved_scope = (
+                resolved_scope = None if (
+                    bypass_channel_reply_scope
+                    or str(target.channel).lower() != "wechat"
+                ) else (
                     conn.execute(
                         "SELECT * FROM reply_scopes WHERE reply_scope_id=?",
                         (scope_value,),
@@ -23532,9 +28893,11 @@ class SQLiteStore:
                         source_sequence, context_token, reply_target_json, content,
                         attachments_json, priority, delivery_mode, notify_enabled,
                         foreground, state, presentation, client_id, attempts, created_at,
-                        from_user_id, contextless_client_id, active_wire_variant)
+                        from_user_id, contextless_client_id, active_wire_variant,
+                        transport_idempotency_key, sender_json,
+                        delivery_address_json, transport_metadata_json)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                               'pending', 'unseen', ?, 0, ?, ?, ?, 'primary')""",
+                               'pending', 'unseen', ?, 0, ?, ?, ?, 'primary', ?, ?, ?, ?)""",
                     (
                         outbox_value, event_value, effective_task_value, target.channel,
                         target.bot_id, target.external_user_id, target.session_id,
@@ -23544,6 +28907,10 @@ class SQLiteStore:
                         int(notify_value), int(foreground_value), client_value, now_text,
                         from_user_value,
                         (str(contextless_value) if contextless_value is not None else None),
+                        transport_idempotency_value,
+                        json_dumps(sender_value),
+                        json_dumps(address_value.to_dict()),
+                        json_dumps(transport_metadata_value),
                     ),
                 )
                 row = conn.execute("SELECT * FROM user_outbox WHERE outbox_id = ?", (outbox_value,)).fetchone()
@@ -23571,6 +28938,7 @@ class SQLiteStore:
                     "priority": priority_value,
                     "delivery_mode": mode_value,
                     "foreground": foreground_value,
+                    "transport_idempotency_key": transport_idempotency_value,
                 }
                 for column, expected in immutable_outbox.items():
                     # ``context_token`` is supplied by the transport and may
@@ -23608,6 +28976,17 @@ class SQLiteStore:
                     list(attachment_values)
                 ):
                     raise StoreError(f"outbox identity conflicts: {outbox_value} (attachments)")
+                for column, expected in (
+                    ("sender_json", sender_value),
+                    ("delivery_address_json", address_value.to_dict()),
+                    ("transport_metadata_json", transport_metadata_value),
+                ):
+                    if self._json_snapshot(
+                        json_loads(row[column], {}) or {}
+                    ) != self._json_snapshot(expected):
+                        raise StoreError(
+                            f"outbox identity conflicts: {outbox_value} ({column})"
+                        )
                 if presentation_values:
                     self._present_projection_ids_tx(
                         conn,
@@ -23657,6 +29036,7 @@ class SQLiteStore:
                     metadata["owner_agent_id"] = durable.agent_id
                     metadata["session_id"] = durable.session_id
                     metadata["context_token"] = durable.reply_target.context_token
+                    metadata["bundle_ordinal"] = ordinal
                     idem = f"outbox:{durable.outbox_id}:attachment:{ordinal}:{attachment_id}"
                     media_id = str(
                         uuid.uuid5(uuid.NAMESPACE_URL, "codex-outgoing-media:" + idem)
@@ -23724,6 +29104,47 @@ class SQLiteStore:
     enqueue_user_outbox = create_user_outbox
     add_user_outbox = create_user_outbox
     create_outbox = create_user_outbox
+
+    async def create_account_outbox(
+        self,
+        delivery: Any = None,
+        *,
+        channel: str,
+        bot_id: str,
+        **kwargs: Any,
+    ) -> UserOutboxItem | ReplyProjectionResult:
+        """Persist one transport-neutral delivery for an exact bot account."""
+
+        channel_value = self._required_store_identity(channel, "channel")
+        bot_value = self._required_store_identity(bot_id, "bot_id")
+        supplied_target: Any = kwargs.get("target")
+        if supplied_target is None:
+            if isinstance(delivery, Mapping):
+                supplied_target = delivery.get("target", delivery.get("reply_target"))
+            elif delivery is not None:
+                supplied_target = getattr(
+                    delivery, "target", getattr(delivery, "reply_target", None)
+                )
+        if supplied_target is not None:
+            target_value = self._coerce_reply_target(supplied_target)
+            if (
+                target_value.channel
+                and str(target_value.channel) != channel_value
+            ) or (
+                target_value.bot_id and str(target_value.bot_id) != bot_value
+            ):
+                raise StoreError("account outbox target conflicts with exact account")
+        kwargs.pop("bypass_channel_reply_scope", None)
+        return await self.create_user_outbox(
+            delivery,
+            channel=channel_value,
+            bot_id=bot_value,
+            bypass_channel_reply_scope=True,
+            **kwargs,
+        )
+
+    enqueue_account_outbox = create_account_outbox
+    create_lark_outbox = create_account_outbox
 
     async def list_outbox(
         self,
@@ -23888,6 +29309,25 @@ class SQLiteStore:
                    AND {outbox}.from_user_id={outbox}.bot_id
             )
         )"""
+
+    async def claim_account_outbox(
+        self,
+        worker_id: str,
+        *,
+        channel: str,
+        bot_id: str,
+        **kwargs: Any,
+    ) -> list[UserOutboxItem]:
+        """Claim only rows belonging to one required transport account."""
+
+        channel_value = self._required_store_identity(channel, "channel")
+        bot_value = self._required_store_identity(bot_id, "bot_id")
+        return await self.claim_outbox(
+            worker_id,
+            channel=channel_value,
+            bot_id=bot_value,
+            **kwargs,
+        )
 
     async def claim_outbox(
         self,
@@ -24245,11 +29685,33 @@ class SQLiteStore:
         claim_token: str | None = None,
         *,
         client_id: str | None = None,
+        remote_delivery_id: str | None = None,
+        transport_receipt: Mapping[str, Any] | None = None,
         now: datetime | str | None = None,
     ) -> bool:
         def op(conn: sqlite3.Connection) -> bool:
             with _transaction(conn):
                 now_text = self._now(now)
+                row = conn.execute(
+                    "SELECT transport_metadata_json,channel,reply_slot_id,"
+                    "attachments_json FROM user_outbox WHERE outbox_id=?",
+                    (outbox_id,),
+                ).fetchone()
+                merged_transport = (
+                    json_loads(row["transport_metadata_json"], {}) or {}
+                    if row is not None
+                    else {}
+                )
+                if transport_receipt:
+                    merged_transport = dict(merged_transport)
+                    merged_transport["receipt"] = {
+                        str(key): value
+                        for key, value in transport_receipt.items()
+                        if not any(
+                            token in str(key).lower()
+                            for token in ("secret", "token", "credential", "authorization")
+                        )
+                    }
                 filters = "outbox_id = ? AND state = 'sending'"
                 params: list[Any] = [outbox_id]
                 if claim_token is not None:
@@ -24269,9 +29731,33 @@ class SQLiteStore:
                         "AND contextless_client_id=?))"
                     )
                     params.extend((client_id, client_id))
+                if (
+                    row is not None
+                    and str(row["channel"] or "").lower() != "wechat"
+                    and row["reply_slot_id"] is None
+                    and str(row["attachments_json"] or "[]") != "[]"
+                ):
+                    # The slotless parent is a logical bundle outcome.  A
+                    # worker may finish it only after every subordinate
+                    # channel send has durably reached ``sent``.
+                    filters += (
+                        " AND EXISTS (SELECT 1 FROM outgoing_media AS child "
+                        "WHERE child.outbox_id=user_outbox.outbox_id)"
+                        " AND NOT EXISTS (SELECT 1 FROM outgoing_media AS child "
+                        "WHERE child.outbox_id=user_outbox.outbox_id "
+                        "AND child.state<>'sent')"
+                    )
                 changed = conn.execute(
-                    "UPDATE user_outbox SET state='sent', sent_at=?, lease_expires_at=NULL, claim_token=NULL, claimed_by=NULL WHERE " + filters,
-                    [now_text, *params],
+                    "UPDATE user_outbox SET state='sent', sent_at=?, "
+                    "remote_delivery_id=COALESCE(?, remote_delivery_id), "
+                    "transport_metadata_json=?, lease_expires_at=NULL, "
+                    "claim_token=NULL, claimed_by=NULL WHERE " + filters,
+                    [
+                        now_text,
+                        str(remote_delivery_id or "") or None,
+                        json_dumps(merged_transport),
+                        *params,
+                    ],
                 ).rowcount == 1
                 if changed and claim_token is not None:
                     conn.execute(
@@ -24341,6 +29827,95 @@ class SQLiteStore:
     fail_outbox = mark_outbox_failed
     mark_delivery_failed = mark_outbox_failed
 
+    async def finish_outbox_attempt(
+        self,
+        outbox_id: str,
+        claim_token: str | None = None,
+        *,
+        outcome: DeliveryOutcome | str,
+        client_id: str | None = None,
+        remote_delivery_id: str | None = None,
+        transport_receipt: Mapping[str, Any] | None = None,
+        error: str = "",
+        last_error: str | None = None,
+        retry: bool | None = None,
+        permanent: bool | None = None,
+        retry_after: float | None = None,
+        delay: float | None = None,
+        now: datetime | str | None = None,
+    ) -> bool:
+        """Commit one transport-neutral delivery outcome under its lease."""
+
+        try:
+            normalized = DeliveryOutcome(str(_enum_value(outcome))).value
+        except ValueError as exc:
+            raise ValueError("invalid delivery outcome") from exc
+        if normalized == DeliveryOutcome.SENT.value:
+            return await self.mark_outbox_sent(
+                outbox_id,
+                claim_token,
+                client_id=client_id,
+                remote_delivery_id=remote_delivery_id,
+                transport_receipt=transport_receipt,
+                now=now,
+            )
+        if normalized in {
+            DeliveryOutcome.RETRYABLE_FAILURE.value,
+            DeliveryOutcome.PERMANENT_FAILURE.value,
+        }:
+            should_retry = normalized == DeliveryOutcome.RETRYABLE_FAILURE.value
+            if retry is not None:
+                should_retry = bool(retry)
+            is_permanent = not should_retry
+            if permanent is not None:
+                is_permanent = bool(permanent)
+            retry_delay = (
+                float(retry_after)
+                if retry_after is not None
+                else float(delay) if delay is not None else 5.0
+            )
+            return await self.mark_outbox_failed(
+                outbox_id,
+                claim_token,
+                error=error,
+                last_error=last_error,
+                retry=should_retry,
+                permanent=is_permanent,
+                delay=max(0.0, retry_delay),
+                now=now,
+            )
+
+        message = str(last_error if last_error is not None else error or "")[:2048]
+
+        def op(conn: sqlite3.Connection) -> bool:
+            with _transaction(conn):
+                now_text = self._now(now)
+                filters = "outbox_id=? AND state='sending'"
+                params: list[Any] = [outbox_id]
+                if claim_token is not None:
+                    filters += " AND claim_token=?"
+                    params.append(claim_token)
+                else:
+                    filters += " AND claimed_by='direct-send'"
+                filters += " AND lease_expires_at IS NOT NULL AND lease_expires_at>?"
+                params.append(now_text)
+                changed = conn.execute(
+                    "UPDATE user_outbox SET state='delivery_unknown', "
+                    "last_error=?, lease_expires_at=NULL, claim_token=NULL, "
+                    "claimed_by=NULL WHERE " + filters,
+                    (message, *params),
+                ).rowcount == 1
+                if changed and claim_token is not None:
+                    conn.execute(
+                        """UPDATE outgoing_media SET lease_expires_at=NULL,
+                               claim_token=NULL, claimed_by=NULL, updated_at=?
+                           WHERE outbox_id=? AND claim_token=?""",
+                        (now_text, outbox_id, claim_token),
+                    )
+                return changed
+
+        return await self._call(op)
+
     async def retry_outbox(
         self, outbox_id: str, *, now: datetime | str | None = None
     ) -> bool:
@@ -24349,7 +29924,12 @@ class SQLiteStore:
             with _transaction(conn):
                 changed = conn.execute(
                     """UPDATE user_outbox SET state='pending', next_attempt_at=?,
-                           last_error=NULL WHERE outbox_id=? AND state IN ('delivery_unknown','failed_permanent')""",
+                           last_error=NULL WHERE outbox_id=?
+                           AND state IN ('delivery_unknown','failed_permanent')
+                           AND NOT EXISTS (
+                               SELECT 1 FROM cron_firings AS firing
+                                WHERE firing.outbox_id=user_outbox.outbox_id
+                           )""",
                     (now_text, outbox_id),
                 ).rowcount == 1
                 return changed
@@ -24661,7 +30241,13 @@ class SQLiteStore:
             parent = conn.execute(
                 """SELECT * FROM user_outbox
                    WHERE outbox_id=? AND claim_token=?
-                     AND reply_slot_id IS NOT NULL
+                     AND (
+                         reply_slot_id IS NOT NULL
+                         OR (
+                             channel<>'wechat' AND reply_slot_id IS NULL
+                             AND COALESCE(attachments_json,'[]')<>'[]'
+                         )
+                     )
                      AND state IN ('claimed','sending')
                      AND lease_expires_at IS NOT NULL
                      AND lease_expires_at>?""",
@@ -24669,14 +30255,45 @@ class SQLiteStore:
             ).fetchone()
             if parent is None:
                 return []
-            rows = conn.execute(
-                """SELECT * FROM outgoing_media
-                   WHERE outbox_id=? AND claim_token=?
-                     AND lease_expires_at IS NOT NULL
-                     AND lease_expires_at>?
-                   ORDER BY created_at ASC, media_id ASC LIMIT ?""",
-                (parent_id, token, now_text, max(0, int(limit))),
-            ).fetchall()
+            if parent["reply_slot_id"] is not None:
+                rows = conn.execute(
+                    """SELECT * FROM outgoing_media
+                       WHERE outbox_id=? AND claim_token=?
+                         AND lease_expires_at IS NOT NULL
+                         AND lease_expires_at>?
+                       ORDER BY created_at ASC, media_id ASC LIMIT ?""",
+                    (parent_id, token, now_text, max(0, int(limit))),
+                ).fetchall()
+            else:
+                # An active exact-account parent authorizes inspection of its
+                # whole durable bundle.  Sent/failed siblings have correctly
+                # released their child leases; every nonterminal sibling must
+                # still be fenced by the parent's token and live lease.
+                unfenced = conn.execute(
+                    """SELECT 1 FROM outgoing_media
+                       WHERE outbox_id=? AND state NOT IN ('sent','failed')
+                         AND NOT (
+                             claim_token=?
+                             AND lease_expires_at IS NOT NULL
+                             AND lease_expires_at>?
+                         ) LIMIT 1""",
+                    (parent_id, token, now_text),
+                ).fetchone()
+                if unfenced is not None:
+                    return []
+                rows = conn.execute(
+                    """SELECT * FROM outgoing_media
+                       WHERE outbox_id=? AND (
+                           state IN ('sent','failed')
+                           OR (
+                               claim_token=?
+                               AND lease_expires_at IS NOT NULL
+                               AND lease_expires_at>?
+                           )
+                       )
+                       ORDER BY created_at ASC, media_id ASC LIMIT ?""",
+                    (parent_id, token, now_text, max(0, int(limit))),
+                ).fetchall()
             values = [
                 item
                 for row in rows
@@ -24714,7 +30331,13 @@ class SQLiteStore:
             parent = conn.execute(
                 """SELECT * FROM user_outbox
                    WHERE outbox_id=? AND claim_token=?
-                     AND reply_slot_id IS NOT NULL
+                     AND (
+                         reply_slot_id IS NOT NULL
+                         OR (
+                             channel<>'wechat' AND reply_slot_id IS NULL
+                             AND COALESCE(attachments_json,'[]')<>'[]'
+                         )
+                     )
                      AND state IN ('claimed','sending')
                      AND lease_expires_at IS NOT NULL
                      AND lease_expires_at>?""",
@@ -24722,14 +30345,297 @@ class SQLiteStore:
             ).fetchone()
             if parent is None:
                 return None
-            child = conn.execute(
-                """SELECT * FROM outgoing_media
-                   WHERE media_id=? AND outbox_id=? AND claim_token=?
-                     AND lease_expires_at IS NOT NULL
-                     AND lease_expires_at>?""",
-                (str(media_id), parent_id, token, now_text),
-            ).fetchone()
+            if parent["reply_slot_id"] is not None:
+                child = conn.execute(
+                    """SELECT * FROM outgoing_media
+                       WHERE media_id=? AND outbox_id=? AND claim_token=?
+                         AND lease_expires_at IS NOT NULL
+                         AND lease_expires_at>?""",
+                    (str(media_id), parent_id, token, now_text),
+                ).fetchone()
+            else:
+                child = conn.execute(
+                    """SELECT * FROM outgoing_media
+                       WHERE media_id=? AND outbox_id=? AND (
+                           state IN ('sent','failed')
+                           OR (
+                               claim_token=?
+                               AND lease_expires_at IS NOT NULL
+                               AND lease_expires_at>?
+                           )
+                       )""",
+                    (str(media_id), parent_id, token, now_text),
+                ).fetchone()
             return self._outgoing_media_from_row(child, parent)
+
+        return await self._call(op)
+
+    async def claim_account_outgoing_media(
+        self,
+        worker_id: str,
+        *,
+        channel: str,
+        bot_id: str,
+        **kwargs: Any,
+    ) -> list[OutgoingMediaRecord]:
+        """Claim outgoing media for one required transport account only."""
+
+        channel_value = self._required_store_identity(channel, "channel")
+        bot_value = self._required_store_identity(bot_id, "bot_id")
+        if channel_value.lower() != "wechat":
+            # Exact-account transports have no iLink reply slot, but their
+            # outbox row is still the sole logical delivery owner.  Claim the
+            # slotless parent and every unfinished upload child atomically so
+            # siblings cannot be split across workers or bot accounts.
+            kwargs.pop("scoped", None)
+            return await self._claim_exact_account_media_bundles(
+                worker_id,
+                channel=channel_value,
+                bot_id=bot_value,
+                **kwargs,
+            )
+        return await self.claim_outgoing_media(
+            worker_id,
+            channel=channel_value,
+            bot_id=bot_value,
+            **kwargs,
+        )
+
+    async def _claim_exact_account_media_bundles(
+        self,
+        worker_id: str,
+        *,
+        channel: str,
+        bot_id: str,
+        limit: int = 1,
+        lease_seconds: float = 60.0,
+        now: datetime | str | None = None,
+        states: Iterable[MediaDeliveryState | str] | None = None,
+    ) -> list[OutgoingMediaRecord]:
+        """Claim slotless parent bundles for one non-WeChat bot account."""
+
+        if int(limit) <= 0:
+            return []
+        requested_states = (
+            (
+                MediaDeliveryState.READY,
+                MediaDeliveryState.UPLOAD_PENDING,
+                MediaDeliveryState.UPLOADING,
+                MediaDeliveryState.UPLOADED,
+                MediaDeliveryState.SEND_PENDING,
+            )
+            if states is None
+            else states
+        )
+        state_values = tuple(
+            dict.fromkeys(
+                MediaDeliveryState(str(_enum_value(item))).value
+                for item in requested_states
+            )
+        )
+        if not state_values:
+            return []
+
+        def op(conn: sqlite3.Connection) -> list[OutgoingMediaRecord]:
+            with _transaction(conn):
+                now_text = self._now(now)
+                lease = self._lease_deadline(now_text, lease_seconds)
+                # Read a few extra parents because a malformed/partially
+                # available bundle is skipped without blocking a later bot-
+                # local delivery.  Writers remain serialized by this same
+                # BEGIN IMMEDIATE transaction.
+                parents = conn.execute(
+                    """SELECT parent.* FROM user_outbox AS parent
+                       WHERE parent.channel=? AND parent.bot_id=?
+                         AND parent.channel<>'wechat'
+                         AND parent.reply_slot_id IS NULL
+                         AND COALESCE(parent.attachments_json,'[]')<>'[]'
+                         AND parent.state IN ('pending','retry_wait')
+                         AND (parent.next_attempt_at IS NULL
+                              OR parent.next_attempt_at<=?)
+                         AND parent.notify_enabled=1
+                         AND parent.delivery_mode<>'inbox_only'
+                         AND EXISTS (
+                             SELECT 1 FROM outgoing_media AS child
+                              WHERE child.outbox_id=parent.outbox_id
+                         )
+                         AND (parent.reply_scope_id IS NULL OR NOT EXISTS (
+                             SELECT 1 FROM user_outbox AS predecessor
+                              WHERE predecessor.reply_scope_id=
+                                    parent.reply_scope_id
+                                AND predecessor.reply_ordinal<
+                                    parent.reply_ordinal
+                                AND predecessor.state NOT IN
+                                    ('sent','failed_permanent',
+                                     'delivery_unknown')
+                         ))
+                       ORDER BY parent.priority DESC,parent.created_at ASC,
+                                parent.outbox_id ASC LIMIT ?""",
+                    (
+                        channel,
+                        bot_id,
+                        now_text,
+                        max(4, int(limit) * 4),
+                    ),
+                ).fetchall()
+                claimed: list[OutgoingMediaRecord] = []
+                claimed_bundles = 0
+                state_placeholders = ",".join("?" for _ in state_values)
+                for parent in parents:
+                    if claimed_bundles >= int(limit):
+                        break
+                    children = conn.execute(
+                        """SELECT child.* FROM outgoing_media AS child
+                           WHERE child.outbox_id=?
+                           ORDER BY child.created_at,child.media_id""",
+                        (parent["outbox_id"],),
+                    ).fetchall()
+                    unfinished = tuple(
+                        child
+                        for child in children
+                        if str(child["state"])
+                        not in {
+                            MediaDeliveryState.SENT.value,
+                            MediaDeliveryState.FAILED.value,
+                        }
+                    )
+                    # Every nonterminal sibling must be claimable now.  This
+                    # all-or-nothing test prevents an expired/slow child from
+                    # being split into a second worker lease.
+                    eligible = True
+                    for child in unfinished:
+                        if str(child["state"]) not in state_values:
+                            eligible = False
+                            break
+                        next_attempt = text_to_datetime(child["next_attempt_at"])
+                        current = text_to_datetime(now_text)
+                        if (
+                            next_attempt is not None
+                            and current is not None
+                            and next_attempt > current
+                        ):
+                            eligible = False
+                            break
+                        expiry = text_to_datetime(child["lease_expires_at"])
+                        if child["claim_token"] is not None and (
+                            expiry is not None
+                            and current is not None
+                            and expiry > current
+                        ):
+                            eligible = False
+                            break
+                        attachment = conn.execute(
+                            "SELECT state FROM attachments WHERE attachment_id=?",
+                            (child["attachment_id"],),
+                        ).fetchone()
+                        if attachment is None or str(attachment["state"]) != "ready":
+                            eligible = False
+                            break
+                    if not eligible:
+                        continue
+
+                    token = _uuid()
+                    parent_changed = conn.execute(
+                        """UPDATE user_outbox
+                              SET state='claimed',claimed_by=?,claim_token=?,
+                                  lease_expires_at=?,attempts=attempts+1
+                            WHERE outbox_id=? AND channel=? AND bot_id=?
+                              AND channel<>'wechat'
+                              AND reply_slot_id IS NULL
+                              AND COALESCE(attachments_json,'[]')<>'[]'
+                              AND state IN ('pending','retry_wait')
+                              AND (next_attempt_at IS NULL
+                                   OR next_attempt_at<=?)
+                              AND notify_enabled=1
+                              AND delivery_mode<>'inbox_only'""",
+                        (
+                            worker_id,
+                            token,
+                            lease,
+                            parent["outbox_id"],
+                            channel,
+                            bot_id,
+                            now_text,
+                        ),
+                    ).rowcount
+                    if parent_changed != 1:
+                        continue
+
+                    if unfinished:
+                        child_ids = tuple(str(child["media_id"]) for child in unfinished)
+                        child_placeholders = ",".join("?" for _ in child_ids)
+                        changed = conn.execute(
+                            f"""UPDATE outgoing_media
+                                  SET state=CASE
+                                          WHEN state IN ('ready','upload_pending')
+                                          THEN 'uploading' ELSE state END,
+                                      claimed_by=?,claim_token=?,
+                                      lease_expires_at=?,attempts=attempts+1,
+                                      updated_at=?
+                                WHERE outbox_id=?
+                                  AND media_id IN ({child_placeholders})
+                                  AND state IN ({state_placeholders})
+                                  AND state NOT IN ('sent','failed')
+                                  AND (next_attempt_at IS NULL
+                                       OR next_attempt_at<=?)
+                                  AND (claim_token IS NULL
+                                       OR lease_expires_at IS NULL
+                                       OR lease_expires_at<=?)
+                                  AND EXISTS (
+                                      SELECT 1 FROM attachments AS attachment
+                                       WHERE attachment.attachment_id=
+                                             outgoing_media.attachment_id
+                                         AND attachment.state='ready'
+                                  )""",
+                            (
+                                worker_id,
+                                token,
+                                lease,
+                                now_text,
+                                parent["outbox_id"],
+                                *child_ids,
+                                *state_values,
+                                now_text,
+                                now_text,
+                            ),
+                        ).rowcount
+                        if changed != len(unfinished):
+                            raise StoreError(
+                                "exact-account media bundle claim was split"
+                            )
+
+                    fresh_parent = conn.execute(
+                        "SELECT * FROM user_outbox WHERE outbox_id=?",
+                        (parent["outbox_id"],),
+                    ).fetchone()
+                    if fresh_parent is None:
+                        raise StoreError("claimed media parent disappeared")
+                    fresh_children = conn.execute(
+                        """SELECT * FROM outgoing_media
+                           WHERE outbox_id=?
+                             AND (claim_token=? OR state IN ('sent','failed'))
+                           ORDER BY created_at,media_id""",
+                        (parent["outbox_id"], token),
+                    ).fetchall()
+                    bundle_items: list[OutgoingMediaRecord] = []
+                    for child in fresh_children:
+                        item = self._outgoing_media_from_row(child, fresh_parent)
+                        if item is not None:
+                            bundle_items.append(item)
+                    def bundle_order(
+                        item: OutgoingMediaRecord,
+                    ) -> tuple[int, str]:
+                        try:
+                            ordinal = int(
+                                item.metadata.get("bundle_ordinal", 1 << 30)
+                            )
+                        except (TypeError, ValueError):
+                            ordinal = 1 << 30
+                        return ordinal, item.media_id
+
+                    claimed.extend(sorted(bundle_items, key=bundle_order))
+                    claimed_bundles += 1
+                return claimed
 
         return await self._call(op)
 
@@ -25054,7 +30960,10 @@ class SQLiteStore:
                             "lease_expires_at > ?",
                             "EXISTS (SELECT 1 FROM user_outbox AS parent "
                             "WHERE parent.outbox_id=outgoing_media.outbox_id "
-                            "AND parent.reply_slot_id IS NOT NULL "
+                            "AND (parent.reply_slot_id IS NOT NULL OR ("
+                            "parent.channel<>'wechat' "
+                            "AND parent.reply_slot_id IS NULL "
+                            "AND COALESCE(parent.attachments_json,'[]')<>'[]')) "
                             "AND parent.claim_token=? "
                             "AND parent.state IN ('claimed','sending') "
                             "AND parent.lease_expires_at IS NOT NULL "
@@ -25279,15 +31188,39 @@ class SQLiteStore:
                 now_text = self._now(now)
                 lease = self._lease_deadline(now_text, lease_seconds)
                 parent = conn.execute(
-                    """SELECT 1 FROM user_outbox
+                    """SELECT channel,reply_slot_id FROM user_outbox
                        WHERE outbox_id=? AND claim_token=?
-                         AND reply_slot_id IS NOT NULL
+                         AND (
+                             reply_slot_id IS NOT NULL
+                             OR (
+                                 channel<>'wechat' AND reply_slot_id IS NULL
+                                 AND COALESCE(attachments_json,'[]')<>'[]'
+                             )
+                         )
                          AND state IN ('claimed','sending')
                          AND lease_expires_at IS NOT NULL
                          AND lease_expires_at>?""",
                     (parent_id, token, now_text),
                 ).fetchone()
+                if parent is None:
+                    return False
                 placeholders = ",".join("?" for _ in children)
+                exact_account = (
+                    parent["reply_slot_id"] is None
+                    and str(parent["channel"] or "").lower() != "wechat"
+                )
+                if exact_account:
+                    expected_children = {
+                        str(row["media_id"])
+                        for row in conn.execute(
+                            """SELECT media_id FROM outgoing_media
+                               WHERE outbox_id=?
+                                 AND state NOT IN ('sent','failed')""",
+                            (parent_id,),
+                        ).fetchall()
+                    }
+                    if expected_children != set(children):
+                        return False
                 child_count = conn.execute(
                     f"""SELECT COUNT(*) FROM outgoing_media
                         WHERE outbox_id=? AND claim_token=?
@@ -25297,7 +31230,7 @@ class SQLiteStore:
                           AND lease_expires_at>?""",
                     (parent_id, token, *children, now_text),
                 ).fetchone()[0]
-                if parent is None or int(child_count) != len(children):
+                if int(child_count) != len(children):
                     return False
                 parent_changed = conn.execute(
                     """UPDATE user_outbox SET lease_expires_at=?
@@ -25532,7 +31465,11 @@ class SQLiteStore:
                        WHERE o.channel=? AND o.bot_id=? AND o.external_user_id=?
                          AND o.session_id=? AND o.agent_id=?
                          AND o.state IN ('pending','retry_wait')
-                         AND o.foreground=0""",
+                         AND o.foreground=0
+                         AND NOT EXISTS (
+                             SELECT 1 FROM cron_firings AS firing
+                              WHERE firing.task_id=o.task_id
+                         )""",
                     (
                     int(bool(enabled)), channel, bot_id, external_user_id,
                         session_id, agent_id,
@@ -25927,9 +31864,19 @@ class SQLiteStore:
                                 agent_incarnation=int(
                                     mailbox["destination_agent_incarnation"]
                                 ),
+                                account_channel=str(
+                                    old_invocation["account_channel"]
+                                ),
+                                account_bot_id=str(
+                                    old_invocation["account_bot_id"]
+                                ),
                                 now=now_text,
                                 max_agent_queue=self.max_agent_queue,
                                 max_global_queue=self.max_global_queue,
+                                max_account_queue=self.max_account_queue,
+                                max_account_agent_queue=(
+                                    self.max_account_agent_queue
+                                ),
                             )
                         except QueueFullError:
                             conn.execute(
@@ -25951,9 +31898,10 @@ class SQLiteStore:
                                        invocation_id,work_kind,work_id,agent_id,
                                        agent_incarnation,state,dispatch_backend,
                                        ready_sequence,mailbox_id,next_attempt_at,
-                                       created_at,updated_at,expires_at)
+                                       created_at,updated_at,expires_at,
+                                       account_channel,account_bot_id)
                                    VALUES (?,'mailbox',?,?,?,'queued',
-                                           'compatibility',?,?,NULL,?,?,?)""",
+                                           'compatibility',?,?,NULL,?,?,?,?,?)""",
                                 (
                                     replacement_invocation_id,
                                     mailbox["message_id"],
@@ -25964,6 +31912,8 @@ class SQLiteStore:
                                     now_text,
                                     now_text,
                                     mailbox["expires_at"],
+                                    old_invocation["account_channel"],
+                                    old_invocation["account_bot_id"],
                                 ),
                             )
                             outcome = MailboxOrphanReviewOutcome.RETRIED
@@ -26115,6 +32065,11 @@ class SQLiteStore:
                            ON lifecycle.agent_id=mailbox.destination_agent_id
                           AND lifecycle.agent_incarnation=
                               mailbox.destination_agent_incarnation
+                         JOIN agent_account_admission_counters AS fairness
+                           ON fairness.agent_id=ai.agent_id
+                          AND fairness.agent_incarnation=ai.agent_incarnation
+                          AND fairness.channel=ai.account_channel
+                          AND fairness.bot_id=ai.account_bot_id
                         WHERE mailbox.destination_agent_id=?
                           AND mailbox.state='pending'
                           AND (mailbox.next_attempt_at IS NULL
@@ -26126,8 +32081,9 @@ class SQLiteStore:
                           AND lifecycle.lifecycle_state='enabled'
                           AND """
                     + self._unified_invocation_claim_guard("ai")
-                    + " ORDER BY ai.ready_sequence ASC LIMIT 1",
-                    (destination_agent_id, now_text, now_text, now_text),
+                    + " ORDER BY fairness.last_served_ordinal ASC, "
+                      "ai.ready_sequence ASC LIMIT 1",
+                    (destination_agent_id, now_text, now_text, *(now_text,) * 5),
                 ).fetchall()
                 result: list[AgentMailboxItem] = []
                 for row in rows:
@@ -26149,6 +32105,18 @@ class SQLiteStore:
                              row["destination_agent_incarnation"]),
                         ).rowcount != 1:
                             raise StoreError("mailbox invocation claim conflicts")
+                        claimed_invocation = conn.execute(
+                            "SELECT * FROM agent_invocations "
+                            "WHERE invocation_id=?",
+                            (row["current_invocation_id"],),
+                        ).fetchone()
+                        if claimed_invocation is None:
+                            raise StoreError("mailbox invocation disappeared")
+                        self._mark_invocation_account_served_tx(
+                            conn,
+                            claimed_invocation,
+                            now=now_text,
+                        )
                         fresh = conn.execute("SELECT * FROM agent_mailbox WHERE mailbox_id=?", (row["mailbox_id"],)).fetchone()
                         item = self._mailbox_from_row(fresh)
                         if item is not None:
@@ -26766,6 +32734,8 @@ class SQLiteStore:
                     now=now_text,
                     max_agent_queue=self.max_agent_queue,
                     max_global_queue=self.max_global_queue,
+                    max_account_queue=self.max_account_queue,
+                    max_account_agent_queue=self.max_account_agent_queue,
                 )
                 # Retain managed attachments for the mailbox lifetime.  A
                 # channel-only/unknown reference stays in the structured
@@ -28008,6 +33978,3632 @@ class SQLiteStore:
     get_role = get_session_role
     set_role = set_session_role
 
+    @staticmethod
+    def _fresh_cron_reply_target(target: ReplyTarget) -> ReplyTarget:
+        """Remove one-inbound reply hints while preserving durable addressing."""
+
+        transport_metadata = dict(target.transport_metadata)
+        transport_metadata.pop("reply_to", None)
+        is_lark_thread = bool(
+            str(target.channel).casefold() == "lark"
+            and (
+                str(target.destination_kind).casefold() == "thread"
+                or str(target.thread_id or "").strip()
+            )
+        )
+        return ReplyTarget(
+            channel=target.channel,
+            bot_id=target.bot_id,
+            external_user_id=target.external_user_id,
+            session_id=target.session_id or "default",
+            source_message_id=(
+                target.source_message_id if is_lark_thread else None
+            ),
+            source_sequence=None,
+            context_token=None,
+            conversation_subject_id=target.conversation_subject_id,
+            conversation_subject_scope=target.conversation_subject_scope,
+            destination_kind=target.destination_kind,
+            destination_id=target.destination_id,
+            thread_id=target.thread_id,
+            root_message_id=target.root_message_id,
+            transport_metadata=transport_metadata,
+        )
+
+    @staticmethod
+    def _natural_cron_resolution_text(value: Any) -> str:
+        """Canonicalize the tiny confirmation language without interpreting it."""
+
+        return " ".join(
+            unicodedata.normalize("NFKC", str(value or "")).split()
+        ).casefold()
+
+    @classmethod
+    def _natural_cron_resolution_phrases(
+        cls,
+        action: str,
+        draft_id: str,
+    ) -> frozenset[str]:
+        aliases = {
+            "confirm": ("confirm", "确认"),
+            "cancel": ("cancel", "取消"),
+        }
+        try:
+            words = aliases[str(action).strip().casefold()]
+        except KeyError as exc:
+            raise ValueError("natural cron resolution action is invalid") from exc
+        identity = cls._natural_cron_resolution_text(draft_id)
+        return frozenset(
+            {
+                cls._natural_cron_resolution_text(word)
+                for word in words
+            }
+            | {
+                cls._natural_cron_resolution_text(f"{word} {identity}")
+                for word in words
+            }
+        )
+
+    @classmethod
+    def _natural_cron_scope_target(cls, target: ReplyTarget) -> Any:
+        """Return the stable bot/chat/thread address used for draft authority.
+
+        Source-message IDs, reply sequence numbers, and context tokens belong
+        to one inbound delivery.  Every actual destination field remains in
+        the comparison, including Lark chat/thread/root and transport data.
+        """
+
+        transport_metadata = dict(target.transport_metadata)
+        # Lark's ``reply_to`` identifies the individual message being
+        # answered, not the durable chat/thread destination.  A confirmation
+        # may reply to the proposal and therefore legitimately carry a
+        # different parent while remaining in the exact same thread.
+        transport_metadata.pop("reply_to", None)
+        return cls._json_snapshot(
+            {
+                "channel": target.channel,
+                "bot_id": target.bot_id,
+                "external_user_id": target.external_user_id,
+                "session_id": target.session_id or "default",
+                "conversation_subject_id": target.conversation_subject_id,
+                "conversation_subject_scope": (
+                    target.conversation_subject_scope
+                ),
+                "destination_kind": target.destination_kind,
+                "destination_id": target.destination_id,
+                "thread_id": target.thread_id,
+                "root_message_id": target.root_message_id,
+                "transport_metadata": transport_metadata,
+            }
+        )
+
+    @classmethod
+    def _natural_cron_task_context_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        task_id: str,
+        execution_id: str,
+        now_text: str,
+    ) -> dict[str, Any]:
+        """Authenticate one live human task as a scheduling capability.
+
+        The Agent bridge bearer is intentionally not operation-scoped.  This
+        store check therefore repeats every scheduling-specific invariant and
+        binds the operation to the exact live task execution and lease.
+        """
+
+        task_value = str(task_id or "").strip()
+        execution_value = str(execution_id or "").strip()
+        if not task_value or not execution_value:
+            raise PermissionError(
+                "natural cron requires an exact running task execution"
+            )
+        row = conn.execute(
+            """SELECT task.*,
+                      execution.state AS natural_execution_state,
+                      execution.worker_id AS natural_execution_worker,
+                      execution.claim_token AS natural_execution_token,
+                      execution.lease_expires_at AS natural_execution_lease,
+                      execution.finished_at AS natural_execution_finished_at,
+                      inbound.message_id AS natural_inbound_message_id,
+                      inbound.channel AS natural_inbound_channel,
+                      inbound.bot_id AS natural_inbound_bot_id,
+                      inbound.external_user_id AS natural_inbound_actor_id,
+                      inbound.session_id AS natural_inbound_session_id,
+                      inbound.text AS natural_inbound_text,
+                      inbound.stored_at AS natural_inbound_stored_at,
+                      inbound.task_id AS natural_inbound_task_id,
+                      inbound.principal_id AS natural_inbound_principal_id,
+                      inbound.principal_account_id
+                          AS natural_inbound_principal_account_id,
+                      inbound.conversation_subject_id
+                          AS natural_inbound_subject_id,
+                      inbound.identity_snapshot_json
+                          AS natural_inbound_identity_snapshot_json
+                 FROM tasks AS task
+                 JOIN task_executions AS execution
+                   ON execution.execution_id=task.current_execution_id
+                  AND execution.task_id=task.task_id
+                  AND execution.agent_id=task.agent_id
+                  AND execution.agent_incarnation=task.agent_incarnation
+                 JOIN inbound_messages AS inbound
+                   ON inbound.message_id=task.inbound_message_id
+                WHERE task.task_id=? AND task.current_execution_id=?""",
+            (task_value, execution_value),
+        ).fetchone()
+        if row is None:
+            raise PermissionError(
+                "natural cron requires a human-origin running task"
+            )
+        if (
+            str(row["state"]) != TaskState.RUNNING.value
+            or str(row["natural_execution_state"])
+            != ExecutionState.RUNNING.value
+            or row["natural_execution_finished_at"] is not None
+            or str(row["claimed_by"] or "")
+            != str(row["natural_execution_worker"] or "")
+            or not str(row["claim_token"] or "")
+            or str(row["claim_token"] or "")
+            != str(row["natural_execution_token"] or "")
+            or not cls._lease_is_active(row["lease_expires_at"], now_text)
+            or not cls._lease_is_active(
+                row["natural_execution_lease"], now_text
+            )
+        ):
+            raise PermissionError(
+                "natural cron requires an exact live task execution"
+            )
+        if (
+            row["parent_task_id"] is not None
+            or int(row["child_depth"] or 0) != 0
+            or str(row["natural_inbound_task_id"] or "") != task_value
+        ):
+            raise PermissionError(
+                "natural cron is limited to top-level human tasks"
+            )
+
+        metadata = json_loads(row["metadata_json"], {}) or {}
+        if not isinstance(metadata, Mapping):
+            raise PermissionError("natural cron task policy is invalid")
+        effective_policy = metadata.get("effective_policy", {})
+        if (
+            not isinstance(effective_policy, Mapping)
+            or effective_policy.get("can_execute_commands") is not True
+            or str(effective_policy.get("profile_id") or "")
+            != str(row["agent_id"])
+            or int(effective_policy.get("profile_version") or 0)
+            != int(row["profile_version"])
+            or str(effective_policy.get("mode_id") or "")
+            != str(row["mode_id"])
+            or int(effective_policy.get("mode_policy_version") or 0)
+            != int(row["policy_version"])
+            or bool(metadata.get("internal_mailbox"))
+            or bool(metadata.get("cron"))
+            or bool(metadata.get("cron_job_id"))
+        ):
+            raise PermissionError(
+                "natural cron is unavailable for this task policy"
+            )
+
+        target = cls._coerce_reply_target(
+            json_loads(row["reply_target_json"], {}) or {}
+        )
+        actor = str(row["actor_external_user_id"] or "").strip()
+        route_scope = str(
+            target.conversation_subject_scope
+            or row["external_user_id"]
+            or ""
+        ).strip()
+        if not actor:
+            raise PermissionError("natural cron task actor is unavailable")
+        if (
+            target.channel != str(row["channel"])
+            or target.bot_id != str(row["bot_id"])
+            or target.external_user_id != actor
+            or str(target.session_id or "default")
+            != str(row["session_id"] or "default")
+            or route_scope != str(row["external_user_id"])
+            or str(row["natural_inbound_channel"] or "") != target.channel
+            or str(row["natural_inbound_bot_id"] or "") != target.bot_id
+            or str(row["natural_inbound_actor_id"] or "") != actor
+            or str(row["natural_inbound_session_id"] or "default")
+            != str(target.session_id or "default")
+        ):
+            raise PermissionError("natural cron task origin is invalid")
+
+        principal_id = str(row["principal_id"] or "").strip()
+        account_id = str(row["principal_account_id"] or "").strip()
+        if (
+            str(row["natural_inbound_principal_id"] or "") != principal_id
+            or str(row["natural_inbound_principal_account_id"] or "")
+            != account_id
+        ):
+            raise PermissionError("natural cron principal snapshot is invalid")
+        identity = json_loads(row["identity_snapshot_json"], {}) or {}
+        inbound_identity = json_loads(
+            row["natural_inbound_identity_snapshot_json"], {}
+        ) or {}
+        if not isinstance(identity, Mapping) or not isinstance(
+            inbound_identity, Mapping
+        ):
+            raise PermissionError("natural cron identity snapshot is invalid")
+        principal_snapshot = identity.get("principal", {})
+        inbound_principal = inbound_identity.get("principal", {})
+        if not isinstance(principal_snapshot, Mapping) or not isinstance(
+            inbound_principal, Mapping
+        ):
+            raise PermissionError("natural cron principal snapshot is invalid")
+        revision_raw = principal_snapshot.get("mapping_revision")
+        inbound_revision_raw = inbound_principal.get("mapping_revision")
+        if principal_id:
+            try:
+                mapping_revision = int(revision_raw)
+                inbound_revision = int(inbound_revision_raw)
+            except (TypeError, ValueError) as exc:
+                raise PermissionError(
+                    "natural cron principal revision is invalid"
+                ) from exc
+            if (
+                mapping_revision <= 0
+                or inbound_revision != mapping_revision
+                or str(principal_snapshot.get("principal_id") or "")
+                != principal_id
+                or str(
+                    principal_snapshot.get("principal_account_id") or ""
+                )
+                != account_id
+            ):
+                raise PermissionError(
+                    "natural cron principal snapshot is invalid"
+                )
+        else:
+            if account_id or revision_raw not in (None, 0, "", "0"):
+                raise PermissionError(
+                    "natural cron unmapped identity snapshot is invalid"
+                )
+            if inbound_revision_raw not in (None, 0, "", "0"):
+                raise PermissionError(
+                    "natural cron unmapped identity snapshot is invalid"
+                )
+            mapping_revision = None
+
+        subject_id = str(row["conversation_subject_id"] or "").strip()
+        if (
+            not subject_id
+            or str(row["natural_inbound_subject_id"] or "") != subject_id
+            or str(target.conversation_subject_id or "") != subject_id
+        ):
+            raise PermissionError(
+                "natural cron conversation subject is invalid"
+            )
+        subject = conn.execute(
+            "SELECT channel,bot_id,scope_key FROM conversation_subjects "
+            "WHERE conversation_subject_id=?",
+            (subject_id,),
+        ).fetchone()
+        if (
+            subject is None
+            or str(subject["channel"]) != target.channel
+            or str(subject["bot_id"]) != target.bot_id
+            or str(subject["scope_key"]) != route_scope
+        ):
+            raise PermissionError(
+                "natural cron conversation subject is unavailable"
+            )
+
+        cls._cron_owner_scope_tx(
+            conn,
+            principal_id=principal_id,
+            principal_account_id=account_id,
+            principal_mapping_revision=mapping_revision,
+            origin_channel=target.channel,
+            origin_bot_id=target.bot_id,
+            origin_external_user_id=actor,
+            require_mapping_revision=bool(principal_id),
+        )
+        lifecycle = conn.execute(
+            "SELECT lifecycle_state,desired_process_state FROM agent_lifecycle "
+            "WHERE agent_id=? AND agent_incarnation=?",
+            (str(row["agent_id"]), int(row["agent_incarnation"])),
+        ).fetchone()
+        if lifecycle is None or (
+            str(lifecycle["lifecycle_state"])
+            != AgentLifecycleState.ENABLED.value
+            or str(lifecycle["desired_process_state"])
+            != AgentDesiredProcessState.RUNNING.value
+        ):
+            raise PermissionError("natural cron target Agent is unavailable")
+        if target.channel.casefold() == "lark":
+            bot = conn.execute(
+                "SELECT 1 FROM bot_profiles WHERE channel='lark' AND bot_id=? "
+                "AND enabled=1 AND removed_at IS NULL",
+                (target.bot_id,),
+            ).fetchone()
+            if bot is None:
+                raise PermissionError("natural cron origin Lark bot is unavailable")
+        return {
+            "row": row,
+            "target": target,
+            "scope_target": cls._natural_cron_scope_target(target),
+            "actor": actor,
+            "route_scope": route_scope,
+            "principal_id": principal_id,
+            "principal_account_id": account_id,
+            "principal_mapping_revision": mapping_revision,
+            "subject_id": subject_id,
+            "identity_snapshot": dict(identity),
+            "metadata": dict(metadata),
+        }
+
+    @staticmethod
+    def _expire_natural_cron_drafts_tx(
+        conn: sqlite3.Connection,
+        *,
+        now_text: str,
+    ) -> int:
+        return conn.execute(
+            """UPDATE natural_cron_drafts
+                  SET state='expired',resolved_at=?,updated_at=?
+                WHERE state='pending' AND expires_at<=?""",
+            (now_text, now_text, now_text),
+        ).rowcount
+
+    async def _persist_natural_cron_expiry(self, *, now_text: str) -> int:
+        """Commit expiry before an operation that may reject and roll back."""
+
+        def op(conn: sqlite3.Connection) -> int:
+            with _transaction(conn):
+                return self._expire_natural_cron_drafts_tx(
+                    conn, now_text=now_text
+                )
+
+        return await self._call(op)
+
+    @classmethod
+    def _natural_cron_scope_matches(
+        cls,
+        draft: sqlite3.Row,
+        context: Mapping[str, Any],
+    ) -> bool:
+        row = context["row"]
+        expected = (
+            str(context["target"].channel),
+            str(context["target"].bot_id),
+            str(context["actor"]),
+            str(context["target"].session_id or "default"),
+            str(context["subject_id"]),
+            str(context["route_scope"]),
+            str(row["conversation_id"]),
+            str(row["agent_id"]),
+            int(row["agent_incarnation"]),
+            str(context["principal_id"]),
+            str(context["principal_account_id"]),
+            context["principal_mapping_revision"],
+        )
+        actual = (
+            str(draft["origin_channel"]),
+            str(draft["origin_bot_id"]),
+            str(draft["origin_external_user_id"]),
+            str(draft["origin_session_id"] or "default"),
+            str(draft["origin_conversation_subject_id"] or ""),
+            str(draft["origin_conversation_subject_scope"]),
+            str(draft["conversation_id"]),
+            str(draft["agent_id"]),
+            int(draft["agent_incarnation"]),
+            str(draft["principal_id"] or ""),
+            str(draft["principal_account_id"] or ""),
+            (
+                int(draft["principal_mapping_revision"])
+                if draft["principal_mapping_revision"] is not None
+                else None
+            ),
+        )
+        if actual != expected:
+            return False
+        target = cls._coerce_reply_target(
+            json_loads(draft["origin_reply_target_json"], {}) or {}
+        )
+        return cls._natural_cron_scope_target(target) == context["scope_target"]
+
+    @classmethod
+    def _natural_cron_draft_authority_tx(
+        cls,
+        conn: sqlite3.Connection,
+        draft: sqlite3.Row,
+    ) -> None:
+        principal_id = str(draft["principal_id"] or "")
+        account_id = str(draft["principal_account_id"] or "")
+        revision = (
+            int(draft["principal_mapping_revision"])
+            if draft["principal_mapping_revision"] is not None
+            else None
+        )
+        cls._cron_owner_scope_tx(
+            conn,
+            principal_id=principal_id,
+            principal_account_id=account_id,
+            principal_mapping_revision=revision,
+            origin_channel=str(draft["origin_channel"]),
+            origin_bot_id=str(draft["origin_bot_id"]),
+            origin_external_user_id=str(draft["origin_external_user_id"]),
+            require_mapping_revision=bool(principal_id),
+        )
+        lifecycle = conn.execute(
+            "SELECT lifecycle_state,desired_process_state FROM agent_lifecycle "
+            "WHERE agent_id=? AND agent_incarnation=?",
+            (str(draft["agent_id"]), int(draft["agent_incarnation"])),
+        ).fetchone()
+        if lifecycle is None or (
+            str(lifecycle["lifecycle_state"])
+            != AgentLifecycleState.ENABLED.value
+            or str(lifecycle["desired_process_state"])
+            != AgentDesiredProcessState.RUNNING.value
+        ):
+            raise PermissionError("natural cron target Agent is unavailable")
+        if str(draft["origin_channel"]).casefold() == "lark":
+            bot = conn.execute(
+                "SELECT 1 FROM bot_profiles WHERE channel='lark' AND bot_id=? "
+                "AND enabled=1 AND removed_at IS NULL",
+                (str(draft["origin_bot_id"]),),
+            ).fetchone()
+            if bot is None:
+                raise PermissionError("natural cron origin Lark bot is unavailable")
+
+    @classmethod
+    def _select_natural_cron_draft_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        draft_id: str,
+        context: Mapping[str, Any],
+    ) -> sqlite3.Row:
+        identity = str(draft_id or "").strip()
+        if identity:
+            row = conn.execute(
+                "SELECT * FROM natural_cron_drafts WHERE draft_id=?",
+                (identity,),
+            ).fetchone()
+            if row is None or not cls._natural_cron_scope_matches(row, context):
+                raise NotFoundError("natural cron draft not found")
+            return row
+        current = context["row"]
+        rows = conn.execute(
+            """SELECT * FROM natural_cron_drafts
+                WHERE origin_channel=? AND origin_bot_id=?
+                  AND origin_external_user_id=? AND origin_session_id=?
+                  AND origin_conversation_subject_id=?
+                  AND origin_conversation_subject_scope=?
+                  AND conversation_id=? AND agent_id=?
+                  AND agent_incarnation=?
+                  AND state='pending'
+                ORDER BY created_at,draft_id""",
+            (
+                context["target"].channel,
+                context["target"].bot_id,
+                context["actor"],
+                context["target"].session_id or "default",
+                context["subject_id"],
+                context["route_scope"],
+                str(current["conversation_id"]),
+                str(current["agent_id"]),
+                int(current["agent_incarnation"]),
+            ),
+        ).fetchall()
+        matches = [
+            row for row in rows if cls._natural_cron_scope_matches(row, context)
+        ]
+        if not matches:
+            raise NotFoundError("no pending natural cron draft")
+        if len(matches) != 1:
+            raise InvalidTransition(
+                "multiple natural cron drafts are pending; specify a draft ID"
+            )
+        return matches[0]
+
+    @classmethod
+    def _natural_cron_resolution_evidence_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        draft: sqlite3.Row,
+        context: Mapping[str, Any],
+        action: str,
+    ) -> tuple[str, str, str, str | None]:
+        """Return exact later human evidence for one confirm/cancel action."""
+
+        current = context["row"]
+        phrases = cls._natural_cron_resolution_phrases(
+            action, str(draft["draft_id"])
+        )
+        current_task_id = str(current["task_id"])
+        current_execution_id = str(current["current_execution_id"])
+        source_task_id = str(draft["source_task_id"])
+        all_phrases = {
+            phrase: resolution_action
+            for resolution_action in ("confirm", "cancel")
+            for phrase in cls._natural_cron_resolution_phrases(
+                resolution_action, str(draft["draft_id"])
+            )
+        }
+
+        def require_unambiguous_bare(text: str) -> None:
+            bare = {
+                cls._natural_cron_resolution_text(word)
+                for word in ("confirm", "确认", "cancel", "取消")
+            }
+            if text not in bare:
+                return
+            candidates = conn.execute(
+                """SELECT * FROM natural_cron_drafts
+                    WHERE origin_channel=? AND origin_bot_id=?
+                      AND origin_external_user_id=? AND origin_session_id=?
+                      AND origin_conversation_subject_id=?
+                      AND origin_conversation_subject_scope=?
+                      AND conversation_id=? AND agent_id=?
+                      AND agent_incarnation=?
+                      AND state='pending'""",
+                (
+                    context["target"].channel,
+                    context["target"].bot_id,
+                    context["actor"],
+                    context["target"].session_id or "default",
+                    context["subject_id"],
+                    context["route_scope"],
+                    str(current["conversation_id"]),
+                    str(current["agent_id"]),
+                    int(current["agent_incarnation"]),
+                ),
+            ).fetchall()
+            matches = [
+                candidate
+                for candidate in candidates
+                if cls._natural_cron_scope_matches(candidate, context)
+            ]
+            if len(matches) != 1:
+                raise InvalidTransition(
+                    "bare natural cron confirmation is ambiguous; "
+                    "include the draft ID"
+                )
+
+        if current_task_id != source_task_id:
+            text = cls._natural_cron_resolution_text(
+                current["natural_inbound_text"]
+            )
+            if (
+                text not in phrases
+                or str(current["natural_inbound_message_id"])
+                == str(draft["source_inbound_message_id"])
+                or str(current["natural_inbound_stored_at"])
+                <= str(draft["created_at"])
+            ):
+                raise PermissionError(
+                    f"natural cron {action} requires exact later user input"
+                )
+            require_unambiguous_bare(text)
+            used = conn.execute(
+                "SELECT draft_id FROM natural_cron_drafts "
+                "WHERE confirmation_inbound_message_id=? AND draft_id<>?",
+                (
+                    str(current["natural_inbound_message_id"]),
+                    str(draft["draft_id"]),
+                ),
+            ).fetchone()
+            if used is not None:
+                raise PermissionError(
+                    "natural cron confirmation input was already consumed"
+                )
+            return (
+                current_task_id,
+                current_execution_id,
+                str(current["natural_inbound_message_id"]),
+                None,
+            )
+
+        rows = conn.execute(
+            """SELECT steering.steering_id,inbound.message_id,inbound.text,
+                      inbound.channel,inbound.bot_id,inbound.external_user_id,
+                      inbound.session_id,inbound.task_id,inbound.principal_id,
+                      inbound.principal_account_id,
+                      inbound.conversation_subject_id,
+                      inbound.identity_snapshot_json
+                 FROM task_steering AS steering
+                 JOIN inbound_messages AS inbound
+                   ON inbound.message_id=steering.inbound_message_id
+                WHERE steering.target_task_id=?
+                  AND steering.target_execution_id=?
+                  AND steering.state='applied'
+                  AND steering.created_at>?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM natural_cron_drafts AS used
+                       WHERE used.draft_id<>?
+                         AND (
+                             used.confirmation_steering_id=steering.steering_id
+                             OR used.confirmation_inbound_message_id=
+                                inbound.message_id
+                         )
+                  )
+                ORDER BY steering.sequence,steering.steering_id""",
+            (
+                current_task_id,
+                current_execution_id,
+                str(draft["created_at"]),
+                str(draft["draft_id"]),
+            ),
+        ).fetchall()
+        for row in rows:
+            text = cls._natural_cron_resolution_text(row["text"])
+            resolution_action = all_phrases.get(text)
+            if resolution_action is not None:
+                identity = json_loads(row["identity_snapshot_json"], {}) or {}
+                principal = (
+                    identity.get("principal", {})
+                    if isinstance(identity, Mapping)
+                    else {}
+                )
+                subject = (
+                    identity.get("conversation_subject", {})
+                    if isinstance(identity, Mapping)
+                    else {}
+                )
+                destination = (
+                    identity.get("destination", {})
+                    if isinstance(identity, Mapping)
+                    else {}
+                )
+                if not all(
+                    isinstance(value, Mapping)
+                    for value in (principal, subject, destination)
+                ):
+                    continue
+                revision = principal.get("mapping_revision")
+                if revision in (0, "0", "") and context[
+                    "principal_mapping_revision"
+                ] is None:
+                    revision = None
+                evidence_target = ReplyTarget(
+                    channel=str(row["channel"] or ""),
+                    bot_id=str(row["bot_id"] or ""),
+                    external_user_id=str(row["external_user_id"] or ""),
+                    session_id=str(row["session_id"] or "default"),
+                    conversation_subject_id=str(
+                        row["conversation_subject_id"] or ""
+                    ),
+                    conversation_subject_scope=str(
+                        subject.get("scope_key") or ""
+                    ),
+                    destination_kind=str(destination.get("kind") or ""),
+                    destination_id=str(destination.get("id") or ""),
+                    thread_id=str(destination.get("thread_id") or ""),
+                    root_message_id=str(
+                        destination.get("root_message_id") or ""
+                    ),
+                    transport_metadata=(
+                        dict(destination.get("transport_metadata") or {})
+                        if isinstance(
+                            destination.get("transport_metadata"), Mapping
+                        )
+                        else {}
+                    ),
+                )
+                if (
+                    str(row["task_id"] or "") != current_task_id
+                    or str(row["principal_id"] or "")
+                    != str(context["principal_id"])
+                    or str(row["principal_account_id"] or "")
+                    != str(context["principal_account_id"])
+                    or str(principal.get("principal_id") or "")
+                    != str(context["principal_id"])
+                    or str(principal.get("principal_account_id") or "")
+                    != str(context["principal_account_id"])
+                    or revision != context["principal_mapping_revision"]
+                    or str(subject.get("conversation_subject_id") or "")
+                    != str(context["subject_id"])
+                    or cls._natural_cron_scope_target(evidence_target)
+                    != context["scope_target"]
+                ):
+                    continue
+                require_unambiguous_bare(text)
+                if resolution_action != action:
+                    raise InvalidTransition(
+                        "an earlier natural cron "
+                        f"{resolution_action} input must be resolved first"
+                    )
+                return (
+                    current_task_id,
+                    current_execution_id,
+                    str(row["message_id"]),
+                    str(row["steering_id"]),
+                )
+        raise PermissionError(
+            f"natural cron {action} requires exact later user input"
+        )
+
+    @classmethod
+    def _natural_cron_frozen_template_tx(
+        cls,
+        conn: sqlite3.Connection,
+        draft: sqlite3.Row,
+    ) -> dict[str, Any]:
+        """Validate a proposal-time task snapshot without mutable lookups."""
+
+        template = json_loads(draft["task_template_json"], {}) or {}
+        if not isinstance(template, Mapping):
+            raise StoreError("natural cron task template is malformed")
+        template = dict(template)
+        if (
+            str(template.get("agent_id") or "") != str(draft["agent_id"])
+            or str(template.get("conversation_id") or "")
+            != str(draft["conversation_id"])
+            or str(template.get("actor_external_user_id") or "")
+            != str(draft["origin_external_user_id"])
+            or str(template.get("principal_id") or "")
+            != str(draft["principal_id"] or "")
+            or str(template.get("principal_account_id") or "")
+            != str(draft["principal_account_id"] or "")
+            or str(template.get("conversation_subject_id") or "")
+            != str(draft["origin_conversation_subject_id"] or "")
+        ):
+            raise StoreError("natural cron task template ownership was altered")
+        try:
+            profile_version = int(template.get("profile_version") or 0)
+            policy_version = int(template.get("policy_version") or 0)
+        except (TypeError, ValueError) as exc:
+            raise StoreError("natural cron task policy is malformed") from exc
+        lifecycle = conn.execute(
+            "SELECT profile_version,lifecycle_state,desired_process_state "
+            "FROM agent_lifecycle WHERE agent_id=? AND agent_incarnation=?",
+            (str(draft["agent_id"]), int(draft["agent_incarnation"])),
+        ).fetchone()
+        profile = conn.execute(
+            "SELECT enabled FROM agent_profiles WHERE agent_id=? "
+            "AND profile_version=?",
+            (str(draft["agent_id"]), profile_version),
+        ).fetchone()
+        mode = conn.execute(
+            "SELECT 1 FROM agent_modes WHERE agent_id=? AND mode_id=? "
+            "AND policy_version=?",
+            (
+                str(draft["agent_id"]),
+                str(template.get("mode_id") or ""),
+                policy_version,
+            ),
+        ).fetchone()
+        if (
+            lifecycle is None
+            or str(lifecycle["lifecycle_state"])
+            != AgentLifecycleState.ENABLED.value
+            or str(lifecycle["desired_process_state"])
+            != AgentDesiredProcessState.RUNNING.value
+            or int(lifecycle["profile_version"]) != profile_version
+            or profile is None
+            or not bool(profile["enabled"])
+            or mode is None
+        ):
+            raise InvalidTransition(
+                "natural cron frozen Agent policy is unavailable"
+            )
+        target = cls._fresh_cron_reply_target(
+            cls._coerce_reply_target(template.get("reply_target"))
+        )
+        origin_target = cls._fresh_cron_reply_target(
+            cls._coerce_reply_target(
+                json_loads(draft["origin_reply_target_json"], {}) or {}
+            )
+        )
+        if cls._reply_target_snapshot(
+            target.to_dict()
+        ) != cls._reply_target_snapshot(origin_target.to_dict()):
+            raise StoreError("natural cron task destination was altered")
+        inputs = template.get("inputs", {})
+        if (
+            not isinstance(inputs, Mapping)
+            or set(inputs) - {"text"}
+            or str(inputs.get("text") or "") != str(draft["prompt"])
+        ):
+            raise StoreError("natural cron task prompt was altered")
+        metadata = template.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise StoreError("natural cron task metadata is malformed")
+        if str(metadata.get("cron_job_id") or "") != str(draft["job_id"]):
+            raise StoreError("natural cron task job identity was altered")
+        forbidden = {
+            "_process_agent_bridge_capability",
+            "direct_user_request",
+            "command_snapshot",
+            "__command_snapshot",
+            "synthetic_command_name",
+            "initial_reply",
+            "reply_scope_id",
+            "delivery_reply_scope_id",
+            "pending_delivery_reply_scope_id",
+            "agent_bridge",
+            "agent_bridge_capability",
+            "bridge_capability",
+            "cron",
+            "cron_firing",
+        }
+        if forbidden.intersection(metadata):
+            raise StoreError("natural cron task metadata contains live-turn state")
+        identity = template.get("identity_snapshot", {})
+        if not isinstance(identity, Mapping):
+            raise StoreError("natural cron identity snapshot is malformed")
+        principal = identity.get("principal", {})
+        subject = identity.get("conversation_subject", {})
+        if not isinstance(principal, Mapping) or not isinstance(
+            subject, Mapping
+        ):
+            raise StoreError("natural cron identity snapshot is malformed")
+        expected_revision = (
+            int(draft["principal_mapping_revision"])
+            if draft["principal_mapping_revision"] is not None
+            else None
+        )
+        actual_revision = principal.get("mapping_revision")
+        if actual_revision in (0, "0", "") and expected_revision is None:
+            actual_revision = None
+        if (
+            str(principal.get("principal_id") or "")
+            != str(draft["principal_id"] or "")
+            or str(principal.get("principal_account_id") or "")
+            != str(draft["principal_account_id"] or "")
+            or actual_revision != expected_revision
+            or str(subject.get("conversation_subject_id") or "")
+            != str(draft["origin_conversation_subject_id"] or "")
+            or str(subject.get("scope_key") or "")
+            != str(draft["origin_conversation_subject_scope"])
+        ):
+            raise StoreError("natural cron identity snapshot was altered")
+        return template
+
+    @classmethod
+    def _validate_natural_cron_draft_snapshot_tx(
+        cls,
+        conn: sqlite3.Connection,
+        draft: sqlite3.Row,
+    ) -> None:
+        """Fail closed when a v41 draft no longer matches its frozen source."""
+
+        source = conn.execute(
+            "SELECT * FROM tasks WHERE task_id=?",
+            (str(draft["source_task_id"]),),
+        ).fetchone()
+        inbound = conn.execute(
+            "SELECT * FROM inbound_messages WHERE message_id=?",
+            (str(draft["source_inbound_message_id"]),),
+        ).fetchone()
+        if source is None or inbound is None:
+            raise StoreError("natural cron draft source is unavailable")
+
+        created_at = text_to_datetime(draft["created_at"])
+        updated_at = text_to_datetime(draft["updated_at"])
+        expires_at = text_to_datetime(draft["expires_at"])
+        if (
+            created_at is None
+            or updated_at is None
+            or expires_at is None
+            or updated_at < created_at
+            or expires_at
+            != created_at
+            + timedelta(seconds=DEFAULT_NATURAL_CRON_DRAFT_TTL_SECONDS)
+        ):
+            raise StoreError("natural cron draft timestamps are invalid")
+        spec = schedule_from_parts(
+            str(draft["schedule_kind"]),
+            str(draft["schedule_expression"]),
+            timezone_name=str(draft["timezone_name"]),
+        )
+        first_fire = first_fire_at(spec, created_at=created_at)
+        if (
+            spec.kind != str(draft["schedule_kind"])
+            or spec.expression != str(draft["schedule_expression"])
+            or spec.timezone_name != str(draft["timezone_name"])
+            or first_fire is None
+            or _utc_text(first_fire) != str(draft["next_fire_at"])
+        ):
+            raise StoreError("natural cron draft schedule projection is invalid")
+
+        target = cls._fresh_cron_reply_target(
+            cls._coerce_reply_target(
+                json_loads(draft["origin_reply_target_json"], {}) or {}
+            )
+        )
+        source_target = cls._fresh_cron_reply_target(
+            cls._coerce_reply_target(
+                json_loads(source["reply_target_json"], {}) or {}
+            )
+        )
+        expected_target = (
+            str(draft["origin_channel"]),
+            str(draft["origin_bot_id"]),
+            str(draft["origin_external_user_id"]),
+            str(draft["origin_session_id"]),
+            str(draft["origin_conversation_subject_id"] or ""),
+            str(draft["origin_conversation_subject_scope"]),
+        )
+        actual_target = (
+            target.channel,
+            target.bot_id,
+            target.external_user_id,
+            target.session_id or "default",
+            str(target.conversation_subject_id or ""),
+            str(target.conversation_subject_scope or ""),
+        )
+        if (
+            actual_target != expected_target
+            or cls._reply_target_snapshot(target.to_dict())
+            != cls._reply_target_snapshot(source_target.to_dict())
+        ):
+            raise StoreError("natural cron draft destination is invalid")
+
+        template = json_loads(draft["task_template_json"], {}) or {}
+        if not isinstance(template, Mapping):
+            raise StoreError("natural cron task template is malformed")
+        required_template = {
+            "agent_id", "conversation_id", "thread_id", "mode_id",
+            "profile_version", "policy_version", "model", "reasoning_effort",
+            "reply_target", "inputs", "parent_task_id", "child_depth",
+            "metadata", "actor_external_user_id", "principal_id",
+            "principal_account_id", "conversation_subject_id",
+            "identity_snapshot",
+        }
+        if set(template) != required_template:
+            raise StoreError("natural cron task template shape is invalid")
+        scalar_pairs = (
+            ("agent_id", draft["agent_id"]),
+            ("conversation_id", draft["conversation_id"]),
+            ("mode_id", source["mode_id"]),
+            ("profile_version", source["profile_version"]),
+            ("policy_version", source["policy_version"]),
+            ("model", source["model"]),
+            ("reasoning_effort", source["reasoning_effort"]),
+            ("actor_external_user_id", draft["origin_external_user_id"]),
+            ("principal_id", draft["principal_id"]),
+            ("principal_account_id", draft["principal_account_id"]),
+            (
+                "conversation_subject_id",
+                draft["origin_conversation_subject_id"],
+            ),
+        )
+        conflicts = [
+            name
+            for name, expected in scalar_pairs
+            if str(template.get(name) or "") != str(expected or "")
+        ]
+        if str(template.get("thread_id") or "") != str(source["thread_id"] or ""):
+            conflicts.append("thread_id")
+        if template.get("parent_task_id") is not None or int(
+            template.get("child_depth") or 0
+        ) != 0:
+            conflicts.append("lineage")
+        inputs = template.get("inputs")
+        if not isinstance(inputs, Mapping) or dict(inputs) != {
+            "text": str(draft["prompt"])
+        }:
+            conflicts.append("inputs")
+        template_target = cls._fresh_cron_reply_target(
+            cls._coerce_reply_target(template.get("reply_target"))
+        )
+        if cls._reply_target_snapshot(
+            template_target.to_dict()
+        ) != cls._reply_target_snapshot(target.to_dict()):
+            conflicts.append("reply_target")
+        metadata = template.get("metadata")
+        forbidden = {
+            "_process_agent_bridge_capability",
+            "direct_user_request", "command_snapshot", "__command_snapshot",
+            "synthetic_command_name", "initial_reply", "reply_scope_id",
+            "delivery_reply_scope_id", "pending_delivery_reply_scope_id",
+            "agent_bridge", "agent_bridge_capability", "bridge_capability",
+            "cron", "cron_firing",
+        }
+        if (
+            not isinstance(metadata, Mapping)
+            or str(metadata.get("cron_job_id") or "") != str(draft["job_id"])
+            or forbidden.intersection(metadata)
+        ):
+            conflicts.append("metadata")
+        identity = template.get("identity_snapshot")
+        source_identity = json_loads(source["identity_snapshot_json"], {}) or {}
+        if (
+            not isinstance(identity, Mapping)
+            or cls._json_snapshot(identity) != cls._json_snapshot(source_identity)
+        ):
+            conflicts.append("identity_snapshot")
+        principal_snapshot = (
+            identity.get("principal", {})
+            if isinstance(identity, Mapping)
+            else {}
+        )
+        actor_snapshot = (
+            identity.get("actor", {})
+            if isinstance(identity, Mapping)
+            else {}
+        )
+        if (
+            not isinstance(actor_snapshot, Mapping)
+            or str(actor_snapshot.get("channel") or "")
+            != str(draft["origin_channel"])
+            or str(actor_snapshot.get("bot_id") or "")
+            != str(draft["origin_bot_id"])
+            or str(actor_snapshot.get("external_user_id") or "")
+            != str(draft["origin_external_user_id"])
+        ):
+            conflicts.append("identity_actor")
+        if not isinstance(principal_snapshot, Mapping):
+            conflicts.append("identity_snapshot")
+        else:
+            expected_revision = (
+                int(draft["principal_mapping_revision"])
+                if draft["principal_mapping_revision"] is not None
+                else None
+            )
+            actual_revision = principal_snapshot.get("mapping_revision")
+            if actual_revision in (0, "0", "") and expected_revision is None:
+                actual_revision = None
+            try:
+                normalized_revision = (
+                    int(actual_revision)
+                    if actual_revision is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                normalized_revision = object()
+            if (
+                str(principal_snapshot.get("principal_id") or "")
+                != str(draft["principal_id"] or "")
+                or str(
+                    principal_snapshot.get("principal_account_id") or ""
+                )
+                != str(draft["principal_account_id"] or "")
+                or normalized_revision != expected_revision
+            ):
+                conflicts.append("principal_mapping_revision")
+        if conflicts:
+            raise StoreError(
+                "natural cron task template conflicts with its source: "
+                + ", ".join(dict.fromkeys(conflicts))
+            )
+
+        state = str(draft["state"])
+        job = conn.execute(
+            "SELECT * FROM cron_jobs WHERE job_id=?",
+            (str(draft["job_id"]),),
+        ).fetchone()
+        if state == "confirmed":
+            if job is None:
+                raise StoreError("confirmed natural cron draft has no job")
+            cls._validate_natural_cron_job_tx(
+                conn,
+                draft=draft,
+                job=job,
+                require_initial_projection=False,
+            )
+        elif job is not None:
+            raise StoreError("unconfirmed natural cron draft has a job")
+
+        if state not in {"confirmed", "cancelled"}:
+            return
+        confirmation_inbound = conn.execute(
+            "SELECT * FROM inbound_messages WHERE message_id=?",
+            (str(draft["confirmation_inbound_message_id"]),),
+        ).fetchone()
+        if confirmation_inbound is None:
+            raise StoreError("natural cron confirmation evidence is unavailable")
+        action = "confirm" if state == "confirmed" else "cancel"
+        if (
+            cls._natural_cron_resolution_text(confirmation_inbound["text"])
+            not in cls._natural_cron_resolution_phrases(
+                action, str(draft["draft_id"])
+            )
+            or str(confirmation_inbound["stored_at"])
+            <= str(draft["created_at"])
+            or str(confirmation_inbound["channel"])
+            != str(draft["origin_channel"])
+            or str(confirmation_inbound["bot_id"])
+            != str(draft["origin_bot_id"])
+            or str(confirmation_inbound["external_user_id"])
+            != str(draft["origin_external_user_id"])
+            or str(confirmation_inbound["session_id"] or "default")
+            != str(draft["origin_session_id"])
+            or str(confirmation_inbound["conversation_subject_id"] or "")
+            != str(draft["origin_conversation_subject_id"] or "")
+            or str(confirmation_inbound["principal_id"] or "")
+            != str(draft["principal_id"] or "")
+            or str(confirmation_inbound["principal_account_id"] or "")
+            != str(draft["principal_account_id"] or "")
+        ):
+            raise StoreError("natural cron confirmation evidence is invalid")
+
+    @classmethod
+    def _validate_natural_cron_job_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        draft: sqlite3.Row,
+        job: sqlite3.Row,
+        require_initial_projection: bool,
+    ) -> None:
+        immutable = (
+            "job_id",
+            "principal_id",
+            "principal_account_id",
+            "origin_channel",
+            "origin_bot_id",
+            "origin_external_user_id",
+            "origin_conversation_subject_id",
+            "origin_conversation_subject_scope",
+            "origin_session_id",
+            "agent_id",
+            "agent_incarnation",
+            "schedule_kind",
+            "schedule_expression",
+            "timezone_name",
+            "prompt",
+            "created_at",
+        )
+        conflicts = [
+            name
+            for name in immutable
+            if str(job[name] or "") != str(draft[name] or "")
+        ]
+        for column in ("origin_reply_target_json", "task_template_json"):
+            if cls._json_snapshot(
+                json_loads(job[column], {}) or {}
+            ) != cls._json_snapshot(json_loads(draft[column], {}) or {}):
+                conflicts.append(column.removesuffix("_json"))
+        if job["expires_at"] is not None:
+            conflicts.append("expires_at")
+        if require_initial_projection:
+            if not bool(job["enabled"]):
+                conflicts.append("enabled")
+            if str(job["next_fire_at"] or "") != str(
+                draft["next_fire_at"]
+            ):
+                conflicts.append("next_fire_at")
+            if job["last_fired_at"] is not None:
+                conflicts.append("last_fired_at")
+            if job["disabled_at"] is not None or job["disabled_reason"] is not None:
+                conflicts.append("disabled")
+            firing = conn.execute(
+                "SELECT 1 FROM cron_firings WHERE job_id=? LIMIT 1",
+                (str(draft["job_id"]),),
+            ).fetchone()
+            if firing is not None:
+                conflicts.append("firings")
+        if conflicts:
+            raise StoreError(
+                "natural cron job conflicts with its draft: "
+                + ", ".join(dict.fromkeys(conflicts))
+            )
+
+    @classmethod
+    def _insert_natural_cron_job_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        draft: sqlite3.Row,
+        now_text: str,
+    ) -> sqlite3.Row:
+        """Insert the exact proposal snapshot without session reinterpretation."""
+
+        cls._natural_cron_frozen_template_tx(conn, draft)
+        spec = schedule_from_parts(
+            str(draft["schedule_kind"]),
+            str(draft["schedule_expression"]),
+            timezone_name=str(draft["timezone_name"]),
+        )
+        created_at = text_to_datetime(draft["created_at"])
+        if created_at is None:
+            raise StoreError("natural cron draft creation time is invalid")
+        first_fire = first_fire_at(spec, created_at=created_at)
+        if first_fire is None or _utc_text(first_fire) != str(
+            draft["next_fire_at"]
+        ):
+            raise StoreError("natural cron draft schedule projection is invalid")
+        existing = conn.execute(
+            "SELECT * FROM cron_jobs WHERE job_id=?",
+            (str(draft["job_id"]),),
+        ).fetchone()
+        if existing is not None:
+            cls._validate_natural_cron_job_tx(
+                conn,
+                draft=draft,
+                job=existing,
+                require_initial_projection=True,
+            )
+            return existing
+        conn.execute(
+            """INSERT INTO cron_jobs (
+                   job_id,principal_id,principal_account_id,origin_channel,
+                   origin_bot_id,origin_external_user_id,
+                   origin_conversation_subject_id,
+                   origin_conversation_subject_scope,origin_session_id,
+                   origin_reply_target_json,agent_id,agent_incarnation,
+                   task_template_json,schedule_kind,schedule_expression,
+                   timezone_name,prompt,enabled,created_at,updated_at,
+                   next_fire_at,last_fired_at,expires_at,disabled_at,
+                   disabled_reason
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,NULL,
+                         NULL,NULL,NULL)""",
+            (
+                draft["job_id"],
+                draft["principal_id"],
+                draft["principal_account_id"],
+                draft["origin_channel"],
+                draft["origin_bot_id"],
+                draft["origin_external_user_id"],
+                draft["origin_conversation_subject_id"],
+                draft["origin_conversation_subject_scope"],
+                draft["origin_session_id"],
+                draft["origin_reply_target_json"],
+                draft["agent_id"],
+                draft["agent_incarnation"],
+                draft["task_template_json"],
+                draft["schedule_kind"],
+                draft["schedule_expression"],
+                draft["timezone_name"],
+                draft["prompt"],
+                draft["created_at"],
+                now_text,
+                draft["next_fire_at"],
+            ),
+        )
+        created = conn.execute(
+            "SELECT * FROM cron_jobs WHERE job_id=?",
+            (str(draft["job_id"]),),
+        ).fetchone()
+        if created is None:
+            raise StoreError("natural cron job insert failed")
+        cls._validate_natural_cron_job_tx(
+            conn,
+            draft=draft,
+            job=created,
+            require_initial_projection=True,
+        )
+        return created
+
+    @staticmethod
+    def _cron_job_disable_tx(
+        conn: sqlite3.Connection,
+        *,
+        job_id: str,
+        now_text: str,
+        reason: str,
+    ) -> None:
+        conn.execute(
+            "UPDATE cron_jobs SET enabled=0,next_fire_at=NULL,"
+            "updated_at=?,disabled_at=COALESCE(disabled_at,?),"
+            "disabled_reason=COALESCE(disabled_reason,?) "
+            "WHERE job_id=? AND enabled=1",
+            (now_text, now_text, str(reason or "disabled"), job_id),
+        )
+
+    @staticmethod
+    def _cron_job_fireability_reason_tx(
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> str | None:
+        """Return a durable reason when a scheduled capability is revoked."""
+
+        principal_id = str(row["principal_id"] or "")
+        account_id = str(row["principal_account_id"] or "")
+        if principal_id or account_id:
+            if not principal_id or not account_id:
+                return "owner principal mapping is incomplete"
+            mapping = conn.execute(
+                """SELECT 1
+                     FROM principal_accounts AS account
+                     JOIN principals AS principal
+                       ON principal.principal_id=account.principal_id
+                    WHERE account.principal_account_id=?
+                      AND account.principal_id=?
+                      AND account.channel=? AND account.bot_id=?
+                      AND account.external_user_id=?
+                      AND account.active=1 AND principal.enabled=1""",
+                (
+                    account_id,
+                    principal_id,
+                    str(row["origin_channel"]),
+                    str(row["origin_bot_id"]),
+                    str(row["origin_external_user_id"]),
+                ),
+            ).fetchone()
+            if mapping is None:
+                return "owner principal mapping is no longer active"
+
+        lifecycle = conn.execute(
+            """SELECT lifecycle_state,desired_process_state,profile_version
+                 FROM agent_lifecycle
+                WHERE agent_id=? AND agent_incarnation=?""",
+            (str(row["agent_id"]), int(row["agent_incarnation"])),
+        ).fetchone()
+        if lifecycle is None or (
+            str(lifecycle["lifecycle_state"])
+            != AgentLifecycleState.ENABLED.value
+            or str(lifecycle["desired_process_state"])
+            != AgentDesiredProcessState.RUNNING.value
+        ):
+            return "target Agent incarnation is no longer enabled"
+        profile = conn.execute(
+            "SELECT enabled FROM agent_profiles WHERE agent_id=? "
+            "AND profile_version=?",
+            (str(row["agent_id"]), int(lifecycle["profile_version"])),
+        ).fetchone()
+        if profile is None or not bool(profile["enabled"]):
+            return "target Agent profile is no longer enabled"
+
+        if str(row["origin_channel"]).casefold() == "lark":
+            bot = conn.execute(
+                """SELECT 1 FROM bot_profiles
+                    WHERE channel='lark' AND bot_id=? AND enabled=1
+                      AND removed_at IS NULL LIMIT 1""",
+                (str(row["origin_bot_id"]),),
+            ).fetchone()
+            if bot is None:
+                return "origin Lark bot is disabled or removed"
+        return None
+
+    @staticmethod
+    def _cron_owner_scope_tx(
+        conn: sqlite3.Connection,
+        *,
+        principal_id: str,
+        principal_account_id: str,
+        principal_mapping_revision: int | None,
+        origin_channel: str,
+        origin_bot_id: str,
+        origin_external_user_id: str,
+        require_mapping_revision: bool,
+        not_found_job_id: str | None = None,
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Authenticate one cron owner snapshot and return its row predicate.
+
+        The caller already owns the surrounding transaction.  Keeping the
+        live principal mapping check and job predicate in that transaction
+        prevents a remap/revocation from racing a list, lookup, delete, or
+        idempotent create replay.  A mapped principal may also manage legacy
+        jobs created by this exact transport account before it was mapped;
+        unmapped callers may manage only those exact-origin legacy rows.
+        """
+
+        principal_value = str(principal_id or "").strip()
+        account_value = str(principal_account_id or "").strip()
+        channel_value = str(origin_channel or "").strip()
+        bot_value = str(origin_bot_id or "").strip()
+        actor_value = str(origin_external_user_id or "").strip()
+        if not all((channel_value, bot_value, actor_value)):
+            raise ValueError("cron owner channel, bot, and actor are required")
+        if bool(principal_value) != bool(account_value):
+            raise ValueError(
+                "cron principal_id and principal_account_id must be supplied together"
+            )
+
+        def reject() -> None:
+            if not_found_job_id is not None:
+                raise NotFoundError(
+                    f"cron job not found: {not_found_job_id}"
+                )
+            raise PermissionError("cron owner mapping is no longer active")
+
+        active = conn.execute(
+            """SELECT account.principal_account_id,account.principal_id,
+                      account.mapping_revision,principal.enabled
+                 FROM principal_accounts AS account
+                 JOIN principals AS principal
+                   ON principal.principal_id=account.principal_id
+                WHERE account.channel=? AND account.bot_id=?
+                  AND account.external_user_id=? AND account.active=1""",
+            (channel_value, bot_value, actor_value),
+        ).fetchone()
+        if principal_value:
+            if principal_mapping_revision is None:
+                if require_mapping_revision:
+                    reject()
+                revision_value = None
+            else:
+                try:
+                    revision_value = int(principal_mapping_revision)
+                except (TypeError, ValueError):
+                    reject()
+                    raise AssertionError("unreachable")
+                if revision_value <= 0:
+                    reject()
+            if (
+                active is None
+                or not bool(active["enabled"])
+                or str(active["principal_id"]) != principal_value
+                or str(active["principal_account_id"]) != account_value
+                or (
+                    revision_value is not None
+                    and int(active["mapping_revision"]) != revision_value
+                )
+            ):
+                reject()
+            return (
+                "(principal_id=? OR (principal_id IS NULL "
+                "AND origin_channel=? AND origin_bot_id=? "
+                "AND origin_external_user_id=?))",
+                (principal_value, channel_value, bot_value, actor_value),
+            )
+
+        if principal_mapping_revision not in (None, 0, "", "0") or active is not None:
+            reject()
+        return (
+            "(principal_id IS NULL AND origin_channel=? AND origin_bot_id=? "
+            "AND origin_external_user_id=?)",
+            (channel_value, bot_value, actor_value),
+        )
+
+    @classmethod
+    def _validate_cron_subject_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        subject_id: str | None,
+        channel: str,
+        bot_id: str,
+        scope: str,
+    ) -> None:
+        if not subject_id:
+            return
+        row = conn.execute(
+            "SELECT channel,bot_id,scope_key FROM conversation_subjects "
+            "WHERE conversation_subject_id=?",
+            (subject_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError("cron origin conversation subject is unavailable")
+        if (
+            str(row["channel"]) != channel
+            or str(row["bot_id"]) != bot_id
+            or str(row["scope_key"]) != scope
+        ):
+            raise StoreError("cron origin conversation subject conflicts")
+
+    @classmethod
+    def _normalize_cron_task_template_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        raw_template: Any,
+        prompt: str,
+        agent_id: str,
+        agent_incarnation: int,
+        origin_target: ReplyTarget,
+        route_scope: str,
+        principal_id: str | None,
+        principal_account_id: str | None,
+        conversation_subject_id: str | None,
+        now_text: str,
+    ) -> dict[str, Any]:
+        """Validate and freeze a complete occurrence-independent AgentTask."""
+
+        lifecycle = conn.execute(
+            """SELECT profile_version,lifecycle_state,desired_process_state
+                 FROM agent_lifecycle
+                WHERE agent_id=? AND agent_incarnation=?""",
+            (agent_id, int(agent_incarnation)),
+        ).fetchone()
+        if lifecycle is None or (
+            str(lifecycle["lifecycle_state"])
+            != AgentLifecycleState.ENABLED.value
+            or str(lifecycle["desired_process_state"])
+            != AgentDesiredProcessState.RUNNING.value
+        ):
+            raise InvalidTransition(
+                f"target Agent is not enabled: {agent_id}@{agent_incarnation}"
+            )
+        profile_version = int(lifecycle["profile_version"])
+        profile = conn.execute(
+            "SELECT * FROM agent_profiles WHERE agent_id=? "
+            "AND profile_version=? AND enabled=1",
+            (agent_id, profile_version),
+        ).fetchone()
+        if profile is None:
+            raise InvalidTransition(f"target Agent profile is disabled: {agent_id}")
+
+        supplied = cls._mapping_snapshot(raw_template)
+        for occurrence_key in (
+            "task_id", "execution_id", "inbound_message_id", "dedupe_key",
+            "request_id",
+        ):
+            if supplied.get(occurrence_key) not in (None, ""):
+                raise ValueError(
+                    f"cron task template cannot set {occurrence_key}"
+                )
+        if supplied.get("parent_task_id") not in (None, "") or int(
+            supplied.get("child_depth", 0) or 0
+        ) != 0:
+            raise ValueError("cron task template cannot be a child task")
+
+        selected_mode = conn.execute(
+            """SELECT mode_id,policy_version,authorized_by,authorized_at
+                 FROM session_modes
+                WHERE channel=? AND bot_id=? AND external_user_id=?
+                  AND session_id=? AND agent_id=?""",
+            (
+                origin_target.channel,
+                origin_target.bot_id,
+                route_scope,
+                origin_target.session_id or "default",
+                agent_id,
+            ),
+        ).fetchone()
+        default_mode = str(profile["default_mode_id"] or "chat")
+        mode_id = str(
+            supplied.get("mode_id")
+            or (selected_mode["mode_id"] if selected_mode is not None else "")
+            or default_mode
+        ).strip().casefold()
+        if mode_id == "execute":
+            supplied_metadata = supplied.get("metadata", {})
+            supplied_authorization = (
+                supplied_metadata.get("mode_authorization", {})
+                if isinstance(supplied_metadata, Mapping)
+                else {}
+            )
+            trusted_startup = bool(
+                isinstance(supplied_authorization, Mapping)
+                and supplied_authorization.get("source") == "trusted_startup"
+            )
+            session_authorized = bool(
+                selected_mode is not None
+                and str(selected_mode["mode_id"]).casefold() == "execute"
+                and _normalized_authorization_evidence(
+                    selected_mode["authorized_by"],
+                    selected_mode["authorized_at"],
+                )
+                is not None
+            )
+            if not (session_authorized or trusted_startup):
+                raise PermissionError(
+                    "cron execute task requires durable mode authorization"
+                )
+        supplied_policy = supplied.get("policy_version")
+        policy_version = int(
+            supplied_policy
+            if supplied_policy not in (None, "")
+            else (
+                selected_mode["policy_version"]
+                if selected_mode is not None
+                and str(selected_mode["mode_id"]).casefold() == mode_id
+                else 0
+            )
+            or 0
+        )
+        mode = None
+        if policy_version > 0:
+            mode = conn.execute(
+                "SELECT 1 FROM agent_modes WHERE agent_id=? AND mode_id=? "
+                "AND policy_version=?",
+                (agent_id, mode_id, policy_version),
+            ).fetchone()
+            if mode is None and supplied_policy not in (None, ""):
+                raise StoreError(
+                    f"cron task mode policy is unavailable: "
+                    f"{agent_id}/{mode_id}@{policy_version}"
+                )
+        if mode is None:
+            mode = conn.execute(
+                "SELECT policy_version FROM agent_modes WHERE agent_id=? "
+                "AND mode_id=? ORDER BY policy_version DESC LIMIT 1",
+                (agent_id, mode_id),
+            ).fetchone()
+            if mode is None:
+                raise StoreError(
+                    f"cron task mode is unavailable: {agent_id}/{mode_id}"
+                )
+            policy_version = int(mode["policy_version"])
+        if supplied.get("profile_version") not in (None, "") and int(
+            supplied["profile_version"]
+        ) != profile_version:
+            raise StoreError("cron task profile does not match Agent incarnation")
+
+        preferences = conn.execute(
+            """SELECT model_id,reasoning_effort
+                 FROM session_model_preferences
+                WHERE channel=? AND bot_id=? AND external_user_id=?
+                  AND session_id=? AND agent_id=?""",
+            (
+                origin_target.channel,
+                origin_target.bot_id,
+                route_scope,
+                origin_target.session_id or "default",
+                agent_id,
+            ),
+        ).fetchone()
+        fresh_target = cls._fresh_cron_reply_target(origin_target)
+        supplied_target = cls._coerce_reply_target(
+            supplied.get("reply_target"), fallback=fresh_target
+        )
+        supplied_target = cls._fresh_cron_reply_target(supplied_target)
+        if cls._reply_target_snapshot(
+            supplied_target.to_dict()
+        ) != cls._reply_target_snapshot(fresh_target.to_dict()):
+            raise StoreError("cron task reply target conflicts with its origin")
+
+        supplied_agent = str(supplied.get("agent_id") or agent_id)
+        if supplied_agent != agent_id:
+            raise StoreError("cron task Agent conflicts with job ownership")
+        actor = str(
+            supplied.get("actor_external_user_id")
+            or origin_target.external_user_id
+        )
+        if actor != origin_target.external_user_id:
+            raise StoreError("cron task actor conflicts with its origin")
+        for field, supplied_value, expected in (
+            ("principal_id", supplied.get("principal_id"), principal_id),
+            (
+                "principal_account_id",
+                supplied.get("principal_account_id"),
+                principal_account_id,
+            ),
+            (
+                "conversation_subject_id",
+                supplied.get("conversation_subject_id"),
+                conversation_subject_id,
+            ),
+        ):
+            if supplied_value not in (None, "") and str(
+                supplied_value
+            ) != str(expected or ""):
+                raise StoreError(f"cron task {field} conflicts with its origin")
+
+        inputs = supplied.get("inputs", {"text": prompt})
+        if not isinstance(inputs, Mapping):
+            raise ValueError("cron task inputs must be a mapping")
+        inputs = dict(inputs)
+        if set(inputs) - {"text"}:
+            raise ValueError("cron task template supports only a text prompt")
+        if str(inputs.get("text") or "") != prompt:
+            raise ValueError("cron task prompt conflicts with job prompt")
+        metadata = supplied.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise ValueError("cron task metadata must be a mapping")
+        metadata = dict(metadata)
+        identity_snapshot = supplied.get("identity_snapshot", {})
+        if not isinstance(identity_snapshot, Mapping):
+            raise ValueError("cron task identity snapshot must be a mapping")
+
+        task = AgentTask(
+            agent_id=agent_id,
+            conversation_id=str(supplied.get("conversation_id") or ""),
+            thread_id=(str(supplied["thread_id"]) if supplied.get("thread_id") else None),
+            mode_id=mode_id,
+            profile_version=profile_version,
+            policy_version=policy_version,
+            model=str(
+                supplied.get("model")
+                if supplied.get("model") is not None
+                else (preferences["model_id"] if preferences is not None else "")
+                or ""
+            ),
+            reasoning_effort=str(
+                supplied.get("reasoning_effort")
+                if supplied.get("reasoning_effort") is not None
+                else (
+                    preferences["reasoning_effort"]
+                    if preferences is not None
+                    else ""
+                )
+                or ""
+            ),
+            reply_target=fresh_target,
+            inputs={"text": prompt},
+            metadata=metadata,
+            actor_external_user_id=actor,
+            principal_id=principal_id,
+            principal_account_id=principal_account_id,
+            conversation_subject_id=conversation_subject_id,
+            identity_snapshot=dict(identity_snapshot),
+        )
+        conversation_id = cls._ensure_conversation_tx(
+            conn,
+            task,
+            channel=origin_target.channel,
+            bot_id=origin_target.bot_id,
+            external_user_id=route_scope,
+            session_id=origin_target.session_id or "default",
+            now=now_text,
+        )
+        role_snapshot = cls._task_role_snapshot_tx(
+            conn,
+            metadata=task.metadata,
+            channel=origin_target.channel,
+            bot_id=origin_target.bot_id,
+            external_user_id=route_scope,
+            session_id=origin_target.session_id or "default",
+            agent_id=agent_id,
+        )
+        role_version, role_hash, persona_version = role_binding_key(role_snapshot)
+        thread_id = cls._resolve_task_thread_tx(
+            conn,
+            supplied_thread_id=task.thread_id,
+            conversation_id=conversation_id,
+            mode_id=mode_id,
+            profile_version=profile_version,
+            policy_version=policy_version,
+            role_version=role_version,
+            role_snapshot_hash=role_hash,
+            persona_composition_version=persona_version,
+        )
+        metadata["session_role"] = role_snapshot
+        normalized = {
+            "agent_id": agent_id,
+            "conversation_id": conversation_id,
+            "thread_id": thread_id,
+            "mode_id": mode_id,
+            "profile_version": profile_version,
+            "policy_version": policy_version,
+            "model": task.model,
+            "reasoning_effort": task.reasoning_effort,
+            "reply_target": fresh_target.to_dict(),
+            "inputs": {"text": prompt},
+            "parent_task_id": None,
+            "child_depth": 0,
+            "metadata": cls._json_snapshot(metadata),
+            "actor_external_user_id": actor,
+            "principal_id": principal_id,
+            "principal_account_id": principal_account_id,
+            "conversation_subject_id": conversation_subject_id,
+            "identity_snapshot": cls._json_snapshot(dict(identity_snapshot)),
+        }
+        return normalized
+
+    async def create_cron_job(
+        self,
+        job: CronJobRecord | Mapping[str, Any] | None = None,
+        *,
+        job_id: str | None = None,
+        principal_id: str | None = None,
+        principal_account_id: str | None = None,
+        principal_mapping_revision: int | None = None,
+        origin_channel: str | None = None,
+        origin_bot_id: str | None = None,
+        origin_external_user_id: str | None = None,
+        origin_conversation_subject_id: str | None = None,
+        origin_conversation_subject_scope: str | None = None,
+        origin_session_id: str | None = None,
+        origin_reply_target: Any = None,
+        agent_id: str | None = None,
+        agent_incarnation: int | None = None,
+        schedule_kind: str | None = None,
+        schedule_expression: str | None = None,
+        timezone_name: str | None = None,
+        prompt: str | None = None,
+        task_template: Any = None,
+        expires_at: datetime | str | None = None,
+        next_fire_at: datetime | str | None = None,
+        created_at: datetime | str | None = None,
+        now: datetime | str | None = None,
+    ) -> CronJobRecord:
+        """Create one immutable schedule, idempotent by caller-owned job ID."""
+
+        data = self._mapping_snapshot(job)
+
+        def value(name: str, supplied: Any, default: Any = None) -> Any:
+            return supplied if supplied is not None else data.get(name, default)
+
+        job_value = str(value("job_id", job_id, "") or _uuid()).strip()
+        principal_value = str(value("principal_id", principal_id, "") or "").strip()
+        account_value = str(
+            value("principal_account_id", principal_account_id, "") or ""
+        ).strip()
+        channel_value = str(value("origin_channel", origin_channel, "") or "").strip()
+        bot_value = str(value("origin_bot_id", origin_bot_id, "") or "").strip()
+        actor_value = str(
+            value("origin_external_user_id", origin_external_user_id, "") or ""
+        ).strip()
+        session_value = str(
+            value("origin_session_id", origin_session_id, "default") or "default"
+        ).strip()
+        subject_value = str(
+            value(
+                "origin_conversation_subject_id",
+                origin_conversation_subject_id,
+                "",
+            )
+            or ""
+        ).strip()
+        target_value = self._coerce_reply_target(
+            value("origin_reply_target", origin_reply_target),
+            fallback=ReplyTarget(
+                channel=channel_value,
+                bot_id=bot_value,
+                external_user_id=actor_value,
+                session_id=session_value,
+            ),
+        )
+        scope_value = str(
+            value(
+                "origin_conversation_subject_scope",
+                origin_conversation_subject_scope,
+                target_value.conversation_subject_scope or actor_value,
+            )
+            or ""
+        ).strip()
+        agent_value = str(value("agent_id", agent_id, "") or "").strip()
+        prompt_value = str(value("prompt", prompt, "") or "").strip()
+        kind_value = str(value("schedule_kind", schedule_kind, "") or "").strip()
+        expression_value = str(
+            value("schedule_expression", schedule_expression, "") or ""
+        ).strip()
+        timezone_value = str(
+            value("timezone_name", timezone_name, DEFAULT_TIMEZONE)
+            or DEFAULT_TIMEZONE
+        ).strip()
+        if not all(
+            (job_value, channel_value, bot_value, actor_value, session_value,
+             scope_value, agent_value, prompt_value, kind_value, expression_value)
+        ):
+            raise ValueError("cron job identity, schedule, Agent, and prompt are required")
+        if bool(principal_value) != bool(account_value):
+            raise ValueError(
+                "cron principal_id and principal_account_id must be supplied together"
+            )
+        spec = schedule_from_parts(
+            kind_value,
+            expression_value,
+            timezone_name=timezone_value,
+        )
+        kind_value = spec.kind
+        expression_value = spec.expression
+        timezone_value = spec.timezone_name
+        if (
+            target_value.channel != channel_value
+            or target_value.bot_id != bot_value
+            or target_value.external_user_id != actor_value
+            or str(target_value.session_id or "default") != session_value
+        ):
+            raise StoreError("cron reply target conflicts with origin identity")
+        if target_value.conversation_subject_scope and (
+            target_value.conversation_subject_scope != scope_value
+        ):
+            raise StoreError("cron reply target conflicts with origin conversation")
+        if subject_value and target_value.conversation_subject_id and (
+            target_value.conversation_subject_id != subject_value
+        ):
+            raise StoreError("cron reply target conflicts with origin subject")
+        target_value = ReplyTarget(
+            **{
+                **target_value.to_dict(),
+                "conversation_subject_id": (
+                    subject_value or target_value.conversation_subject_id
+                ),
+                "conversation_subject_scope": scope_value,
+            }
+        )
+        created_text = self._now(value("created_at", created_at, now))
+        created_dt = text_to_datetime(created_text)
+        if created_dt is None:
+            raise ValueError("cron created_at is invalid")
+        first_fire = first_fire_at(spec, created_at=created_dt)
+        if first_fire is None:
+            raise ValueError("cron schedule has no future occurrence")
+        supplied_next = value("next_fire_at", next_fire_at)
+        if supplied_next is not None and self._now(supplied_next) != _utc_text(first_fire):
+            raise ValueError("cron next_fire_at conflicts with its schedule")
+        next_text = _utc_text(first_fire)
+        expires_value = value("expires_at", expires_at)
+        expires_text = self._now(expires_value) if expires_value is not None else None
+        if expires_text is not None and expires_text <= next_text:
+            raise ValueError("cron expiry precedes its first occurrence")
+        raw_template = value("task_template", task_template)
+        requested_incarnation = value(
+            "agent_incarnation", agent_incarnation
+        )
+        mapping_revision_value = value(
+            "principal_mapping_revision", principal_mapping_revision
+        )
+
+        def op(conn: sqlite3.Connection) -> CronJobRecord:
+            with _transaction(conn):
+                existing_row = conn.execute(
+                    "SELECT * FROM cron_jobs WHERE job_id=?", (job_value,)
+                ).fetchone()
+                self._cron_owner_scope_tx(
+                    conn,
+                    principal_id=principal_value,
+                    principal_account_id=account_value,
+                    principal_mapping_revision=mapping_revision_value,
+                    origin_channel=channel_value,
+                    origin_bot_id=bot_value,
+                    origin_external_user_id=actor_value,
+                    require_mapping_revision=True,
+                )
+                if existing_row is not None:
+                    existing = self._cron_job_from_row(existing_row)
+                    if existing is None:
+                        raise StoreError("cron job row is malformed")
+                    immutable = {
+                        "principal_id": principal_value,
+                        "principal_account_id": account_value,
+                        "origin_channel": channel_value,
+                        "origin_bot_id": bot_value,
+                        "origin_external_user_id": actor_value,
+                        "origin_conversation_subject_id": subject_value,
+                        "origin_conversation_subject_scope": scope_value,
+                        "origin_session_id": session_value,
+                        "agent_id": agent_value,
+                        "schedule_kind": kind_value,
+                        "schedule_expression": expression_value,
+                        "timezone_name": timezone_value,
+                        "prompt": prompt_value,
+                        "expires_at": expires_text or "",
+                    }
+                    actual = {
+                        "principal_id": existing.principal_id,
+                        "principal_account_id": existing.principal_account_id or "",
+                        "origin_channel": existing.origin_channel,
+                        "origin_bot_id": existing.origin_bot_id,
+                        "origin_external_user_id": existing.origin_external_user_id,
+                        "origin_conversation_subject_id": (
+                            existing.origin_conversation_subject_id or ""
+                        ),
+                        "origin_conversation_subject_scope": (
+                            existing.origin_conversation_subject_scope
+                        ),
+                        "origin_session_id": existing.origin_session_id,
+                        "agent_id": existing.agent_id,
+                        "schedule_kind": existing.schedule_kind,
+                        "schedule_expression": existing.schedule_expression,
+                        "timezone_name": existing.timezone_name,
+                        "prompt": existing.prompt,
+                        "expires_at": _utc_text(existing.expires_at)
+                        if existing.expires_at is not None
+                        else "",
+                    }
+                    mismatches = [
+                        name for name, expected in immutable.items()
+                        if str(actual[name]) != str(expected)
+                    ]
+                    if requested_incarnation is not None and int(
+                        requested_incarnation
+                    ) != existing.agent_incarnation:
+                        mismatches.append("agent_incarnation")
+                    if self._reply_target_snapshot(
+                        existing.origin_reply_target.to_dict()
+                    ) != self._reply_target_snapshot(target_value.to_dict()):
+                        mismatches.append("origin_reply_target")
+                    if raw_template is not None:
+                        supplied_template = self._mapping_snapshot(raw_template)
+                        for name, supplied_item in supplied_template.items():
+                            if name in {
+                                "task_id", "execution_id", "inbound_message_id",
+                                "dedupe_key", "request_id",
+                            } and supplied_item in (None, ""):
+                                continue
+                            if name == "reply_target":
+                                incoming_target = self._fresh_cron_reply_target(
+                                    self._coerce_reply_target(supplied_item)
+                                )
+                                stored_target = ReplyTarget.from_value(
+                                    existing.task_template.get("reply_target", {})
+                                )
+                                if self._reply_target_snapshot(
+                                    incoming_target.to_dict()
+                                ) != self._reply_target_snapshot(
+                                    stored_target.to_dict()
+                                ):
+                                    mismatches.append("task_template.reply_target")
+                            elif name in existing.task_template and self._json_snapshot(
+                                supplied_item
+                            ) != self._json_snapshot(existing.task_template[name]):
+                                mismatches.append(f"task_template.{name}")
+                    if mismatches:
+                        raise StoreError(
+                            "cron job identity conflicts: " + ", ".join(
+                                dict.fromkeys(mismatches)
+                            )
+                        )
+                    return existing
+
+                self._validate_cron_subject_tx(
+                    conn,
+                    subject_id=subject_value or None,
+                    channel=channel_value,
+                    bot_id=bot_value,
+                    scope=scope_value,
+                )
+                if channel_value.casefold() == "lark":
+                    active_bot = conn.execute(
+                        "SELECT 1 FROM bot_profiles WHERE channel='lark' "
+                        "AND bot_id=? AND enabled=1 AND removed_at IS NULL",
+                        (bot_value,),
+                    ).fetchone()
+                    if active_bot is None:
+                        raise InvalidTransition(
+                            "cron origin Lark bot is disabled or removed"
+                        )
+                if requested_incarnation is None:
+                    lifecycle_rows = conn.execute(
+                        """SELECT agent_incarnation
+                             FROM agent_lifecycle
+                            WHERE agent_id=? AND lifecycle_state='enabled'
+                              AND desired_process_state='running'
+                            ORDER BY agent_incarnation DESC""",
+                        (agent_value,),
+                    ).fetchall()
+                    if len(lifecycle_rows) != 1:
+                        raise StoreError(
+                            f"Agent incarnation is not uniquely resolvable: {agent_value}"
+                        )
+                    incarnation_value = int(
+                        lifecycle_rows[0]["agent_incarnation"]
+                    )
+                else:
+                    incarnation_value = int(requested_incarnation)
+                normalized_template = self._normalize_cron_task_template_tx(
+                    conn,
+                    raw_template=raw_template,
+                    prompt=prompt_value,
+                    agent_id=agent_value,
+                    agent_incarnation=incarnation_value,
+                    origin_target=target_value,
+                    route_scope=scope_value,
+                    principal_id=principal_value or None,
+                    principal_account_id=account_value or None,
+                    conversation_subject_id=subject_value or None,
+                    now_text=created_text,
+                )
+                conn.execute(
+                    """INSERT INTO cron_jobs (
+                           job_id,principal_id,principal_account_id,
+                           origin_channel,origin_bot_id,origin_external_user_id,
+                           origin_conversation_subject_id,
+                           origin_conversation_subject_scope,origin_session_id,
+                           origin_reply_target_json,agent_id,agent_incarnation,
+                           task_template_json,schedule_kind,schedule_expression,
+                           timezone_name,prompt,enabled,created_at,updated_at,
+                           next_fire_at,last_fired_at,expires_at,disabled_at,
+                           disabled_reason
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,NULL,?,NULL,NULL)""",
+                    (
+                        job_value,
+                        principal_value or None,
+                        account_value or None,
+                        channel_value,
+                        bot_value,
+                        actor_value,
+                        subject_value or None,
+                        scope_value,
+                        session_value,
+                        json_dumps(target_value.to_dict()),
+                        agent_value,
+                        incarnation_value,
+                        json_dumps(normalized_template),
+                        kind_value,
+                        expression_value,
+                        timezone_value,
+                        prompt_value,
+                        created_text,
+                        created_text,
+                        next_text,
+                        expires_text,
+                    ),
+                )
+                created = self._cron_job_from_row(
+                    conn.execute(
+                        "SELECT * FROM cron_jobs WHERE job_id=?", (job_value,)
+                    ).fetchone()
+                )
+                if created is None:
+                    raise StoreError("cron job insert failed")
+                return created
+
+        return await self._call(op)
+
+    async def create_natural_cron_draft(
+        self,
+        draft: NaturalCronDraftRecord | Mapping[str, Any] | None = None,
+        *,
+        draft_id: str | None = None,
+        job_id: str | None = None,
+        source_task_id: str | None = None,
+        source_execution_id: str | None = None,
+        schedule_kind: str | None = None,
+        schedule_expression: str | None = None,
+        timezone_name: str | None = None,
+        prompt: str | None = None,
+        next_fire_at: datetime | str | None = None,
+        created_at: datetime | str | None = None,
+        expires_at: datetime | str | None = None,
+        now: datetime | str | None = None,
+    ) -> NaturalCronDraftRecord:
+        """Freeze a proposed schedule without creating an executable job."""
+
+        data = self._mapping_snapshot(draft)
+
+        def value(name: str, supplied: Any, default: Any = None) -> Any:
+            return supplied if supplied is not None else data.get(name, default)
+
+        draft_value = str(value("draft_id", draft_id, "") or "").strip()
+        job_value = str(value("job_id", job_id, "") or "").strip()
+        task_value = str(
+            value("source_task_id", source_task_id, "") or ""
+        ).strip()
+        execution_value = str(
+            value("source_execution_id", source_execution_id, "") or ""
+        ).strip()
+        prompt_value = str(value("prompt", prompt, "") or "").strip()
+        kind_value = str(
+            value("schedule_kind", schedule_kind, "") or ""
+        ).strip()
+        expression_value = str(
+            value("schedule_expression", schedule_expression, "") or ""
+        ).strip()
+        timezone_value = str(
+            value("timezone_name", timezone_name, DEFAULT_TIMEZONE)
+            or DEFAULT_TIMEZONE
+        ).strip()
+        if not all(
+            (
+                draft_value,
+                job_value,
+                task_value,
+                execution_value,
+                prompt_value,
+                kind_value,
+                expression_value,
+            )
+        ):
+            raise ValueError(
+                "natural cron draft identity, source, schedule, and prompt "
+                "are required"
+            )
+        spec = schedule_from_parts(
+            kind_value,
+            expression_value,
+            timezone_name=timezone_value,
+        )
+        kind_value = spec.kind
+        expression_value = spec.expression
+        timezone_value = spec.timezone_name
+        created_text = self._now(value("created_at", created_at, now))
+        created_dt = text_to_datetime(created_text)
+        if created_dt is None:
+            raise ValueError("natural cron draft creation time is invalid")
+        first_fire = first_fire_at(spec, created_at=created_dt)
+        if first_fire is None:
+            raise ValueError("natural cron schedule has no future occurrence")
+        next_text = _utc_text(first_fire)
+        supplied_next = value("next_fire_at", next_fire_at)
+        if supplied_next is not None and self._now(supplied_next) != next_text:
+            raise ValueError(
+                "natural cron next_fire_at conflicts with its schedule"
+            )
+        expected_expiry = _utc_text(
+            created_dt
+            + timedelta(seconds=DEFAULT_NATURAL_CRON_DRAFT_TTL_SECONDS)
+        )
+        supplied_expiry = value("expires_at", expires_at)
+        if (
+            supplied_expiry is not None
+            and self._now(supplied_expiry) != expected_expiry
+        ):
+            raise ValueError("natural cron draft expiry must be 15 minutes")
+
+        def op(conn: sqlite3.Connection) -> NaturalCronDraftRecord:
+            with _transaction(conn):
+                context = self._natural_cron_task_context_tx(
+                    conn,
+                    task_id=task_value,
+                    execution_id=execution_value,
+                    now_text=created_text,
+                )
+                self._expire_natural_cron_drafts_tx(
+                    conn, now_text=created_text
+                )
+                existing_row = conn.execute(
+                    "SELECT * FROM natural_cron_drafts WHERE draft_id=?",
+                    (draft_value,),
+                ).fetchone()
+                if existing_row is not None:
+                    expected = {
+                        "job_id": job_value,
+                        "source_task_id": task_value,
+                        "source_execution_id": execution_value,
+                        "schedule_kind": kind_value,
+                        "schedule_expression": expression_value,
+                        "timezone_name": timezone_value,
+                        "prompt": prompt_value,
+                    }
+                    conflicts = [
+                        name
+                        for name, expected_value in expected.items()
+                        if str(existing_row[name]) != str(expected_value)
+                    ]
+                    if conflicts or not self._natural_cron_scope_matches(
+                        existing_row, context
+                    ):
+                        if not conflicts:
+                            conflicts.append("origin")
+                        raise StoreError(
+                            "natural cron draft identity conflicts: "
+                            + ", ".join(conflicts)
+                        )
+                    existing = self._natural_cron_draft_from_row(existing_row)
+                    if existing is None:
+                        raise StoreError("natural cron draft row is malformed")
+                    if existing.state != "pending":
+                        raise InvalidTransition(
+                            "natural cron draft is already " + existing.state
+                        )
+                    return existing
+
+                task = context["row"]
+                target = self._fresh_cron_reply_target(context["target"])
+                metadata = dict(context["metadata"])
+                for transient in (
+                    "_process_agent_bridge_capability",
+                    "direct_user_request",
+                    "command_snapshot",
+                    "__command_snapshot",
+                    "synthetic_command_name",
+                    "initial_reply",
+                    "reply_scope_id",
+                    "delivery_reply_scope_id",
+                    "pending_delivery_reply_scope_id",
+                    "agent_bridge",
+                    "agent_bridge_capability",
+                    "bridge_capability",
+                    "cron",
+                    "cron_firing",
+                    "cron_job_id",
+                ):
+                    metadata.pop(transient, None)
+                metadata["cron_job_id"] = job_value
+                raw_template = {
+                    "agent_id": str(task["agent_id"]),
+                    "conversation_id": str(task["conversation_id"]),
+                    "thread_id": task["thread_id"],
+                    "mode_id": str(task["mode_id"]),
+                    "profile_version": int(task["profile_version"]),
+                    "policy_version": int(task["policy_version"]),
+                    "model": str(task["model"] or ""),
+                    "reasoning_effort": str(
+                        task["reasoning_effort"] or ""
+                    ),
+                    "reply_target": target.to_dict(),
+                    "inputs": {"text": prompt_value},
+                    "metadata": metadata,
+                    "actor_external_user_id": context["actor"],
+                    "principal_id": context["principal_id"] or None,
+                    "principal_account_id": (
+                        context["principal_account_id"] or None
+                    ),
+                    "conversation_subject_id": context["subject_id"],
+                    "identity_snapshot": context["identity_snapshot"],
+                }
+                normalized_template = self._normalize_cron_task_template_tx(
+                    conn,
+                    raw_template=raw_template,
+                    prompt=prompt_value,
+                    agent_id=str(task["agent_id"]),
+                    agent_incarnation=int(task["agent_incarnation"]),
+                    origin_target=target,
+                    route_scope=context["route_scope"],
+                    principal_id=context["principal_id"] or None,
+                    principal_account_id=(
+                        context["principal_account_id"] or None
+                    ),
+                    conversation_subject_id=context["subject_id"],
+                    now_text=created_text,
+                )
+                if str(normalized_template.get("conversation_id") or "") != str(
+                    task["conversation_id"]
+                ):
+                    raise StoreError(
+                        "natural cron source conversation changed during proposal"
+                    )
+
+                pending_rows = conn.execute(
+                    """SELECT * FROM natural_cron_drafts
+                        WHERE state='pending'
+                          AND origin_channel=? AND origin_bot_id=?
+                          AND origin_external_user_id=?
+                          AND origin_conversation_subject_id=?
+                          AND origin_conversation_subject_scope=?
+                          AND origin_session_id=? AND conversation_id=?
+                          AND agent_id=? AND agent_incarnation=?""",
+                    (
+                        target.channel,
+                        target.bot_id,
+                        context["actor"],
+                        context["subject_id"],
+                        context["route_scope"],
+                        target.session_id or "default",
+                        str(task["conversation_id"]),
+                        str(task["agent_id"]),
+                        int(task["agent_incarnation"]),
+                    ),
+                ).fetchall()
+                superseded_ids = [
+                    str(row["draft_id"])
+                    for row in pending_rows
+                    if self._natural_cron_scope_matches(row, context)
+                ]
+                if superseded_ids:
+                    placeholders = ",".join("?" for _ in superseded_ids)
+                    conn.execute(
+                        f"""UPDATE natural_cron_drafts
+                               SET state='superseded',resolved_at=?,updated_at=?
+                             WHERE state='pending'
+                               AND draft_id IN ({placeholders})""",
+                        (created_text, created_text, *superseded_ids),
+                    )
+
+                try:
+                    conn.execute(
+                        """INSERT INTO natural_cron_drafts (
+                               draft_id,job_id,source_task_id,
+                               source_execution_id,source_inbound_message_id,
+                               principal_id,principal_account_id,
+                               principal_mapping_revision,origin_channel,
+                               origin_bot_id,origin_external_user_id,
+                               origin_conversation_subject_id,
+                               origin_conversation_subject_scope,
+                               origin_session_id,origin_reply_target_json,
+                               conversation_id,agent_id,agent_incarnation,
+                               task_template_json,schedule_kind,
+                               schedule_expression,timezone_name,prompt,
+                               next_fire_at,state,created_at,updated_at,
+                               expires_at
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                                    ?,?,?,?,?,'pending',?,?,?)""",
+                        (
+                            draft_value,
+                            job_value,
+                            task_value,
+                            execution_value,
+                            str(task["inbound_message_id"]),
+                            context["principal_id"] or None,
+                            context["principal_account_id"] or None,
+                            context["principal_mapping_revision"],
+                            target.channel,
+                            target.bot_id,
+                            context["actor"],
+                            context["subject_id"],
+                            context["route_scope"],
+                            target.session_id or "default",
+                            json_dumps(target.to_dict()),
+                            str(task["conversation_id"]),
+                            str(task["agent_id"]),
+                            int(task["agent_incarnation"]),
+                            json_dumps(normalized_template),
+                            kind_value,
+                            expression_value,
+                            timezone_value,
+                            prompt_value,
+                            next_text,
+                            created_text,
+                            created_text,
+                            expected_expiry,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise StoreError(
+                        "natural cron draft identity conflicts"
+                    ) from exc
+                created = self._natural_cron_draft_from_row(
+                    conn.execute(
+                        "SELECT * FROM natural_cron_drafts WHERE draft_id=?",
+                        (draft_value,),
+                    ).fetchone()
+                )
+                if created is None:
+                    raise StoreError("natural cron draft insert failed")
+                return created
+
+        await self._persist_natural_cron_expiry(now_text=created_text)
+        return await self._call(op)
+
+    async def get_natural_cron_draft(
+        self,
+        draft_id: str,
+    ) -> NaturalCronDraftRecord | None:
+        return await self._call(
+            lambda conn: self._natural_cron_draft_from_row(
+                conn.execute(
+                    "SELECT * FROM natural_cron_drafts WHERE draft_id=?",
+                    (str(draft_id),),
+                ).fetchone()
+            )
+        )
+
+    async def list_natural_cron_drafts(
+        self,
+        *,
+        task_id: str,
+        execution_id: str,
+        states: Sequence[str] = ("pending",),
+        limit: int = 100,
+        now: datetime | str | None = None,
+    ) -> list[NaturalCronDraftRecord]:
+        """List unresolved drafts for one exact live origin only."""
+
+        state_values = tuple(dict.fromkeys(str(value) for value in states))
+        allowed = {
+            "pending",
+            "confirmed",
+            "cancelled",
+            "expired",
+            "superseded",
+        }
+        if not state_values or any(value not in allowed for value in state_values):
+            raise ValueError("natural cron draft state filter is invalid")
+        limit_value = max(0, min(100, int(limit)))
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> list[NaturalCronDraftRecord]:
+            with _transaction(conn):
+                context = self._natural_cron_task_context_tx(
+                    conn,
+                    task_id=str(task_id),
+                    execution_id=str(execution_id),
+                    now_text=now_text,
+                )
+                self._expire_natural_cron_drafts_tx(conn, now_text=now_text)
+                if limit_value == 0:
+                    return []
+                placeholders = ",".join("?" for _ in state_values)
+                current = context["row"]
+                rows = conn.execute(
+                    f"""SELECT * FROM natural_cron_drafts
+                         WHERE origin_channel=? AND origin_bot_id=?
+                           AND origin_external_user_id=?
+                           AND origin_session_id=?
+                           AND origin_conversation_subject_id=?
+                           AND origin_conversation_subject_scope=?
+                           AND conversation_id=? AND agent_id=?
+                           AND agent_incarnation=?
+                           AND state IN ({placeholders})
+                         ORDER BY created_at DESC,draft_id DESC""",
+                    (
+                        context["target"].channel,
+                        context["target"].bot_id,
+                        context["actor"],
+                        context["target"].session_id or "default",
+                        context["subject_id"],
+                        context["route_scope"],
+                        str(current["conversation_id"]),
+                        str(current["agent_id"]),
+                        int(current["agent_incarnation"]),
+                        *state_values,
+                    ),
+                ).fetchall()
+                records: list[NaturalCronDraftRecord] = []
+                for row in rows:
+                    if not self._natural_cron_scope_matches(row, context):
+                        continue
+                    self._natural_cron_draft_authority_tx(conn, row)
+                    record = self._natural_cron_draft_from_row(row)
+                    if record is not None:
+                        records.append(record)
+                    if len(records) >= limit_value:
+                        break
+                return records
+
+        return await self._call(op)
+
+    async def confirm_natural_cron_draft(
+        self,
+        draft_id: str,
+        *,
+        task_id: str,
+        execution_id: str,
+        now: datetime | str | None = None,
+    ) -> Mapping[str, Any]:
+        """Atomically authenticate, materialize, and confirm one proposal."""
+
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> Mapping[str, Any]:
+            with _transaction(conn):
+                context = self._natural_cron_task_context_tx(
+                    conn,
+                    task_id=str(task_id),
+                    execution_id=str(execution_id),
+                    now_text=now_text,
+                )
+                self._expire_natural_cron_drafts_tx(conn, now_text=now_text)
+                row = self._select_natural_cron_draft_tx(
+                    conn,
+                    draft_id=str(draft_id or ""),
+                    context=context,
+                )
+                self._natural_cron_draft_authority_tx(conn, row)
+                state = str(row["state"])
+                if state == "expired":
+                    raise InvalidTransition("natural cron draft expired")
+                if state not in {"pending", "confirmed"}:
+                    raise InvalidTransition(
+                        f"natural cron draft cannot be confirmed from {state}"
+                    )
+                evidence = self._natural_cron_resolution_evidence_tx(
+                    conn,
+                    draft=row,
+                    context=context,
+                    action="confirm",
+                )
+                existing_job = conn.execute(
+                    "SELECT * FROM cron_jobs WHERE job_id=?",
+                    (str(row["job_id"]),),
+                ).fetchone()
+                if state == "confirmed":
+                    if existing_job is None:
+                        raise StoreError(
+                            "confirmed natural cron draft has no job"
+                        )
+                    self._validate_natural_cron_job_tx(
+                        conn,
+                        draft=row,
+                        job=existing_job,
+                        require_initial_projection=False,
+                    )
+                    draft_record = self._natural_cron_draft_from_row(row)
+                    job_record = self._cron_job_from_row(existing_job)
+                    if draft_record is None or job_record is None:
+                        raise StoreError(
+                            "natural cron confirmation result is malformed"
+                        )
+                    return {"draft": draft_record, "job": job_record}
+                job = self._insert_natural_cron_job_tx(
+                    conn,
+                    draft=row,
+                    now_text=now_text,
+                )
+                changed = conn.execute(
+                    """UPDATE natural_cron_drafts
+                          SET state='confirmed',resolved_at=?,updated_at=?,
+                              confirmation_task_id=?,
+                              confirmation_execution_id=?,
+                              confirmation_inbound_message_id=?,
+                              confirmation_steering_id=?
+                        WHERE draft_id=? AND state='pending'
+                          AND expires_at>?""",
+                    (
+                        now_text,
+                        now_text,
+                        *evidence,
+                        str(row["draft_id"]),
+                        now_text,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise InvalidTransition(
+                        "natural cron completion lost its state fence"
+                    )
+                confirmed = self._natural_cron_draft_from_row(
+                    conn.execute(
+                        "SELECT * FROM natural_cron_drafts WHERE draft_id=?",
+                        (str(row["draft_id"]),),
+                    ).fetchone()
+                )
+                job_record = self._cron_job_from_row(job)
+                if confirmed is None or job_record is None:
+                    raise StoreError(
+                        "natural cron confirmation result is malformed"
+                    )
+                return {"draft": confirmed, "job": job_record}
+
+        await self._persist_natural_cron_expiry(now_text=now_text)
+        return await self._call(op)
+
+    async def cancel_natural_cron_draft(
+        self,
+        draft_id: str,
+        *,
+        task_id: str,
+        execution_id: str,
+        now: datetime | str | None = None,
+    ) -> NaturalCronDraftRecord:
+        """Cancel a pending draft using exact later human cancellation text."""
+
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> NaturalCronDraftRecord:
+            with _transaction(conn):
+                context = self._natural_cron_task_context_tx(
+                    conn,
+                    task_id=str(task_id),
+                    execution_id=str(execution_id),
+                    now_text=now_text,
+                )
+                self._expire_natural_cron_drafts_tx(conn, now_text=now_text)
+                row = self._select_natural_cron_draft_tx(
+                    conn,
+                    draft_id=str(draft_id or ""),
+                    context=context,
+                )
+                self._natural_cron_draft_authority_tx(conn, row)
+                state = str(row["state"])
+                if state == "expired":
+                    raise InvalidTransition("natural cron draft expired")
+                if state not in {"pending", "cancelled"}:
+                    raise InvalidTransition(
+                        f"natural cron draft cannot be cancelled from {state}"
+                    )
+                evidence = self._natural_cron_resolution_evidence_tx(
+                    conn,
+                    draft=row,
+                    context=context,
+                    action="cancel",
+                )
+                if state == "pending":
+                    changed = conn.execute(
+                        """UPDATE natural_cron_drafts
+                              SET state='cancelled',resolved_at=?,updated_at=?,
+                                  confirmation_task_id=?,
+                                  confirmation_execution_id=?,
+                                  confirmation_inbound_message_id=?,
+                                  confirmation_steering_id=?
+                            WHERE draft_id=? AND state='pending'
+                              AND expires_at>?""",
+                        (
+                            now_text,
+                            now_text,
+                            *evidence,
+                            str(row["draft_id"]),
+                            now_text,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise InvalidTransition(
+                            "natural cron cancellation lost its state fence"
+                        )
+                elif state == "cancelled":
+                    pass
+                record = self._natural_cron_draft_from_row(
+                    conn.execute(
+                        "SELECT * FROM natural_cron_drafts WHERE draft_id=?",
+                        (str(row["draft_id"]),),
+                    ).fetchone()
+                )
+                if record is None:
+                    raise StoreError("natural cron draft disappeared")
+                return record
+
+        await self._persist_natural_cron_expiry(now_text=now_text)
+        return await self._call(op)
+
+    async def get_cron_job(self, job_id: str) -> CronJobRecord | None:
+        def op(conn: sqlite3.Connection) -> CronJobRecord | None:
+            return self._cron_job_from_row(
+                conn.execute(
+                    "SELECT * FROM cron_jobs WHERE job_id=?", (str(job_id),)
+                ).fetchone()
+            )
+
+        return await self._call(op)
+
+    async def list_cron_jobs(
+        self,
+        *,
+        principal_id: str | None = None,
+        origin_channel: str | None = None,
+        origin_bot_id: str | None = None,
+        origin_external_user_id: str | None = None,
+        enabled: bool | None = None,
+        limit: int = 100,
+        order: str = "asc",
+    ) -> list[CronJobRecord]:
+        order_value = str(order or "").strip().casefold()
+        if order_value not in {"asc", "desc"}:
+            raise ValueError("cron list order must be asc or desc")
+        filters: list[str] = []
+        parameters: list[Any] = []
+        for column, value_ in (
+            ("principal_id", principal_id),
+            ("origin_channel", origin_channel),
+            ("origin_bot_id", origin_bot_id),
+            ("origin_external_user_id", origin_external_user_id),
+        ):
+            if value_ is not None:
+                filters.append(f"{column} IS ?" if value_ == "" else f"{column}=?")
+                parameters.append(None if value_ == "" else str(value_))
+        if enabled is not None:
+            filters.append("enabled=?")
+            parameters.append(int(bool(enabled)))
+        where = " WHERE " + " AND ".join(filters) if filters else ""
+        parameters.append(max(0, int(limit)))
+
+        def op(conn: sqlite3.Connection) -> list[CronJobRecord]:
+            rows = conn.execute(
+                "SELECT * FROM cron_jobs" + where
+                + f" ORDER BY created_at {order_value.upper()},"
+                + f"job_id {order_value.upper()} LIMIT ?",
+                parameters,
+            ).fetchall()
+            return [
+                record
+                for record in (self._cron_job_from_row(row) for row in rows)
+                if record is not None
+            ]
+
+        return await self._call(op)
+
+    async def list_cron_jobs_for_owner(
+        self,
+        *,
+        principal_id: str = "",
+        principal_account_id: str = "",
+        principal_mapping_revision: int | None = None,
+        origin_channel: str,
+        origin_bot_id: str,
+        origin_external_user_id: str,
+        enabled: bool | None = None,
+        limit: int = 100,
+        order: str = "desc",
+    ) -> list[CronJobRecord]:
+        """List a trusted owner's jobs under one mapping-consistent snapshot."""
+
+        order_value = str(order or "").strip().casefold()
+        if order_value not in {"asc", "desc"}:
+            raise ValueError("cron list order must be asc or desc")
+        limit_value = max(0, int(limit))
+
+        def op(conn: sqlite3.Connection) -> list[CronJobRecord]:
+            with _transaction(conn):
+                predicate, parameters = self._cron_owner_scope_tx(
+                    conn,
+                    principal_id=principal_id,
+                    principal_account_id=principal_account_id,
+                    principal_mapping_revision=principal_mapping_revision,
+                    origin_channel=origin_channel,
+                    origin_bot_id=origin_bot_id,
+                    origin_external_user_id=origin_external_user_id,
+                    require_mapping_revision=True,
+                )
+                filters = [predicate]
+                values: list[Any] = list(parameters)
+                if enabled is not None:
+                    filters.append("enabled=?")
+                    values.append(int(bool(enabled)))
+                values.append(limit_value)
+                rows = conn.execute(
+                    "SELECT * FROM cron_jobs WHERE "
+                    + " AND ".join(filters)
+                    + f" ORDER BY created_at {order_value.upper()},"
+                    + f"job_id {order_value.upper()} LIMIT ?",
+                    values,
+                ).fetchall()
+                return [
+                    record
+                    for record in (
+                        self._cron_job_from_row(row) for row in rows
+                    )
+                    if record is not None
+                ]
+
+        return await self._call(op)
+
+    async def get_cron_job_for_owner(
+        self,
+        job_id: str,
+        *,
+        principal_id: str = "",
+        principal_account_id: str = "",
+        principal_mapping_revision: int | None = None,
+        origin_channel: str,
+        origin_bot_id: str,
+        origin_external_user_id: str,
+    ) -> CronJobRecord:
+        """Read one owned job without revealing another owner's identity."""
+
+        job_value = str(job_id or "").strip()
+        if not job_value:
+            raise ValueError("cron job_id is required")
+
+        def op(conn: sqlite3.Connection) -> CronJobRecord:
+            with _transaction(conn):
+                predicate, parameters = self._cron_owner_scope_tx(
+                    conn,
+                    principal_id=principal_id,
+                    principal_account_id=principal_account_id,
+                    principal_mapping_revision=principal_mapping_revision,
+                    origin_channel=origin_channel,
+                    origin_bot_id=origin_bot_id,
+                    origin_external_user_id=origin_external_user_id,
+                    require_mapping_revision=True,
+                    not_found_job_id=job_value,
+                )
+                row = conn.execute(
+                    "SELECT * FROM cron_jobs WHERE job_id=? AND " + predicate,
+                    (job_value, *parameters),
+                ).fetchone()
+                result = self._cron_job_from_row(row)
+                if result is None:
+                    raise NotFoundError(f"cron job not found: {job_value}")
+                return result
+
+        return await self._call(op)
+
+    async def disable_cron_job_for_owner(
+        self,
+        job_id: str,
+        *,
+        principal_id: str = "",
+        principal_account_id: str = "",
+        principal_mapping_revision: int | None = None,
+        origin_channel: str,
+        origin_bot_id: str,
+        origin_external_user_id: str,
+        reason: str = "deleted by owner",
+        now: datetime | str | None = None,
+    ) -> CronJobRecord:
+        """Atomically authorize and disable a job without existence leaks."""
+
+        job_value = str(job_id or "").strip()
+        if not job_value:
+            raise ValueError("cron job_id is required")
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> CronJobRecord:
+            with _transaction(conn):
+                predicate, parameters = self._cron_owner_scope_tx(
+                    conn,
+                    principal_id=principal_id,
+                    principal_account_id=principal_account_id,
+                    principal_mapping_revision=principal_mapping_revision,
+                    origin_channel=origin_channel,
+                    origin_bot_id=origin_bot_id,
+                    origin_external_user_id=origin_external_user_id,
+                    require_mapping_revision=True,
+                    not_found_job_id=job_value,
+                )
+                row = conn.execute(
+                    "SELECT * FROM cron_jobs WHERE job_id=? AND " + predicate,
+                    (job_value, *parameters),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"cron job not found: {job_value}")
+                self._cron_job_disable_tx(
+                    conn,
+                    job_id=job_value,
+                    now_text=now_text,
+                    reason=reason,
+                )
+                result = self._cron_job_from_row(
+                    conn.execute(
+                        "SELECT * FROM cron_jobs WHERE job_id=?", (job_value,)
+                    ).fetchone()
+                )
+                if result is None:
+                    raise StoreError("cron job disappeared while disabling")
+                return result
+
+        return await self._call(op)
+
+    async def disable_cron_job(
+        self,
+        job_id: str,
+        *,
+        principal_id: str | None = None,
+        origin_channel: str | None = None,
+        origin_bot_id: str | None = None,
+        origin_external_user_id: str | None = None,
+        reason: str = "deleted by owner",
+        now: datetime | str | None = None,
+    ) -> CronJobRecord:
+        job_value = str(job_id or "").strip()
+        if not job_value:
+            raise ValueError("cron job_id is required")
+        origin_filter = (
+            origin_channel,
+            origin_bot_id,
+            origin_external_user_id,
+        )
+        if any(item is not None for item in origin_filter) and not all(
+            str(item or "").strip() for item in origin_filter
+        ):
+            raise ValueError("cron fallback ownership requires channel, bot, and actor")
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> CronJobRecord:
+            with _transaction(conn):
+                row = conn.execute(
+                    "SELECT * FROM cron_jobs WHERE job_id=?", (job_value,)
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"cron job not found: {job_value}")
+                if principal_id is not None:
+                    if str(row["principal_id"] or "") != str(principal_id or ""):
+                        raise NotFoundError(f"cron job not found: {job_value}")
+                elif all(item is not None for item in origin_filter):
+                    expected = tuple(str(item) for item in origin_filter)
+                    actual = (
+                        str(row["origin_channel"]),
+                        str(row["origin_bot_id"]),
+                        str(row["origin_external_user_id"]),
+                    )
+                    if actual != expected:
+                        raise NotFoundError(f"cron job not found: {job_value}")
+                self._cron_job_disable_tx(
+                    conn,
+                    job_id=job_value,
+                    now_text=now_text,
+                    reason=reason,
+                )
+                result = self._cron_job_from_row(
+                    conn.execute(
+                        "SELECT * FROM cron_jobs WHERE job_id=?", (job_value,)
+                    ).fetchone()
+                )
+                if result is None:
+                    raise StoreError("cron job disappeared while disabling")
+                return result
+
+        return await self._call(op)
+
+    delete_cron_job = disable_cron_job
+
+    async def reconcile_cron_jobs(
+        self,
+        *,
+        now: datetime | str | None = None,
+    ) -> list[CronJobRecord]:
+        """Validate enabled jobs without skipping an overdue catch-up firing."""
+
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> list[CronJobRecord]:
+            with _transaction(conn):
+                rows = conn.execute(
+                    "SELECT * FROM cron_jobs WHERE enabled=1 "
+                    "ORDER BY next_fire_at,job_id"
+                ).fetchall()
+                changed_ids: list[str] = []
+                for row in rows:
+                    job_value = str(row["job_id"])
+                    reason = self._cron_job_fireability_reason_tx(conn, row)
+                    if row["expires_at"] is not None and str(
+                        row["expires_at"]
+                    ) <= now_text:
+                        reason = "expired while scheduler was offline"
+                    try:
+                        spec = schedule_from_parts(
+                            str(row["schedule_kind"]),
+                            str(row["schedule_expression"]),
+                            timezone_name=str(row["timezone_name"]),
+                        )
+                    except CronScheduleError:
+                        reason = "stored schedule is invalid"
+                    if reason is not None:
+                        self._cron_job_disable_tx(
+                            conn,
+                            job_id=job_value,
+                            now_text=now_text,
+                            reason=reason,
+                        )
+                        changed_ids.append(job_value)
+                        continue
+
+                    latest = conn.execute(
+                        "SELECT scheduled_for,fired_at FROM cron_firings "
+                        "WHERE job_id=? ORDER BY scheduled_for DESC LIMIT 1",
+                        (job_value,),
+                    ).fetchone()
+                    if latest is None:
+                        created_at = text_to_datetime(row["created_at"])
+                        if created_at is None:
+                            self._cron_job_disable_tx(
+                                conn,
+                                job_id=job_value,
+                                now_text=now_text,
+                                reason="stored creation time is invalid",
+                            )
+                            changed_ids.append(job_value)
+                            continue
+                        expected = first_fire_at(spec, created_at=created_at)
+                        expected_last_fired = None
+                    else:
+                        scheduled_at = text_to_datetime(latest["scheduled_for"])
+                        fired_at = text_to_datetime(latest["fired_at"])
+                        if scheduled_at is None or fired_at is None:
+                            self._cron_job_disable_tx(
+                                conn,
+                                job_id=job_value,
+                                now_text=now_text,
+                                reason="stored firing history is invalid",
+                            )
+                            changed_ids.append(job_value)
+                            continue
+                        # Replaying the exact prior firing calculation retains
+                        # its at-most-one catch-up skip: a late fired_at moves
+                        # the repaired projection directly beyond that time.
+                        prior_plan = plan_due_firing(
+                            spec,
+                            scheduled_for=scheduled_at,
+                            now=fired_at,
+                        )
+                        expected = (
+                            prior_plan.next_fire_at
+                            if prior_plan is not None
+                            else None
+                        )
+                        expected_last_fired = _utc_text(fired_at)
+                    expected_text = (
+                        _utc_text(expected) if expected is not None else None
+                    )
+                    if expected_text is None:
+                        self._cron_job_disable_tx(
+                            conn,
+                            job_id=job_value,
+                            now_text=now_text,
+                            reason="schedule has no remaining occurrence",
+                        )
+                        changed_ids.append(job_value)
+                        continue
+                    if row["expires_at"] is not None and expected_text >= str(
+                        row["expires_at"]
+                    ):
+                        self._cron_job_disable_tx(
+                            conn,
+                            job_id=job_value,
+                            now_text=now_text,
+                            reason="schedule expiry reached",
+                        )
+                        changed_ids.append(job_value)
+                        continue
+                    stored_last = str(row["last_fired_at"] or "") or None
+                    if (
+                        str(row["next_fire_at"] or "") != expected_text
+                        or stored_last != expected_last_fired
+                    ):
+                        conn.execute(
+                            "UPDATE cron_jobs SET next_fire_at=?,last_fired_at=?,"
+                            "updated_at=? WHERE job_id=? AND enabled=1",
+                            (
+                                expected_text,
+                                expected_last_fired,
+                                now_text,
+                                job_value,
+                            ),
+                        )
+                        changed_ids.append(job_value)
+                if not changed_ids:
+                    return []
+                placeholders = ",".join("?" for _ in changed_ids)
+                changed = conn.execute(
+                    f"SELECT * FROM cron_jobs WHERE job_id IN ({placeholders}) "
+                    "ORDER BY created_at,job_id",
+                    changed_ids,
+                ).fetchall()
+                return [
+                    record
+                    for record in (
+                        self._cron_job_from_row(row) for row in changed
+                    )
+                    if record is not None
+                ]
+
+        return await self._call(op)
+
+    async def list_cron_firings(
+        self,
+        job_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[CronFiringRecord]:
+        def op(conn: sqlite3.Connection) -> list[CronFiringRecord]:
+            rows = conn.execute(
+                "SELECT * FROM cron_firings WHERE job_id=? "
+                "ORDER BY scheduled_for,firing_id LIMIT ?",
+                (str(job_id), max(0, int(limit))),
+            ).fetchall()
+            return [
+                record
+                for record in (
+                    self._cron_firing_from_row(row) for row in rows
+                )
+                if record is not None
+            ]
+
+        return await self._call(op)
+
+    @staticmethod
+    def _cron_occurrence_id(kind: str, job_id: str, scheduled_for: str) -> str:
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"codex-cron:{kind}:{job_id}:{scheduled_for}",
+            )
+        )
+
+    @classmethod
+    def _materialize_cron_task_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        job: sqlite3.Row,
+        scheduled_for: str,
+        fired_at: str,
+        max_agent_queue: int,
+        max_global_queue: int,
+        max_account_queue: int,
+        max_account_agent_queue: int,
+    ) -> TaskRecord:
+        template = json_loads(job["task_template_json"], {}) or {}
+        if not isinstance(template, Mapping):
+            raise StoreError("cron task template is malformed")
+        template = dict(template)
+        target = cls._fresh_cron_reply_target(
+            ReplyTarget.from_value(template.get("reply_target", {}))
+        )
+        origin_target = cls._fresh_cron_reply_target(
+            ReplyTarget.from_value(
+                json_loads(job["origin_reply_target_json"], {}) or {}
+            )
+        )
+        if cls._reply_target_snapshot(
+            target.to_dict()
+        ) != cls._reply_target_snapshot(origin_target.to_dict()):
+            raise StoreError("cron task template reply target was altered")
+        route_scope = str(job["origin_conversation_subject_scope"])
+        cls._validate_reply_target_scope(
+            target,
+            channel=str(job["origin_channel"]),
+            bot_id=str(job["origin_bot_id"]),
+            external_user_id=route_scope,
+            session_id=str(job["origin_session_id"] or "default"),
+        )
+        actor = str(template.get("actor_external_user_id") or "")
+        if actor != str(job["origin_external_user_id"]):
+            raise StoreError("cron task template actor was altered")
+        if str(template.get("agent_id") or "") != str(job["agent_id"]):
+            raise StoreError("cron task template Agent was altered")
+        if int(template.get("profile_version") or 0) <= 0 or int(
+            template.get("policy_version") or 0
+        ) <= 0:
+            raise StoreError("cron task template policy is incomplete")
+        lifecycle = conn.execute(
+            "SELECT profile_version,lifecycle_state,desired_process_state "
+            "FROM agent_lifecycle WHERE agent_id=? AND agent_incarnation=?",
+            (str(job["agent_id"]), int(job["agent_incarnation"])),
+        ).fetchone()
+        if lifecycle is None or (
+            str(lifecycle["lifecycle_state"])
+            != AgentLifecycleState.ENABLED.value
+            or str(lifecycle["desired_process_state"])
+            != AgentDesiredProcessState.RUNNING.value
+            or int(lifecycle["profile_version"])
+            != int(template["profile_version"])
+        ):
+            raise InvalidTransition("cron target Agent incarnation changed")
+        profile = conn.execute(
+            "SELECT enabled FROM agent_profiles WHERE agent_id=? "
+            "AND profile_version=?",
+            (str(job["agent_id"]), int(template["profile_version"])),
+        ).fetchone()
+        mode = conn.execute(
+            "SELECT 1 FROM agent_modes WHERE agent_id=? AND mode_id=? "
+            "AND policy_version=?",
+            (
+                str(job["agent_id"]),
+                str(template.get("mode_id") or ""),
+                int(template["policy_version"]),
+            ),
+        ).fetchone()
+        if profile is None or not bool(profile["enabled"]) or mode is None:
+            raise InvalidTransition("cron task policy snapshot is unavailable")
+
+        conversation_id = str(template.get("conversation_id") or "")
+        conversation = conn.execute(
+            "SELECT channel,bot_id,external_user_id,session_id,agent_id,"
+            "conversation_subject_id FROM conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        if conversation is None:
+            raise StoreError("cron task conversation is unavailable")
+        expected_conversation = (
+            str(job["origin_channel"]),
+            str(job["origin_bot_id"]),
+            route_scope,
+            str(job["origin_session_id"] or "default"),
+            str(job["agent_id"]),
+        )
+        actual_conversation = tuple(
+            str(conversation[name] or "")
+            for name in (
+                "channel", "bot_id", "external_user_id", "session_id", "agent_id"
+            )
+        )
+        # Canonical principal conversations deliberately retain the first
+        # verified transport provenance.  Their conversation_id is protected
+        # by the principal binding; transport conversations must match the
+        # exact origin tuple byte-for-byte.
+        principal_id = str(job["principal_id"] or "")
+        principal_binding = None
+        if principal_id:
+            principal_binding = conn.execute(
+                "SELECT 1 FROM principal_conversation_bindings "
+                "WHERE principal_id=? AND agent_id=? AND session_id=? "
+                "AND conversation_id=?",
+                (
+                    principal_id,
+                    str(job["agent_id"]),
+                    str(job["origin_session_id"] or "default"),
+                    conversation_id,
+                ),
+            ).fetchone()
+        if actual_conversation != expected_conversation and principal_binding is None:
+            raise StoreError("cron task conversation origin was altered")
+
+        metadata = template.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise StoreError("cron task metadata is malformed")
+        metadata = dict(metadata)
+        role_snapshot = cls._task_role_snapshot_tx(
+            conn,
+            metadata=metadata,
+            channel=str(job["origin_channel"]),
+            bot_id=str(job["origin_bot_id"]),
+            external_user_id=route_scope,
+            session_id=str(job["origin_session_id"] or "default"),
+            agent_id=str(job["agent_id"]),
+        )
+        role_version, role_hash, persona_version = role_binding_key(role_snapshot)
+        thread_id = cls._resolve_task_thread_tx(
+            conn,
+            supplied_thread_id=template.get("thread_id"),
+            conversation_id=conversation_id,
+            mode_id=str(template["mode_id"]),
+            profile_version=int(template["profile_version"]),
+            policy_version=int(template["policy_version"]),
+            role_version=role_version,
+            role_snapshot_hash=role_hash,
+            persona_composition_version=persona_version,
+        )
+        inputs = template.get("inputs", {})
+        if not isinstance(inputs, Mapping) or str(inputs.get("text") or "") != str(
+            job["prompt"]
+        ):
+            raise StoreError("cron task prompt snapshot was altered")
+        if set(inputs) - {"text"}:
+            raise StoreError("cron task template contains unsupported inputs")
+
+        firing_id = cls._cron_occurrence_id(
+            "firing", str(job["job_id"]), scheduled_for
+        )
+        task_id = cls._cron_occurrence_id(
+            "task", str(job["job_id"]), scheduled_for
+        )
+        request_id = "cron:" + firing_id
+        dedupe_key = (
+            "cron:" + str(job["job_id"]) + ":" + scheduled_for
+        )
+        metadata["cron"] = {
+            "job_id": str(job["job_id"]),
+            "firing_id": firing_id,
+            "scheduled_for": scheduled_for,
+            "fired_at": fired_at,
+            "catch_up": scheduled_for < fired_at,
+        }
+        identity_snapshot = template.get("identity_snapshot", {})
+        if not isinstance(identity_snapshot, Mapping):
+            raise StoreError("cron task identity snapshot is malformed")
+        supplied_subject = str(template.get("conversation_subject_id") or "")
+        expected_subject = str(job["origin_conversation_subject_id"] or "")
+        if supplied_subject != expected_subject:
+            raise StoreError("cron task conversation subject was altered")
+        supplied_principal = str(template.get("principal_id") or "")
+        supplied_account = str(template.get("principal_account_id") or "")
+        if supplied_principal != principal_id or supplied_account != str(
+            job["principal_account_id"] or ""
+        ):
+            raise StoreError("cron task principal snapshot was altered")
+
+        conn.execute(
+            """INSERT INTO tasks (
+                   task_id,dedupe_key,inbound_message_id,channel,bot_id,
+                   external_user_id,session_id,agent_id,agent_incarnation,
+                   conversation_id,thread_id,mode_id,profile_version,
+                   policy_version,model,reasoning_effort,reply_target_json,
+                   inputs_json,metadata_json,actor_external_user_id,
+                   principal_id,principal_account_id,conversation_subject_id,
+                   identity_snapshot_json,state,attempts,next_attempt_at,
+                   parent_task_id,child_depth,request_id,created_at,updated_at
+               ) VALUES (?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                         'queued',0,NULL,NULL,0,?,?,?)""",
+            (
+                task_id,
+                dedupe_key,
+                str(job["origin_channel"]),
+                str(job["origin_bot_id"]),
+                route_scope,
+                str(job["origin_session_id"] or "default"),
+                str(job["agent_id"]),
+                int(job["agent_incarnation"]),
+                conversation_id,
+                thread_id,
+                str(template["mode_id"]),
+                int(template["profile_version"]),
+                int(template["policy_version"]),
+                str(template.get("model") or ""),
+                str(template.get("reasoning_effort") or ""),
+                json_dumps(target.to_dict()),
+                json_dumps({"text": str(job["prompt"])}),
+                json_dumps(cls._json_snapshot(metadata)),
+                actor,
+                principal_id or None,
+                supplied_account or None,
+                expected_subject or None,
+                json_dumps(cls._json_snapshot(dict(identity_snapshot))),
+                request_id,
+                fired_at,
+                fired_at,
+            ),
+        )
+        cls._validate_task_input_attachment_access_tx(
+            conn,
+            task_id=task_id,
+            inputs={"text": str(job["prompt"])},
+            agent_id=str(job["agent_id"]),
+            channel=str(job["origin_channel"]),
+            bot_id=str(job["origin_bot_id"]),
+            external_user_id=route_scope,
+            session_id=str(job["origin_session_id"] or "default"),
+        )
+        cls._create_queued_task_invocation_tx(
+            conn,
+            task_id=task_id,
+            now=fired_at,
+            max_agent_queue=max_agent_queue,
+            max_global_queue=max_global_queue,
+            max_account_queue=max_account_queue,
+            max_account_agent_queue=max_account_agent_queue,
+        )
+        task = cls._fetch_task_tx(conn, task_id)
+        if task is None:
+            raise StoreError("cron task insert failed")
+        return task
+
+    async def fire_next_due_cron_job(
+        self,
+        *,
+        now: datetime | str | None = None,
+    ) -> CronFireResult | None:
+        """Atomically enqueue one due Agent task and advance its schedule.
+
+        No user-visible message is created at firing time.  The task's normal
+        completion/failure projection is the sole channel delivery.
+        """
+
+        now_text = self._now(now)
+        now_dt = text_to_datetime(now_text)
+        if now_dt is None:
+            raise ValueError("cron firing time is invalid")
+
+        def op(conn: sqlite3.Connection) -> CronFireResult | None:
+            with _transaction(conn):
+                # Expiry revokes both execution and delivery.  Do this in the
+                # same write transaction that selects a due occurrence so no
+                # scheduler can race an expired capability into a task.
+                conn.execute(
+                    """UPDATE cron_jobs
+                          SET enabled=0,next_fire_at=NULL,updated_at=?,
+                              disabled_at=COALESCE(disabled_at,?),
+                              disabled_reason=COALESCE(
+                                  disabled_reason,'expired before firing')
+                        WHERE enabled=1 AND expires_at IS NOT NULL
+                          AND expires_at<=?""",
+                    (now_text, now_text, now_text),
+                )
+                global_count = int(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(unfinished_count),0) "
+                        "FROM global_agent_admission_counter "
+                        "WHERE singleton=1"
+                    ).fetchone()[0]
+                )
+                if global_count >= int(self.max_global_queue):
+                    # No occurrence can reserve global admission right now.
+                    # Leave every due job unchanged for the next bounded tick.
+                    return None
+                while True:
+                    row = conn.execute(
+                        """SELECT job.*
+                             FROM cron_jobs AS job
+                             LEFT JOIN agent_admission_counters AS agent_count
+                               ON agent_count.agent_id=job.agent_id
+                              AND agent_count.agent_incarnation=
+                                  job.agent_incarnation
+                             LEFT JOIN account_admission_counters AS account_count
+                               ON account_count.channel=job.origin_channel
+                              AND account_count.bot_id=job.origin_bot_id
+                             LEFT JOIN agent_account_admission_counters
+                                       AS stream_count
+                               ON stream_count.agent_id=job.agent_id
+                              AND stream_count.agent_incarnation=
+                                  job.agent_incarnation
+                              AND stream_count.channel=job.origin_channel
+                              AND stream_count.bot_id=job.origin_bot_id
+                            WHERE job.enabled=1 AND job.next_fire_at<=?
+                              AND COALESCE(agent_count.unfinished_count,0) < ?
+                              AND COALESCE(account_count.unfinished_count,0) < ?
+                              AND COALESCE(stream_count.unfinished_count,0) < ?
+                            ORDER BY job.next_fire_at,job.created_at,job.job_id
+                            LIMIT 1""",
+                        (
+                            now_text,
+                            int(self.max_agent_queue),
+                            int(self.max_account_queue),
+                            int(self.max_account_agent_queue),
+                        ),
+                    ).fetchone()
+                    if row is None:
+                        return None
+                    job_id = str(row["job_id"])
+                    scheduled_text = str(row["next_fire_at"])
+                    reason = self._cron_job_fireability_reason_tx(conn, row)
+                    if reason is not None:
+                        self._cron_job_disable_tx(
+                            conn,
+                            job_id=job_id,
+                            now_text=now_text,
+                            reason=reason,
+                        )
+                        continue
+                    try:
+                        spec = schedule_from_parts(
+                            str(row["schedule_kind"]),
+                            str(row["schedule_expression"]),
+                            timezone_name=str(row["timezone_name"]),
+                        )
+                    except CronScheduleError:
+                        self._cron_job_disable_tx(
+                            conn,
+                            job_id=job_id,
+                            now_text=now_text,
+                            reason="stored schedule is invalid",
+                        )
+                        continue
+                    scheduled_dt = text_to_datetime(scheduled_text)
+                    if scheduled_dt is None:
+                        self._cron_job_disable_tx(
+                            conn,
+                            job_id=job_id,
+                            now_text=now_text,
+                            reason="stored next firing time is invalid",
+                        )
+                        continue
+                    plan = plan_due_firing(
+                        spec,
+                        scheduled_for=scheduled_dt,
+                        now=now_dt,
+                    )
+                    if plan is None:
+                        return None
+                    existing_firing = conn.execute(
+                        "SELECT 1 FROM cron_firings WHERE job_id=? "
+                        "AND scheduled_for=?",
+                        (job_id, scheduled_text),
+                    ).fetchone()
+                    if existing_firing is not None:
+                        next_text = (
+                            _utc_text(plan.next_fire_at)
+                            if plan.next_fire_at is not None
+                            else None
+                        )
+                        if next_text is None:
+                            self._cron_job_disable_tx(
+                                conn,
+                                job_id=job_id,
+                                now_text=now_text,
+                                reason="one-shot schedule already fired",
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE cron_jobs SET next_fire_at=?,updated_at=? "
+                                "WHERE job_id=? AND enabled=1",
+                                (next_text, now_text, job_id),
+                            )
+                        continue
+
+                    try:
+                        task = self._materialize_cron_task_tx(
+                            conn,
+                            job=row,
+                            scheduled_for=scheduled_text,
+                            fired_at=now_text,
+                            max_agent_queue=self.max_agent_queue,
+                            max_global_queue=self.max_global_queue,
+                            max_account_queue=self.max_account_queue,
+                            max_account_agent_queue=self.max_account_agent_queue,
+                        )
+                    except InvalidTransition as exc:
+                        self._cron_job_disable_tx(
+                            conn,
+                            job_id=job_id,
+                            now_text=now_text,
+                            reason=str(exc),
+                        )
+                        continue
+                    firing_id = self._cron_occurrence_id(
+                        "firing", job_id, scheduled_text
+                    )
+                    conn.execute(
+                        """INSERT INTO cron_firings (
+                               firing_id,job_id,scheduled_for,task_id,outbox_id,
+                               fired_at
+                           ) VALUES (?,?,?,?,?,?)""",
+                        (
+                            firing_id,
+                            job_id,
+                            scheduled_text,
+                            task.task_id,
+                            None,
+                            now_text,
+                        ),
+                    )
+                    next_text = (
+                        _utc_text(plan.next_fire_at)
+                        if plan.next_fire_at is not None
+                        else None
+                    )
+                    disabled_reason = None
+                    if next_text is None:
+                        disabled_reason = "one-shot schedule completed"
+                    elif row["expires_at"] is not None and next_text >= str(
+                        row["expires_at"]
+                    ):
+                        next_text = None
+                        disabled_reason = "schedule expiry reached"
+                    if next_text is None:
+                        changed = conn.execute(
+                            """UPDATE cron_jobs
+                                  SET enabled=0,next_fire_at=NULL,last_fired_at=?,
+                                      updated_at=?,disabled_at=?,disabled_reason=?
+                                WHERE job_id=? AND enabled=1
+                                  AND next_fire_at=?""",
+                            (
+                                now_text,
+                                now_text,
+                                now_text,
+                                disabled_reason,
+                                job_id,
+                                scheduled_text,
+                            ),
+                        ).rowcount
+                    else:
+                        changed = conn.execute(
+                            """UPDATE cron_jobs
+                                  SET next_fire_at=?,last_fired_at=?,updated_at=?
+                                WHERE job_id=? AND enabled=1
+                                  AND next_fire_at=?""",
+                            (
+                                next_text,
+                                now_text,
+                                now_text,
+                                job_id,
+                                scheduled_text,
+                            ),
+                        ).rowcount
+                    if changed != 1:
+                        raise StoreError("cron schedule advance lost its fence")
+                    updated_job = self._cron_job_from_row(
+                        conn.execute(
+                            "SELECT * FROM cron_jobs WHERE job_id=?", (job_id,)
+                        ).fetchone()
+                    )
+                    firing = self._cron_firing_from_row(
+                        conn.execute(
+                            "SELECT * FROM cron_firings WHERE firing_id=?",
+                            (firing_id,),
+                        ).fetchone()
+                    )
+                    if updated_job is None or firing is None:
+                        raise StoreError("cron firing materialization is incomplete")
+                    return CronFireResult(
+                        job=updated_job,
+                        firing=firing,
+                        task=task,
+                    )
+
+        return await self._call(op)
+
     async def set_route(
         self,
         *,
@@ -28063,53 +37659,139 @@ class SQLiteStore:
                     agent_id,
                     now_text=now_text,
                 )
-                cursor = conn.execute(
-                    "UPDATE agent_profiles SET enabled=0 WHERE agent_id=?",
-                    (agent_id,),
+                return self._retire_agent_tx(
+                    conn,
+                    agent_id=agent_id,
+                    default_agent_id=default_agent_id,
+                    now_text=now_text,
                 )
-                conn.execute(
-                    "INSERT OR IGNORE INTO deleted_agents(agent_id, deleted_at) VALUES (?, ?)",
-                    (agent_id, now_text),
-                )
-                marker = conn.execute(
-                    "SELECT deleted_at FROM deleted_agents WHERE agent_id=?",
+
+        return await self._call(op)
+
+    async def force_retire_agent(
+        self, agent_id: str, *, default_agent_id: str = "codex"
+    ) -> dict[str, Any]:
+        """Atomically cancel unfinished work and tombstone one Agent.
+
+        Task and mailbox payload/history rows are retained.  Only mutable
+        scheduling projections are terminalized, every admission reservation
+        is released exactly once, pending steering is fenced from promotion,
+        and the ordinary retirement transaction performs Profile disablement
+        plus route fallback.  The manager uses ``active_task_ids`` to request
+        a cooperative runtime interrupt before reaping the Agent process.
+        """
+
+        agent_id = str(agent_id or "").strip()
+        default_agent_id = str(default_agent_id or "codex").strip() or "codex"
+        if not agent_id:
+            raise ValueError("agent_id is required")
+        now_text = self._now()
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any]:
+            with _transaction(conn):
+                if conn.execute(
+                    "SELECT 1 FROM deleted_agents WHERE agent_id=?",
                     (agent_id,),
-                ).fetchone()
-                profile = self._latest_agent_profile_row_tx(conn, agent_id)
-                if marker is None or profile is None:
-                    raise StoreError(
-                        f"cannot retire Agent without a Profile: {agent_id}"
+                ).fetchone() is not None:
+                    raise InvalidTransition(
+                        f"Agent was already deleted: {agent_id}"
                     )
-                source_id = compound_id(
-                    "agent-lifecycle-source",
-                    ("retire-agent", agent_id, str(marker["deleted_at"])),
-                )
-                self._tombstone_agent_lifecycle_tx(
+                if self._latest_agent_profile_row_tx(conn, agent_id) is None:
+                    raise NotFoundError(f"Agent not found: {agent_id}")
+
+                cancellation = self._force_cancel_agent_work_tx(
                     conn,
                     agent_id=agent_id,
                     now_text=now_text,
-                    event_kind="retired",
-                    source_kind="retire_agent",
-                    source_id=source_id,
-                    provenance={"compatibility_path": "retire_agent"},
-                    profile_version=int(profile["profile_version"]),
                 )
-                # A recreated Agent starts without the retired incarnation's
-                # per-session directory preferences.  Immutable task/history
-                # records remain untouched.
-                conn.execute(
-                    "DELETE FROM session_agent_working_directories "
-                    "WHERE agent_id=?",
-                    (agent_id,),
+                disabled_profiles = self._retire_agent_tx(
+                    conn,
+                    agent_id=agent_id,
+                    default_agent_id=default_agent_id,
+                    now_text=now_text,
                 )
-                conn.execute(
-                    "UPDATE routes SET active_agent_id=?, updated_at=? "
-                    "WHERE active_agent_id=?",
-                    (default_agent_id, now_text, agent_id),
+                # Prove that no resumable aggregate or unreleased admission
+                # reservation survived the force transition before commit.
+                self._assert_agent_retirable_tx(
+                    conn,
+                    agent_id,
+                    now_text=now_text,
                 )
-                return int(cursor.rowcount)
+                return {
+                    **cancellation,
+                    "disabled_profile_count": disabled_profiles,
+                }
 
         return await self._call(op)
+
+    def _retire_agent_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str,
+        default_agent_id: str,
+        now_text: str,
+    ) -> int:
+        """Apply the shared durable portion of normal and forced deletion."""
+
+        cursor = conn.execute(
+            "UPDATE agent_profiles SET enabled=0 WHERE agent_id=?",
+            (agent_id,),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO deleted_agents(agent_id, deleted_at) "
+            "VALUES (?, ?)",
+            (agent_id, now_text),
+        )
+        marker = conn.execute(
+            "SELECT deleted_at FROM deleted_agents WHERE agent_id=?",
+            (agent_id,),
+        ).fetchone()
+        profile = self._latest_agent_profile_row_tx(conn, agent_id)
+        if marker is None or profile is None:
+            raise StoreError(
+                f"cannot retire Agent without a Profile: {agent_id}"
+            )
+        source_id = compound_id(
+            "agent-lifecycle-source",
+            ("retire-agent", agent_id, str(marker["deleted_at"])),
+        )
+        self._tombstone_agent_lifecycle_tx(
+            conn,
+            agent_id=agent_id,
+            now_text=now_text,
+            event_kind="retired",
+            source_kind="retire_agent",
+            source_id=source_id,
+            provenance={"compatibility_path": "retire_agent"},
+            profile_version=int(profile["profile_version"]),
+        )
+        # A recreated Agent starts without the retired incarnation's
+        # per-session directory preferences.  Immutable task/history records
+        # remain untouched.
+        conn.execute(
+            "DELETE FROM session_agent_working_directories WHERE agent_id=?",
+            (agent_id,),
+        )
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='cron_jobs'"
+        ).fetchone() is not None:
+            conn.execute(
+                """UPDATE cron_jobs
+                      SET enabled=0,next_fire_at=NULL,updated_at=?,
+                          disabled_at=COALESCE(disabled_at,?),
+                          disabled_reason=COALESCE(
+                              disabled_reason,'target Agent was deleted')
+                    WHERE agent_id=? AND enabled=1""",
+                (now_text, now_text, agent_id),
+            )
+        conn.execute(
+            "UPDATE routes SET active_agent_id=?, updated_at=? "
+            "WHERE active_agent_id=?",
+            (default_agent_id, now_text, agent_id),
+        )
+        return int(cursor.rowcount)
 
     async def reactivate_agent(self, profile: Any) -> bool:
         """Prepare an explicitly recreated dynamic Agent for publication.
@@ -28381,6 +38063,284 @@ class SQLiteStore:
                 return True
 
         return await self._call(op)
+
+    @staticmethod
+    def _force_cancel_agent_work_tx(
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str,
+        now_text: str,
+    ) -> dict[str, tuple[str, ...]]:
+        """Terminalize every schedulable aggregate owned by ``agent_id``.
+
+        This helper runs only inside the force-retirement transaction.  It
+        deliberately keeps immutable task attempts and mailbox payloads for
+        audit, while clearing every mutable lease/admission fence that could
+        make the work runnable after the Agent is recreated.
+        """
+
+        reason = f"force-cancelled by /delagent {agent_id} force"
+        task_rows = conn.execute(
+            "SELECT task_id,state,current_execution_id FROM tasks "
+            "WHERE agent_id=? AND state IN "
+            "('queued','dispatching','running','cancel_requested','orphaned') "
+            "ORDER BY created_at,task_id",
+            (agent_id,),
+        ).fetchall()
+        cancelled_task_ids: list[str] = []
+        active_task_ids: list[str] = []
+        for task in task_rows:
+            task_id = str(task["task_id"])
+            source_state = str(task["state"])
+            execution_id = str(task["current_execution_id"] or "")
+            active = source_state in {
+                TaskState.DISPATCHING.value,
+                TaskState.RUNNING.value,
+                TaskState.CANCEL_REQUESTED.value,
+            }
+            target_state = (
+                TaskState.INTERRUPTED.value
+                if active
+                else TaskState.CANCELLED.value
+            )
+            if not execution_id:
+                raise StoreError(
+                    f"unfinished task has no current execution: {task_id}"
+                )
+            execution = conn.execute(
+                "SELECT state,finished_at FROM task_executions "
+                "WHERE execution_id=? AND task_id=? AND agent_id=?",
+                (execution_id, task_id, agent_id),
+            ).fetchone()
+            invocation = conn.execute(
+                "SELECT state,admission_released_at FROM agent_invocations "
+                "WHERE invocation_id=? AND work_kind='task' "
+                "AND task_id=? AND agent_id=?",
+                (execution_id, task_id, agent_id),
+            ).fetchone()
+            if execution is None or invocation is None:
+                raise StoreError(
+                    f"unfinished task execution truth is missing: {task_id}"
+                )
+
+            changed = conn.execute(
+                "UPDATE tasks SET state=?,claimed_by=NULL,claim_token=NULL,"
+                "lease_expires_at=NULL,next_attempt_at=NULL,last_error=?,"
+                "result_json=NULL,updated_at=?,terminal_at=?,"
+                "cancel_requested_at=COALESCE(cancel_requested_at,?) "
+                "WHERE task_id=? AND state=?",
+                (
+                    target_state,
+                    reason,
+                    now_text,
+                    now_text,
+                    now_text,
+                    task_id,
+                    source_state,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StoreError(
+                    f"force cancellation lost task fence: {task_id}"
+                )
+
+            # Orphaned attempts are already immutable terminal history and
+            # have released their invocation admission.  The aggregate alone
+            # changes from retryable to cancelled.  Every other unfinished
+            # attempt is terminalized together with its admission counters.
+            if source_state == TaskState.ORPHANED.value:
+                if (
+                    str(execution["state"]) != TaskState.ORPHANED.value
+                    or execution["finished_at"] is None
+                    or invocation["admission_released_at"] is None
+                ):
+                    raise StoreError(
+                        f"orphaned task execution truth conflicts: {task_id}"
+                    )
+            else:
+                if (
+                    str(execution["state"]) != source_state
+                    or execution["finished_at"] is not None
+                    or invocation["admission_released_at"] is not None
+                ):
+                    raise StoreError(
+                        f"unfinished task execution truth conflicts: {task_id}"
+                    )
+                execution_changed = conn.execute(
+                    "UPDATE task_executions SET state=?,lease_expires_at=NULL,"
+                    "finished_at=?,last_error=? "
+                    "WHERE execution_id=? AND task_id=? AND state=? "
+                    "AND finished_at IS NULL",
+                    (
+                        target_state,
+                        now_text,
+                        reason,
+                        execution_id,
+                        task_id,
+                        source_state,
+                    ),
+                ).rowcount
+                if execution_changed != 1:
+                    raise StoreError(
+                        f"force cancellation lost execution fence: {task_id}"
+                    )
+                if not SQLiteStore._release_invocation_tx(
+                    conn,
+                    invocation_id=execution_id,
+                    state=target_state,
+                    now=now_text,
+                    last_error=reason,
+                ):
+                    raise StoreError(
+                        f"force cancellation found released invocation: {task_id}"
+                    )
+
+            SQLiteStore._append_event_tx(
+                conn,
+                task_id,
+                execution_id=execution_id,
+                event_type=target_state,
+                visibility=EventVisibility.INTERNAL,
+                priority=EventPriority.SILENT,
+                content=reason,
+                idempotency_key=f"force-delete:{agent_id}:{task_id}",
+                created_at=now_text,
+            )
+            cancelled_task_ids.append(task_id)
+            if active:
+                active_task_ids.append(task_id)
+
+        # A pending steer would otherwise be promoted into a fresh task as
+        # soon as its now-terminal target is reconciled.  There is no safe
+        # retry destination once the Agent is tombstoned, so fence both queued
+        # and in-flight deliveries into the existing non-runnable uncertainty
+        # state while preserving their immutable input snapshots.
+        steering_ids: list[str] = []
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='task_steering'"
+        ).fetchone() is not None:
+            steering_rows = conn.execute(
+                "SELECT steering_id FROM task_steering WHERE agent_id=? "
+                "AND state IN ('pending','delivering') "
+                "ORDER BY created_at,sequence,steering_id",
+                (agent_id,),
+            ).fetchall()
+            steering_ids = [str(row["steering_id"]) for row in steering_rows]
+            if steering_ids:
+                placeholders = ",".join("?" for _ in steering_ids)
+                changed = conn.execute(
+                    f"UPDATE task_steering SET state='delivery_unknown',"
+                    "claimed_by=NULL,claim_token=NULL,lease_expires_at=NULL,"
+                    f"updated_at=? WHERE steering_id IN ({placeholders}) "
+                    "AND state IN ('pending','delivering')",
+                    (now_text, *steering_ids),
+                ).rowcount
+                if changed != len(steering_ids):
+                    raise StoreError(
+                        "force cancellation lost task steering fence"
+                    )
+
+        mailbox_rows = conn.execute(
+            "SELECT mailbox_id,state,current_invocation_id FROM agent_mailbox "
+            "WHERE destination_agent_id=? AND state IN "
+            "('pending','dispatching','processing','orphaned_mailbox') "
+            "ORDER BY created_at,mailbox_id",
+            (agent_id,),
+        ).fetchall()
+        rejected_mailbox_ids: list[str] = []
+        for mailbox in mailbox_rows:
+            mailbox_id = str(mailbox["mailbox_id"])
+            source_state = str(mailbox["state"])
+            invocation_id = str(mailbox["current_invocation_id"] or "")
+            if not invocation_id:
+                raise StoreError(
+                    f"unfinished mailbox has no current invocation: {mailbox_id}"
+                )
+            invocation = conn.execute(
+                "SELECT admission_released_at FROM agent_invocations "
+                "WHERE invocation_id=? AND work_kind='mailbox' "
+                "AND mailbox_id=? AND agent_id=?",
+                (invocation_id, mailbox_id, agent_id),
+            ).fetchone()
+            if invocation is None:
+                raise StoreError(
+                    f"unfinished mailbox invocation truth is missing: {mailbox_id}"
+                )
+            changed = conn.execute(
+                "UPDATE agent_mailbox SET state='rejected',last_error=?,"
+                "processed_at=?,next_attempt_at=NULL,claimed_by=NULL,"
+                "claim_token=NULL,lease_expires_at=NULL "
+                "WHERE mailbox_id=? AND state=?",
+                (reason, now_text, mailbox_id, source_state),
+            ).rowcount
+            if changed != 1:
+                raise StoreError(
+                    f"force cancellation lost mailbox fence: {mailbox_id}"
+                )
+            if source_state == MailboxState.ORPHANED_MAILBOX.value:
+                if invocation["admission_released_at"] is None:
+                    raise StoreError(
+                        f"orphaned mailbox invocation is unreleased: {mailbox_id}"
+                    )
+            else:
+                if invocation["admission_released_at"] is not None:
+                    raise StoreError(
+                        f"unfinished mailbox invocation was released: {mailbox_id}"
+                    )
+                if not SQLiteStore._release_invocation_tx(
+                    conn,
+                    invocation_id=invocation_id,
+                    state=InvocationState.CANCELLED.value,
+                    now=now_text,
+                    last_error=reason,
+                ):
+                    raise StoreError(
+                        f"force cancellation found released mailbox: {mailbox_id}"
+                    )
+            rejected_mailbox_ids.append(mailbox_id)
+
+        dangling = conn.execute(
+            "SELECT invocation_id FROM agent_invocations WHERE agent_id=? "
+            "AND admission_released_at IS NULL LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        if dangling is not None:
+            raise StoreError(
+                "force cancellation found an unowned Agent invocation: "
+                + str(dangling["invocation_id"])
+            )
+
+        # The durable child-dispatch protocol allows at most one active slot
+        # per incarnation.  Once its invocation is terminal and the Agent is
+        # about to be reaped, release that scheduler fence so it consumes no
+        # process execution capacity and can never be granted later.
+        slot_rows = conn.execute(
+            "SELECT slot_id FROM agent_execution_slots WHERE agent_id=? "
+            "AND state='active' ORDER BY acquired_at,slot_id",
+            (agent_id,),
+        ).fetchall()
+        released_slot_ids = [str(row["slot_id"]) for row in slot_rows]
+        if released_slot_ids:
+            placeholders = ",".join("?" for _ in released_slot_ids)
+            changed = conn.execute(
+                f"UPDATE agent_execution_slots SET state='released',"
+                f"released_at=? WHERE slot_id IN ({placeholders}) "
+                "AND state='active'",
+                (now_text, *released_slot_ids),
+            ).rowcount
+            if changed != len(released_slot_ids):
+                raise StoreError(
+                    "force cancellation lost Agent execution slot fence"
+                )
+
+        return {
+            "cancelled_task_ids": tuple(cancelled_task_ids),
+            "active_task_ids": tuple(active_task_ids),
+            "rejected_mailbox_ids": tuple(rejected_mailbox_ids),
+            "fenced_steering_ids": tuple(steering_ids),
+            "released_execution_slot_ids": tuple(released_slot_ids),
+        }
 
     @staticmethod
     def _assert_agent_retirable_tx(
@@ -31073,6 +41033,2299 @@ class SQLiteStore:
             return str(row["cursor"] if row else "")
         return await self._call(op)
 
+    # ------------------------------------------------------------------
+    # Canonical principals and bot-local conversation subjects (schema v36)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _required_store_identity(value: Any, label: str) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError(f"{label} is required")
+        return normalized
+
+    async def create_principal(
+        self,
+        principal: PrincipalRecord | Mapping[str, Any] | None = None,
+        *,
+        principal_id: str | None = None,
+        display_name: str | None = None,
+        enabled: bool | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        now: datetime | str | None = None,
+    ) -> PrincipalRecord:
+        data: dict[str, Any]
+        if isinstance(principal, Mapping):
+            data = dict(principal)
+        elif principal is not None:
+            data = {
+                name: getattr(principal, name)
+                for name in PrincipalRecord.__dataclass_fields__
+                if hasattr(principal, name)
+            }
+        else:
+            data = {}
+        pid = self._required_store_identity(
+            principal_id if principal_id is not None else data.get("principal_id"),
+            "principal_id",
+        )
+        name = str(
+            display_name if display_name is not None else data.get("display_name", "")
+        )
+        enabled_value = bool(
+            enabled if enabled is not None else data.get("enabled", True)
+        )
+        metadata_value = dict(
+            metadata if metadata is not None else data.get("metadata", {}) or {}
+        )
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> PrincipalRecord:
+            with _transaction(conn):
+                existing = conn.execute(
+                    "SELECT * FROM principals WHERE principal_id=?", (pid,)
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        """INSERT INTO principals
+                               (principal_id, display_name, enabled, metadata_json,
+                                created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            pid,
+                            name,
+                            int(enabled_value),
+                            json_dumps(metadata_value),
+                            now_text,
+                            now_text,
+                        ),
+                    )
+                else:
+                    expected = (
+                        name,
+                        int(enabled_value),
+                        self._json_snapshot(metadata_value),
+                    )
+                    actual = (
+                        str(existing["display_name"] or ""),
+                        int(existing["enabled"]),
+                        self._json_snapshot(
+                            json_loads(existing["metadata_json"], {}) or {}
+                        ),
+                    )
+                    if expected != actual:
+                        raise StoreError(f"principal identity is immutable: {pid}")
+                record = self._principal_from_row(
+                    conn.execute(
+                        "SELECT * FROM principals WHERE principal_id=?", (pid,)
+                    ).fetchone()
+                )
+                assert record is not None
+                return record
+
+        return await self._call(op)
+
+    put_principal = create_principal
+
+    async def get_principal(self, principal_id: str) -> PrincipalRecord | None:
+        pid = self._required_store_identity(principal_id, "principal_id")
+        return await self._call(
+            lambda conn: self._principal_from_row(
+                conn.execute(
+                    "SELECT * FROM principals WHERE principal_id=?", (pid,)
+                ).fetchone()
+            )
+        )
+
+    async def list_principals(
+        self, *, enabled: bool | None = None
+    ) -> list[PrincipalRecord]:
+        where = "" if enabled is None else " WHERE enabled=?"
+        params: tuple[Any, ...] = () if enabled is None else (int(enabled),)
+
+        def op(conn: sqlite3.Connection) -> list[PrincipalRecord]:
+            rows = conn.execute(
+                "SELECT * FROM principals" + where + " ORDER BY principal_id",
+                params,
+            ).fetchall()
+            return [
+                record
+                for row in rows
+                if (record := self._principal_from_row(row)) is not None
+            ]
+
+        return await self._call(op)
+
+    async def update_principal(
+        self,
+        principal_id: str,
+        *,
+        display_name: str | None = None,
+        enabled: bool | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        now: datetime | str | None = None,
+    ) -> PrincipalRecord:
+        pid = self._required_store_identity(principal_id, "principal_id")
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> PrincipalRecord:
+            with _transaction(conn):
+                row = conn.execute(
+                    "SELECT * FROM principals WHERE principal_id=?", (pid,)
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"principal not found: {pid}")
+                new_name = (
+                    str(display_name)
+                    if display_name is not None
+                    else str(row["display_name"] or "")
+                )
+                new_enabled = int(enabled) if enabled is not None else int(row["enabled"])
+                new_metadata = (
+                    dict(metadata)
+                    if metadata is not None
+                    else json_loads(row["metadata_json"], {}) or {}
+                )
+                conn.execute(
+                    """UPDATE principals SET display_name=?, enabled=?,
+                           metadata_json=?, updated_at=? WHERE principal_id=?""",
+                    (
+                        new_name,
+                        new_enabled,
+                        json_dumps(new_metadata),
+                        now_text,
+                        pid,
+                    ),
+                )
+                record = self._principal_from_row(
+                    conn.execute(
+                        "SELECT * FROM principals WHERE principal_id=?", (pid,)
+                    ).fetchone()
+                )
+                assert record is not None
+                return record
+
+        return await self._call(op)
+
+    async def delete_principal(self, principal_id: str) -> bool:
+        pid = self._required_store_identity(principal_id, "principal_id")
+
+        def op(conn: sqlite3.Connection) -> bool:
+            with _transaction(conn):
+                try:
+                    return conn.execute(
+                        "DELETE FROM principals WHERE principal_id=?", (pid,)
+                    ).rowcount == 1
+                except sqlite3.IntegrityError as exc:
+                    raise StoreError(
+                        "principal with account history cannot be deleted"
+                    ) from exc
+
+        return await self._call(op)
+
+    def _map_principal_account_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        principal_id: str,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        identifier_kind: str,
+        configured_by: str,
+        principal_account_id: str,
+        now: str,
+    ) -> PrincipalAccountRecord:
+        """Map one exact account while the caller owns the transaction.
+
+        Both the standalone mapping API and atomic Lark-profile onboarding use
+        this helper.  Keeping the idempotent-return and revisioned-remap logic
+        in one place prevents the bundle from developing subtly different
+        authorization history semantics.
+        """
+
+        principal_row = conn.execute(
+            "SELECT enabled FROM principals WHERE principal_id=?",
+            (principal_id,),
+        ).fetchone()
+        if principal_row is None:
+            raise NotFoundError(f"principal not found: {principal_id}")
+        active = conn.execute(
+            """SELECT pa.*, p.enabled AS principal_enabled
+               FROM principal_accounts AS pa
+               JOIN principals AS p ON p.principal_id=pa.principal_id
+               WHERE pa.channel=? AND pa.bot_id=?
+                 AND pa.external_user_id=? AND pa.active=1""",
+            (channel, bot_id, external_user_id),
+        ).fetchone()
+        if active is not None:
+            if (
+                str(active["principal_id"]) == principal_id
+                and str(active["identifier_kind"]) == identifier_kind
+            ):
+                record = self._principal_account_from_row(active)
+                assert record is not None
+                return record
+            conn.execute(
+                """UPDATE principal_accounts
+                   SET active=0, retired_at=?
+                   WHERE principal_account_id=? AND active=1""",
+                (now, active["principal_account_id"]),
+            )
+        revision = int(
+            conn.execute(
+                """SELECT COALESCE(MAX(mapping_revision), 0) + 1
+                   FROM principal_accounts
+                   WHERE channel=? AND bot_id=? AND external_user_id=?""",
+                (channel, bot_id, external_user_id),
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """INSERT INTO principal_accounts
+                   (principal_account_id, principal_id, channel, bot_id,
+                    external_user_id, identifier_kind, mapping_revision,
+                    active, configured_by, created_at, retired_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)""",
+            (
+                principal_account_id,
+                principal_id,
+                channel,
+                bot_id,
+                external_user_id,
+                identifier_kind,
+                revision,
+                configured_by,
+                now,
+            ),
+        )
+        row = conn.execute(
+            """SELECT pa.*, p.enabled AS principal_enabled
+               FROM principal_accounts AS pa
+               JOIN principals AS p ON p.principal_id=pa.principal_id
+               WHERE pa.principal_account_id=?""",
+            (principal_account_id,),
+        ).fetchone()
+        record = self._principal_account_from_row(row)
+        assert record is not None
+        return record
+
+    async def map_principal_account(
+        self,
+        *,
+        principal_id: str,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        identifier_kind: str,
+        configured_by: str,
+        principal_account_id: str | None = None,
+        now: datetime | str | None = None,
+    ) -> PrincipalAccountRecord:
+        pid = self._required_store_identity(principal_id, "principal_id")
+        channel_value = self._required_store_identity(channel, "channel")
+        bot_value = self._required_store_identity(bot_id, "bot_id")
+        user_value = self._required_store_identity(
+            external_user_id, "external_user_id"
+        )
+        kind_value = self._required_store_identity(
+            identifier_kind, "identifier_kind"
+        )
+        if channel_value.lower() in {"lark", "feishu"} and kind_value != "open_id":
+            raise ValueError("Lark principal accounts require a stable open_id")
+        configured_value = self._required_store_identity(
+            configured_by, "configured_by"
+        )
+        account_value = (
+            self._required_store_identity(
+                principal_account_id, "principal_account_id"
+            )
+            if principal_account_id is not None
+            else _uuid()
+        )
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> PrincipalAccountRecord:
+            with _transaction(conn):
+                return self._map_principal_account_tx(
+                    conn,
+                    principal_id=pid,
+                    channel=channel_value,
+                    bot_id=bot_value,
+                    external_user_id=user_value,
+                    identifier_kind=kind_value,
+                    configured_by=configured_value,
+                    principal_account_id=account_value,
+                    now=now_text,
+                )
+
+        try:
+            return await self._call(op)
+        except sqlite3.IntegrityError as exc:
+            raise StoreError(str(exc)) from exc
+
+    set_principal_account = map_principal_account
+
+    async def resolve_principal_account(
+        self, *, channel: str, bot_id: str, external_user_id: str
+    ) -> PrincipalAccountRecord | None:
+        scope = (
+            self._required_store_identity(channel, "channel"),
+            self._required_store_identity(bot_id, "bot_id"),
+            self._required_store_identity(external_user_id, "external_user_id"),
+        )
+        return await self._call(
+            lambda conn: self._principal_account_from_row(
+                conn.execute(
+                    """SELECT pa.*, p.enabled AS principal_enabled
+                       FROM principal_accounts AS pa
+                       JOIN principals AS p ON p.principal_id=pa.principal_id
+                       WHERE pa.channel=? AND pa.bot_id=?
+                         AND pa.external_user_id=? AND pa.active=1""",
+                    scope,
+                ).fetchone()
+            )
+        )
+
+    async def list_principal_accounts(
+        self,
+        *,
+        principal_id: str | None = None,
+        active: bool | None = None,
+    ) -> list[PrincipalAccountRecord]:
+        filters: list[str] = []
+        params: list[Any] = []
+        if principal_id is not None:
+            filters.append("pa.principal_id=?")
+            params.append(self._required_store_identity(principal_id, "principal_id"))
+        if active is not None:
+            filters.append("pa.active=?")
+            params.append(int(active))
+        where = " WHERE " + " AND ".join(filters) if filters else ""
+
+        def op(conn: sqlite3.Connection) -> list[PrincipalAccountRecord]:
+            rows = conn.execute(
+                """SELECT pa.*, p.enabled AS principal_enabled
+                   FROM principal_accounts AS pa
+                   JOIN principals AS p ON p.principal_id=pa.principal_id"""
+                + where
+                + " ORDER BY pa.created_at, pa.principal_account_id",
+                params,
+            ).fetchall()
+            return [
+                record
+                for row in rows
+                if (record := self._principal_account_from_row(row)) is not None
+            ]
+
+        return await self._call(op)
+
+    async def auto_map_owner_principal_accounts(
+        self,
+        *,
+        accounts: Iterable[tuple[str, str]],
+        configured_by: str = "supervisor:auto-map",
+        now: datetime | str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Map unclaimed, single-sender channel accounts to ``owner``.
+
+        The supervisor calls this only after it owns the complete account set
+        and activates its database epoch.  All sender discovery, conflict
+        checks, principal creation, and mapping writes share one transaction,
+        so concurrent CLI administration can neither race nor weaken that
+        ownership boundary.
+        """
+
+        normalized_accounts: set[tuple[str, str]] = set()
+        for account in accounts:
+            try:
+                channel, bot_id = account
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "accounts must contain (channel, bot_id) pairs"
+                ) from exc
+            channel_value = self._required_store_identity(
+                channel, "channel"
+            ).lower()
+            bot_value = self._required_store_identity(bot_id, "bot_id")
+            if channel_value not in {"lark", "wechat"}:
+                raise ValueError(
+                    "owner principal auto-mapping supports only lark and wechat"
+                )
+            normalized_accounts.add((channel_value, bot_value))
+        configured_value = self._required_store_identity(
+            configured_by, "configured_by"
+        )
+        now_text = self._now(now)
+
+        def result(
+            channel: str,
+            bot_id: str,
+            outcome: str,
+            *,
+            sender_count: int = 0,
+            external_user_id: str = "",
+            identifier_kind: str = "",
+            principal_account_id: str = "",
+        ) -> dict[str, Any]:
+            return {
+                "channel": channel,
+                "bot_id": bot_id,
+                "outcome": outcome,
+                "sender_count": sender_count,
+                "external_user_id": external_user_id,
+                "identifier_kind": identifier_kind,
+                "principal_account_id": principal_account_id,
+            }
+
+        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            results: list[dict[str, Any]] = []
+            with _transaction(conn):
+                for channel, bot_id in sorted(normalized_accounts):
+                    owner_mapping = conn.execute(
+                        """SELECT principal_account_id
+                             FROM principal_accounts
+                            WHERE principal_id='owner' AND channel=? AND bot_id=?
+                              AND active=1
+                            LIMIT 1""",
+                        (channel, bot_id),
+                    ).fetchone()
+                    if owner_mapping is not None:
+                        results.append(
+                            result(
+                                channel,
+                                bot_id,
+                                "already_mapped",
+                                principal_account_id=str(
+                                    owner_mapping["principal_account_id"]
+                                ),
+                            )
+                        )
+                        continue
+
+                    other_mapping = conn.execute(
+                        """SELECT principal_account_id
+                             FROM principal_accounts
+                            WHERE channel=? AND bot_id=? AND active=1
+                            LIMIT 1""",
+                        (channel, bot_id),
+                    ).fetchone()
+                    if other_mapping is not None:
+                        results.append(result(channel, bot_id, "mapping_exists"))
+                        continue
+
+                    sender_summary = conn.execute(
+                        """SELECT COUNT(DISTINCT external_user_id) AS sender_count,
+                                  MIN(external_user_id) AS external_user_id
+                             FROM inbound_messages
+                            WHERE channel=? AND bot_id=?
+                              AND length(trim(external_user_id)) > 0""",
+                        (channel, bot_id),
+                    ).fetchone()
+                    sender_count = int(sender_summary["sender_count"] or 0)
+                    if sender_count != 1:
+                        results.append(
+                            result(
+                                channel,
+                                bot_id,
+                                (
+                                    "no_senders"
+                                    if sender_count == 0
+                                    else "multiple_senders"
+                                ),
+                                sender_count=sender_count,
+                            )
+                        )
+                        continue
+
+                    external_user_id = str(
+                        sender_summary["external_user_id"] or ""
+                    ).strip()
+                    identifier_kind = (
+                        "open_id" if channel == "lark" else "from_user_id"
+                    )
+                    if channel == "lark" and not _LARK_OPEN_ID.fullmatch(
+                        external_user_id
+                    ):
+                        results.append(
+                            result(
+                                channel,
+                                bot_id,
+                                "invalid_sender",
+                                sender_count=sender_count,
+                            )
+                        )
+                        continue
+
+                    principal = conn.execute(
+                        "SELECT enabled FROM principals WHERE principal_id='owner'"
+                    ).fetchone()
+                    if principal is not None and not bool(principal["enabled"]):
+                        results.append(
+                            result(
+                                channel,
+                                bot_id,
+                                "owner_disabled",
+                                sender_count=sender_count,
+                            )
+                        )
+                        continue
+                    if principal is None:
+                        conn.execute(
+                            """INSERT INTO principals
+                                   (principal_id, display_name, enabled,
+                                    metadata_json, created_at, updated_at)
+                               VALUES ('owner', '', 1, '{}', ?, ?)""",
+                            (now_text, now_text),
+                        )
+
+                    mapping = self._map_principal_account_tx(
+                        conn,
+                        principal_id="owner",
+                        channel=channel,
+                        bot_id=bot_id,
+                        external_user_id=external_user_id,
+                        identifier_kind=identifier_kind,
+                        configured_by=configured_value,
+                        principal_account_id=_uuid(),
+                        now=now_text,
+                    )
+                    results.append(
+                        result(
+                            channel,
+                            bot_id,
+                            "mapped",
+                            sender_count=sender_count,
+                            external_user_id=external_user_id,
+                            identifier_kind=identifier_kind,
+                            principal_account_id=mapping.principal_account_id,
+                        )
+                    )
+            return results
+
+        try:
+            return await self._call(op)
+        except sqlite3.IntegrityError as exc:
+            raise StoreError(str(exc)) from exc
+
+    async def unmap_principal_account(
+        self,
+        *,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        now: datetime | str | None = None,
+    ) -> bool:
+        scope = (
+            self._required_store_identity(channel, "channel"),
+            self._required_store_identity(bot_id, "bot_id"),
+            self._required_store_identity(external_user_id, "external_user_id"),
+        )
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> bool:
+            with _transaction(conn):
+                return conn.execute(
+                    """UPDATE principal_accounts SET active=0, retired_at=?
+                       WHERE channel=? AND bot_id=? AND external_user_id=?
+                         AND active=1""",
+                    (now_text, *scope),
+                ).rowcount == 1
+
+        return await self._call(op)
+
+    async def get_principal_conversation_binding(
+        self,
+        *,
+        principal_id: str,
+        agent_id: str,
+        session_id: str = "default",
+    ) -> Mapping[str, Any] | None:
+        """Return the configured provider-history anchor for one tuple."""
+
+        scope = (
+            self._required_store_identity(principal_id, "principal_id"),
+            self._required_store_identity(agent_id, "agent_id"),
+            str(session_id or "default"),
+        )
+
+        def op(conn: sqlite3.Connection) -> Mapping[str, Any] | None:
+            row = conn.execute(
+                """SELECT principal_id, agent_id, session_id, conversation_id,
+                          binding_kind, configured_by, created_at
+                     FROM principal_conversation_bindings
+                    WHERE principal_id=? AND agent_id=? AND session_id=?""",
+                scope,
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+        return await self._call(op)
+
+    async def get_transport_conversation_id(
+        self,
+        *,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str = "default",
+        agent_id: str,
+    ) -> str | None:
+        """Return an existing exact local conversation, canonical then legacy."""
+
+        channel_value = self._required_store_identity(channel, "channel")
+        bot_value = self._required_store_identity(bot_id, "bot_id")
+        user_value = self._required_store_identity(
+            external_user_id, "external_user_id"
+        )
+        session_value = str(session_id or "default")
+        agent_value = self._required_store_identity(agent_id, "agent_id")
+        candidates = conversation_id_candidates(
+            channel_value,
+            bot_value,
+            user_value,
+            session_value,
+            agent_value,
+        )
+
+        def op(conn: sqlite3.Connection) -> str | None:
+            for candidate in candidates:
+                row = conn.execute(
+                    """SELECT channel, bot_id, external_user_id, session_id,
+                              agent_id
+                         FROM conversations WHERE conversation_id=?""",
+                    (candidate,),
+                ).fetchone()
+                if row is None:
+                    continue
+                expected = (
+                    channel_value,
+                    bot_value,
+                    user_value,
+                    session_value,
+                    agent_value,
+                )
+                actual = tuple(
+                    str(row[column])
+                    for column in (
+                        "channel",
+                        "bot_id",
+                        "external_user_id",
+                        "session_id",
+                        "agent_id",
+                    )
+                )
+                if actual != expected:
+                    raise StoreError("transport conversation identity conflicts")
+                return candidate
+            return None
+
+        return await self._call(op)
+
+    async def bind_principal_conversation(
+        self,
+        *,
+        principal_id: str,
+        agent_id: str,
+        session_id: str = "default",
+        conversation_id: str,
+        configured_by: str,
+        now: datetime | str | None = None,
+    ) -> Mapping[str, Any]:
+        """Explicitly adopt one proven direct conversation as history anchor.
+
+        This is an owner-control operation.  The store accepts only a
+        transport conversation whose exact channel/bot/user account is
+        actively mapped to ``principal_id`` and whose subject is direct.
+        Existing tuple bindings are immutable, which prevents a later mapping
+        change from silently importing another principal's provider history.
+        """
+
+        pid = self._required_store_identity(principal_id, "principal_id")
+        aid = self._required_store_identity(agent_id, "agent_id")
+        sid = str(session_id or "default")
+        cid = self._required_store_identity(conversation_id, "conversation_id")
+        configured = self._required_store_identity(configured_by, "configured_by")
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> Mapping[str, Any]:
+            with _transaction(conn):
+                principal = conn.execute(
+                    "SELECT enabled FROM principals WHERE principal_id=?",
+                    (pid,),
+                ).fetchone()
+                if principal is None:
+                    raise NotFoundError(f"principal not found: {pid}")
+                if not bool(principal["enabled"]):
+                    raise StoreError("disabled principal cannot own conversation history")
+                conversation = conn.execute(
+                    """SELECT c.channel, c.bot_id, c.external_user_id,
+                              c.session_id, c.agent_id, c.conversation_subject_id,
+                              subject.subject_kind, subject.scope_key
+                         FROM conversations AS c
+                         LEFT JOIN conversation_subjects AS subject
+                           ON subject.conversation_subject_id=
+                              c.conversation_subject_id
+                        WHERE c.conversation_id=?""",
+                    (cid,),
+                ).fetchone()
+                if conversation is None:
+                    raise NotFoundError(f"conversation not found: {cid}")
+                if (
+                    str(conversation["agent_id"]) != aid
+                    or str(conversation["session_id"]) != sid
+                ):
+                    raise StoreError(
+                        "conversation does not match the principal Agent session"
+                    )
+                if (
+                    str(conversation["subject_kind"] or "") != "direct"
+                    or str(conversation["scope_key"] or "")
+                    != str(conversation["external_user_id"])
+                ):
+                    raise StoreError("only a direct conversation may be adopted")
+                mapping = conn.execute(
+                    """SELECT pa.principal_id
+                         FROM principal_accounts AS pa
+                         JOIN principals AS p ON p.principal_id=pa.principal_id
+                        WHERE pa.channel=? AND pa.bot_id=?
+                          AND pa.external_user_id=? AND pa.active=1
+                          AND p.enabled=1""",
+                    (
+                        conversation["channel"],
+                        conversation["bot_id"],
+                        conversation["external_user_id"],
+                    ),
+                ).fetchone()
+                if mapping is None or str(mapping["principal_id"]) != pid:
+                    raise StoreError(
+                        "conversation account is not mapped to the principal"
+                    )
+                existing = conn.execute(
+                    """SELECT conversation_id
+                         FROM principal_conversation_bindings
+                        WHERE principal_id=? AND agent_id=? AND session_id=?""",
+                    (pid, aid, sid),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["conversation_id"]) != cid:
+                        raise StoreError(
+                            "principal Agent session already has a history anchor"
+                        )
+                else:
+                    try:
+                        conn.execute(
+                            """INSERT INTO principal_conversation_bindings
+                                   (principal_id, agent_id, session_id,
+                                    conversation_id, binding_kind,
+                                    configured_by, created_at)
+                               VALUES (?, ?, ?, ?, 'adopted', ?, ?)""",
+                            (pid, aid, sid, cid, configured, now_text),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        raise StoreError(
+                            "conversation is already another principal scope's anchor"
+                        ) from exc
+                row = conn.execute(
+                    "SELECT * FROM principal_conversation_bindings "
+                    "WHERE principal_id=? AND agent_id=? AND session_id=?",
+                    (pid, aid, sid),
+                ).fetchone()
+                assert row is not None
+                return dict(row)
+
+        return await self._call(op)
+
+    async def resolve_principal_conversation(
+        self,
+        conversation_id: str,
+        *,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str = "default",
+        agent_id: str,
+    ) -> str:
+        """Resolve a transport-local direct alias to its trusted anchor."""
+
+        channel_value = self._required_store_identity(channel, "channel")
+        bot_value = self._required_store_identity(bot_id, "bot_id")
+        user_value = self._required_store_identity(
+            external_user_id, "external_user_id"
+        )
+        session_value = str(session_id or "default")
+        agent_value = self._required_store_identity(agent_id, "agent_id")
+
+        def op(conn: sqlite3.Connection) -> str:
+            candidates = conversation_id_candidates(
+                channel_value,
+                bot_value,
+                user_value,
+                session_value,
+                agent_value,
+            )
+            requested = str(conversation_id or "").strip() or candidates[0]
+            mapping = conn.execute(
+                """SELECT pa.principal_id
+                     FROM principal_accounts AS pa
+                     JOIN principals AS p ON p.principal_id=pa.principal_id
+                    WHERE pa.channel=? AND pa.bot_id=?
+                      AND pa.external_user_id=? AND pa.active=1 AND p.enabled=1""",
+                (channel_value, bot_value, user_value),
+            ).fetchone()
+            if mapping is None:
+                if requested not in candidates:
+                    raise StoreError(
+                        "conversation identity conflicts with transport scope"
+                    )
+                return requested
+            direct = conn.execute(
+                """SELECT 1 FROM conversation_subjects
+                    WHERE channel=? AND bot_id=? AND subject_kind='direct'
+                      AND scope_key=? LIMIT 1""",
+                (channel_value, bot_value, user_value),
+            ).fetchone()
+            if direct is None:
+                if requested not in candidates:
+                    raise StoreError(
+                        "conversation identity conflicts with transport scope"
+                    )
+                return requested
+            binding = conn.execute(
+                """SELECT conversation_id
+                     FROM principal_conversation_bindings
+                    WHERE principal_id=? AND agent_id=? AND session_id=?""",
+                (str(mapping["principal_id"]), agent_value, session_value),
+            ).fetchone()
+            if binding is None:
+                if requested not in candidates:
+                    raise StoreError(
+                        "conversation identity conflicts with transport scope"
+                    )
+                return requested
+            anchor = str(binding["conversation_id"])
+            if requested not in {*candidates, anchor}:
+                raise StoreError(
+                    "conversation identity conflicts with principal scope"
+                )
+            return anchor
+
+        return await self._call(op)
+
+    async def put_conversation_subject(
+        self,
+        subject: Any,
+        *,
+        provenance: Mapping[str, Any] | None = None,
+        now: datetime | str | None = None,
+    ) -> ConversationSubjectRecord:
+        subject_id = self._required_store_identity(
+            getattr(subject, "conversation_subject_id", None),
+            "conversation_subject_id",
+        )
+        channel_value = self._required_store_identity(
+            getattr(subject, "channel", None), "channel"
+        )
+        bot_value = self._required_store_identity(
+            getattr(subject, "bot_id", None), "bot_id"
+        )
+        kind_value = str(
+            getattr(getattr(subject, "kind", None), "value", getattr(subject, "kind", ""))
+            or ""
+        )
+        if kind_value not in {"direct", "group", "thread"}:
+            raise ValueError("conversation subject kind is invalid")
+        scope_value = self._required_store_identity(
+            getattr(subject, "scope_key", None), "scope_key"
+        )
+        chat_value = str(getattr(subject, "external_chat_id", "") or "")
+        thread_value = str(getattr(subject, "external_thread_id", "") or "")
+        parent_value = getattr(subject, "parent_subject_id", None) or None
+        provenance_value = dict(provenance or {})
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> ConversationSubjectRecord:
+            with _transaction(conn):
+                conn.execute(
+                    """INSERT OR IGNORE INTO conversation_subjects
+                           (conversation_subject_id, channel, bot_id, subject_kind,
+                            scope_key, external_chat_id, external_thread_id,
+                            parent_subject_id, provenance_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        subject_id,
+                        channel_value,
+                        bot_value,
+                        kind_value,
+                        scope_value,
+                        chat_value,
+                        thread_value,
+                        parent_value,
+                        json_dumps(provenance_value),
+                        now_text,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM conversation_subjects "
+                    "WHERE conversation_subject_id=?",
+                    (subject_id,),
+                ).fetchone()
+                record = self._conversation_subject_from_row(row)
+                if record is None:
+                    raise StoreError("conversation subject insert failed")
+                expected = (
+                    channel_value,
+                    bot_value,
+                    kind_value,
+                    scope_value,
+                    chat_value,
+                    thread_value,
+                    str(parent_value or ""),
+                )
+                actual = (
+                    record.channel,
+                    record.bot_id,
+                    record.subject_kind,
+                    record.scope_key,
+                    record.external_chat_id,
+                    record.external_thread_id,
+                    str(record.parent_subject_id or ""),
+                )
+                if expected != actual:
+                    raise StoreError(
+                        f"conversation subject identity is immutable: {subject_id}"
+                    )
+                return record
+
+        try:
+            return await self._call(op)
+        except sqlite3.IntegrityError as exc:
+            raise StoreError(str(exc)) from exc
+
+    async def get_conversation_subject(
+        self, conversation_subject_id: str
+    ) -> ConversationSubjectRecord | None:
+        subject_id = self._required_store_identity(
+            conversation_subject_id, "conversation_subject_id"
+        )
+        return await self._call(
+            lambda conn: self._conversation_subject_from_row(
+                conn.execute(
+                    "SELECT * FROM conversation_subjects "
+                    "WHERE conversation_subject_id=?",
+                    (subject_id,),
+                ).fetchone()
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Owner-configured Lark/Feishu bot profiles (schema v36)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _bot_profile_values(profile: Any, fields: Mapping[str, Any]) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        if isinstance(profile, Mapping):
+            data.update(profile)
+        elif profile is not None:
+            for name in BotProfileRecord.__dataclass_fields__:
+                if hasattr(profile, name):
+                    data[name] = getattr(profile, name)
+        data.update({key: value for key, value in fields.items() if value is not None})
+        return data
+
+    @classmethod
+    def _credential_reference(cls, value: Any) -> str:
+        reference = cls._required_store_identity(value, "credential_ref")
+        if len(reference) > 4096 or any(ord(char) < 32 for char in reference):
+            raise ValueError("credential_ref is invalid")
+        scheme, separator, identity = reference.partition(":")
+        if not separator or scheme.lower() not in {
+            "keychain",
+            "file",
+            "secret-service",
+            "credential",
+        } or not identity.strip():
+            raise ValueError("credential_ref must be an opaque credential reference")
+        return reference
+
+    @staticmethod
+    def _bot_error_code(value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = "_".join(str(value).strip().split())
+        normalized = re.sub(r"[^A-Za-z0-9_.:-]+", "_", normalized).strip("_")
+        return normalized[:128] or None
+
+    def _bot_profile_registration_values(
+        self,
+        profile: BotProfileRecord | Mapping[str, Any] | None,
+        fields: Mapping[str, Any],
+        *,
+        now: datetime | str | None,
+    ) -> dict[str, Any]:
+        """Validate and normalize one profile before opening its transaction."""
+
+        data = self._bot_profile_values(profile, fields)
+        forbidden = {
+            "app_secret",
+            "appSecret",
+            "access_token",
+            "refresh_token",
+            "tenant_access_token",
+        }
+        if forbidden.intersection(data):
+            raise ValueError("bot profile may persist credential references only")
+        profile_id = self._required_store_identity(data.get("profile_id"), "profile_id")
+        channel = self._required_store_identity(data.get("channel"), "channel").lower()
+        if channel != "lark":
+            raise ValueError("bot profile channel must be lark")
+        bot_id = self._required_store_identity(data.get("bot_id"), "bot_id")
+        brand = self._required_store_identity(data.get("brand"), "brand").lower()
+        if brand not in {"lark", "feishu"}:
+            raise ValueError("bot profile brand must be lark or feishu")
+        config_dir = self._required_store_identity(data.get("config_dir"), "config_dir")
+        config_identity = self._required_store_identity(
+            data.get("config_dir_identity"), "config_dir_identity"
+        )
+        cli_version = self._required_store_identity(
+            data.get("cli_version"), "cli_version"
+        )
+        credential_ref = self._credential_reference(data.get("credential_ref"))
+        enabled = bool(data.get("enabled", True))
+        mention_policy = self._required_store_identity(
+            data.get("mention_policy", "direct_or_mention"), "mention_policy"
+        )
+        access_policy = self._required_store_identity(
+            data.get("access_policy", "all"), "access_policy"
+        )
+        restart_policy = dict(data.get("restart_policy") or {})
+        return {
+            "profile_id": profile_id,
+            "channel": channel,
+            "bot_id": bot_id,
+            "brand": brand,
+            "config_dir": config_dir,
+            "config_identity": config_identity,
+            "cli_version": cli_version,
+            "credential_ref": credential_ref,
+            "enabled": enabled,
+            "mention_policy": mention_policy,
+            "access_policy": access_policy,
+            "restart_policy": restart_policy,
+            "now": self._now(now),
+        }
+
+    def _create_bot_profile_tx(
+        self,
+        conn: sqlite3.Connection,
+        values: Mapping[str, Any],
+    ) -> BotProfileRecord:
+        """Create or replay one exact bot profile in an existing transaction."""
+
+        profile_id = str(values["profile_id"])
+        channel = str(values["channel"])
+        bot_id = str(values["bot_id"])
+        brand = str(values["brand"])
+        config_dir = str(values["config_dir"])
+        config_identity = str(values["config_identity"])
+        cli_version = str(values["cli_version"])
+        credential_ref = str(values["credential_ref"])
+        enabled = bool(values["enabled"])
+        mention_policy = str(values["mention_policy"])
+        access_policy = str(values["access_policy"])
+        restart_policy = dict(values["restart_policy"] or {})
+        now_text = str(values["now"])
+
+        existing = conn.execute(
+            "SELECT * FROM bot_profiles WHERE profile_id=?", (profile_id,)
+        ).fetchone()
+        if existing is not None:
+            record = self._bot_profile_from_row(existing)
+            assert record is not None
+            expected = (
+                channel, bot_id, brand, config_dir, config_identity,
+                cli_version, credential_ref, enabled, mention_policy,
+                access_policy, self._json_snapshot(restart_policy),
+            )
+            actual = (
+                record.channel, record.bot_id, record.brand,
+                record.config_dir, record.config_dir_identity,
+                record.cli_version, record.credential_ref, record.enabled,
+                record.mention_policy, record.access_policy,
+                self._json_snapshot(record.restart_policy),
+            )
+            if record.removed_at is not None or expected != actual:
+                raise StoreError(
+                    f"bot profile identity is immutable: {profile_id}"
+                )
+            status = conn.execute(
+                "SELECT 1 FROM bot_profile_status WHERE profile_id=?",
+                (profile_id,),
+            ).fetchone()
+            if status is None:
+                raise StoreError(
+                    f"bot profile is missing its status row: {profile_id}"
+                )
+            return record
+        conn.execute(
+            """INSERT INTO bot_profiles
+                   (profile_id, channel, bot_id, brand, config_dir,
+                    config_dir_identity, cli_version, credential_ref,
+                    enabled, mention_policy, access_policy,
+                    restart_policy_json, created_at, updated_at, removed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+            (
+                profile_id, channel, bot_id, brand, config_dir,
+                config_identity, cli_version, credential_ref, int(enabled),
+                mention_policy, access_policy, json_dumps(restart_policy),
+                now_text, now_text,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO bot_profile_status
+                   (profile_id, onboarding_state, connection_state,
+                    generation, last_ready_at, retry_after,
+                    last_error_code, updated_at)
+               VALUES (?, 'registered', 'not_started', 0, NULL, NULL,
+                       NULL, ?)""",
+            (profile_id, now_text),
+        )
+        record = self._bot_profile_from_row(
+            conn.execute(
+                "SELECT * FROM bot_profiles WHERE profile_id=?",
+                (profile_id,),
+            ).fetchone()
+        )
+        assert record is not None
+        return record
+
+    async def create_bot_profile(
+        self,
+        profile: BotProfileRecord | Mapping[str, Any] | None = None,
+        *,
+        now: datetime | str | None = None,
+        **fields: Any,
+    ) -> BotProfileRecord:
+        values = self._bot_profile_registration_values(
+            profile,
+            fields,
+            now=now,
+        )
+
+        def op(conn: sqlite3.Connection) -> BotProfileRecord:
+            with _transaction(conn):
+                return self._create_bot_profile_tx(conn, values)
+
+        try:
+            return await self._call(op)
+        except sqlite3.IntegrityError as exc:
+            raise StoreError("bot profile account or config identity is already in use") from exc
+
+    async def create_bot_profile_for_onboarding(
+        self,
+        profile: BotProfileRecord | Mapping[str, Any] | None = None,
+        *,
+        now: datetime | str | None = None,
+        **fields: Any,
+    ) -> BotProfileRecord:
+        """Insert one definitely-new profile for a live onboarding transaction.
+
+        The ordinary registration API is intentionally replay-idempotent.  A
+        live credential transaction needs a stronger fact: if this call
+        returns, the caller created this exact row and may later attempt the
+        narrow compensation below.  Existing profile IDs are therefore an
+        error even when every field happens to match.
+        """
+
+        values = self._bot_profile_registration_values(
+            profile,
+            fields,
+            now=now,
+        )
+
+        def op(conn: sqlite3.Connection) -> BotProfileRecord:
+            with _transaction(conn):
+                if conn.execute(
+                    "SELECT 1 FROM bot_profiles WHERE profile_id=?",
+                    (str(values["profile_id"]),),
+                ).fetchone() is not None:
+                    raise StoreError(
+                        f"bot profile already exists: {values['profile_id']}"
+                    )
+                return self._create_bot_profile_tx(conn, values)
+
+        try:
+            return await self._call(op)
+        except sqlite3.IntegrityError as exc:
+            raise StoreError(
+                "bot profile account or config identity is already in use"
+            ) from exc
+
+    async def create_bot_profile_with_owner_for_onboarding(
+        self,
+        profile: BotProfileRecord | Mapping[str, Any] | None = None,
+        *,
+        external_user_id: str,
+        source_principal_account_id: str,
+        source_channel: str,
+        source_bot_id: str,
+        source_external_user_id: str,
+        source_mapping_revision: int,
+        configured_by: str,
+        principal_account_id: str | None = None,
+        now: datetime | str | None = None,
+        **fields: Any,
+    ) -> tuple[BotProfileRecord, PrincipalAccountRecord]:
+        """Create one chat-onboarded profile and owner mapping atomically.
+
+        The app-local human Open ID is verified before this call by the new
+        bot's own credentials.  This transaction independently proves that
+        the exact account which initiated onboarding is still an enabled
+        canonical owner, then creates a *new* profile/status/mapping bundle.
+        Existing target state is never replayed, retired, or remapped: the
+        caller needs the stronger fact that it created every returned row so
+        the exact compensation API below can safely remove the bundle.
+        """
+
+        values = self._bot_profile_registration_values(
+            profile,
+            fields,
+            now=now,
+        )
+        target_user = self._required_store_identity(
+            external_user_id,
+            "external_user_id",
+        )
+        if not _LARK_OPEN_ID.fullmatch(target_user):
+            raise ValueError(
+                "chat Lark onboarding requires a stable owner ou_ open_id"
+            )
+        target_bot_open_id = str(
+            (values.get("restart_policy") or {}).get("bot_open_id") or ""
+        ).strip()
+        if (
+            not _LARK_OPEN_ID.fullmatch(target_bot_open_id)
+            or target_user == target_bot_open_id
+        ):
+            raise ValueError(
+                "chat Lark onboarding requires distinct verified human and bot identities"
+            )
+        source_account_id = self._required_store_identity(
+            source_principal_account_id,
+            "source_principal_account_id",
+        )
+        source_channel_value = self._required_store_identity(
+            source_channel,
+            "source_channel",
+        ).lower()
+        if source_channel_value != "lark":
+            raise ValueError("chat Lark onboarding requires a Lark source account")
+        source_bot = self._required_store_identity(source_bot_id, "source_bot_id")
+        source_user = self._required_store_identity(
+            source_external_user_id,
+            "source_external_user_id",
+        )
+        if not _LARK_OPEN_ID.fullmatch(source_user):
+            raise ValueError(
+                "chat Lark onboarding requires a stable source ou_ open_id"
+            )
+        try:
+            source_revision = int(source_mapping_revision)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("source_mapping_revision must be positive") from exc
+        if source_revision <= 0:
+            raise ValueError("source_mapping_revision must be positive")
+        if source_bot == str(values["bot_id"]):
+            raise ValueError("chat Lark onboarding target must be a new bot account")
+        configured_value = self._required_store_identity(
+            configured_by,
+            "configured_by",
+        )
+        target_account_id = (
+            self._required_store_identity(
+                principal_account_id,
+                "principal_account_id",
+            )
+            if principal_account_id is not None
+            else _uuid()
+        )
+        now_text = str(values["now"])
+
+        def op(
+            conn: sqlite3.Connection,
+        ) -> tuple[BotProfileRecord, PrincipalAccountRecord]:
+            with _transaction(conn):
+                source = conn.execute(
+                    """SELECT pa.*, p.enabled AS principal_enabled
+                         FROM principal_accounts AS pa
+                         JOIN principals AS p ON p.principal_id=pa.principal_id
+                        WHERE pa.principal_account_id=?""",
+                    (source_account_id,),
+                ).fetchone()
+                if source is None:
+                    raise StoreError(
+                        "initiating owner authority changed before Lark onboarding"
+                    )
+                expected_source = (
+                    "owner",
+                    source_channel_value,
+                    source_bot,
+                    source_user,
+                    "open_id",
+                    source_revision,
+                    1,
+                    None,
+                    1,
+                )
+                actual_source = (
+                    str(source["principal_id"]),
+                    str(source["channel"]),
+                    str(source["bot_id"]),
+                    str(source["external_user_id"]),
+                    str(source["identifier_kind"]),
+                    int(source["mapping_revision"]),
+                    int(source["active"]),
+                    source["retired_at"],
+                    int(source["principal_enabled"]),
+                )
+                if actual_source != expected_source:
+                    raise StoreError(
+                        "initiating owner authority changed before Lark onboarding"
+                    )
+
+                profile_id = str(values["profile_id"])
+                if conn.execute(
+                    "SELECT 1 FROM bot_profiles WHERE profile_id=?",
+                    (profile_id,),
+                ).fetchone() is not None:
+                    raise StoreError(f"bot profile already exists: {profile_id}")
+
+                target_scope = (str(values["channel"]), str(values["bot_id"]))
+                if conn.execute(
+                    """SELECT 1 FROM bot_profiles
+                        WHERE channel=? AND bot_id=? LIMIT 1""",
+                    target_scope,
+                ).fetchone() is not None:
+                    raise StoreError(
+                        "chat-onboarded bot already has profile history"
+                    )
+                if conn.execute(
+                    """SELECT 1 FROM principal_accounts
+                        WHERE channel=? AND bot_id=? LIMIT 1""",
+                    target_scope,
+                ).fetchone() is not None:
+                    raise StoreError(
+                        "chat-onboarded bot already has principal-account history"
+                    )
+
+                # A QR-created app ID must be globally fresh to this store.
+                # Inspect every applied account-scoped table so a tombstone or
+                # future durable feature cannot be mistaken for an unused app.
+                for table_row in conn.execute(
+                    "SELECT name FROM sqlite_schema "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall():
+                    table_name = str(table_row["name"])
+                    if table_name in {"bot_profiles", "principal_accounts"}:
+                        continue
+                    quoted = '"' + table_name.replace('"', '""') + '"'
+                    columns = {
+                        str(column["name"])
+                        for column in conn.execute(
+                            f"PRAGMA table_info({quoted})"
+                        ).fetchall()
+                    }
+                    if {"channel", "bot_id"}.issubset(columns) and conn.execute(
+                        f"SELECT 1 FROM {quoted} "
+                        "WHERE channel=? AND bot_id=? LIMIT 1",
+                        target_scope,
+                    ).fetchone() is not None:
+                        raise StoreError(
+                            "chat-onboarded bot already has durable account state"
+                        )
+
+                created_profile = self._create_bot_profile_tx(conn, values)
+                conn.execute(
+                    """INSERT INTO principal_accounts
+                           (principal_account_id, principal_id, channel, bot_id,
+                            external_user_id, identifier_kind, mapping_revision,
+                            active, configured_by, created_at, retired_at)
+                       VALUES (?, 'owner', ?, ?, ?, 'open_id', 1, 1, ?, ?, NULL)""",
+                    (
+                        target_account_id,
+                        *target_scope,
+                        target_user,
+                        configured_value,
+                        now_text,
+                    ),
+                )
+                account = self._principal_account_from_row(
+                    conn.execute(
+                        """SELECT pa.*, p.enabled AS principal_enabled
+                             FROM principal_accounts AS pa
+                             JOIN principals AS p
+                               ON p.principal_id=pa.principal_id
+                            WHERE pa.principal_account_id=?""",
+                        (target_account_id,),
+                    ).fetchone()
+                )
+                if account is None:
+                    raise StoreError(
+                        "chat-onboarded owner mapping could not be registered"
+                    )
+                return created_profile, account
+
+        try:
+            return await self._call(op)
+        except sqlite3.IntegrityError as exc:
+            raise StoreError(
+                "bot profile or owner mapping identity is already in use"
+            ) from exc
+
+    async def rollback_bot_profile_registration(
+        self,
+        profile: BotProfileRecord | Mapping[str, Any] | Any,
+    ) -> bool:
+        """Hard-delete only an exact, unused live-onboarding registration.
+
+        This is not a general profile-removal API.  Its caller must have
+        stopped the candidate account while retaining that exact account's
+        ownership lock.  The transaction fails closed if the profile changed,
+        if its creation identity is unavailable, or if *any* durable table has
+        acquired state for the new channel account.  That distinction lets a
+        failed pre-ingress activation be retried without leaving a tombstone,
+        while preserving every row once ingress or authorization became
+        observable.
+        """
+
+        data = self._bot_profile_values(profile, {})
+        profile_id = self._required_store_identity(
+            data.get("profile_id"), "profile_id"
+        )
+        if data.get("removed_at") is not None:
+            return False
+        created_at = data.get("created_at")
+        updated_at = data.get("updated_at")
+        if created_at is None or updated_at is None:
+            return False
+        expected_created_at = _utc_text(created_at)
+        expected_updated_at = _utc_text(updated_at)
+        values = self._bot_profile_registration_values(
+            profile,
+            {},
+            now=expected_created_at,
+        )
+        account = (str(values["channel"]), str(values["bot_id"]))
+        expected = (
+            profile_id,
+            *account,
+            str(values["brand"]),
+            str(values["config_dir"]),
+            str(values["config_identity"]),
+            str(values["cli_version"]),
+            str(values["credential_ref"]),
+            int(bool(values["enabled"])),
+            str(values["mention_policy"]),
+            str(values["access_policy"]),
+            self._json_snapshot(values["restart_policy"]),
+            expected_created_at,
+            expected_updated_at,
+        )
+
+        def quoted_identifier(value: str) -> str:
+            return '"' + value.replace('"', '""') + '"'
+
+        def op(conn: sqlite3.Connection) -> bool:
+            with _transaction(conn):
+                row = conn.execute(
+                    "SELECT * FROM bot_profiles WHERE profile_id=?",
+                    (profile_id,),
+                ).fetchone()
+                if row is None or row["removed_at"] is not None:
+                    return False
+                actual = (
+                    str(row["profile_id"]),
+                    str(row["channel"]),
+                    str(row["bot_id"]),
+                    str(row["brand"]),
+                    str(row["config_dir"]),
+                    str(row["config_dir_identity"]),
+                    str(row["cli_version"]),
+                    str(row["credential_ref"]),
+                    int(row["enabled"]),
+                    str(row["mention_policy"]),
+                    str(row["access_policy"]),
+                    self._json_snapshot(
+                        json_loads(row["restart_policy_json"], {}) or {}
+                    ),
+                    str(row["created_at"]),
+                    str(row["updated_at"]),
+                )
+                if actual != expected:
+                    return False
+                if conn.execute(
+                    "SELECT 1 FROM bot_profile_status WHERE profile_id=?",
+                    (profile_id,),
+                ).fetchone() is None:
+                    return False
+
+                # Inspect the applied schema rather than maintaining a list
+                # that could silently omit a future account-scoped table.  All
+                # names originate in sqlite_schema and are quoted before use.
+                for table_row in conn.execute(
+                    "SELECT name FROM sqlite_schema "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall():
+                    table_name = str(table_row["name"])
+                    if table_name in {"bot_profiles", "bot_profile_status"}:
+                        continue
+                    quoted = quoted_identifier(table_name)
+                    columns = {
+                        str(column["name"])
+                        for column in conn.execute(
+                            f"PRAGMA table_info({quoted})"
+                        ).fetchall()
+                    }
+                    if {"channel", "bot_id"}.issubset(columns) and conn.execute(
+                        f"SELECT 1 FROM {quoted} "
+                        "WHERE channel=? AND bot_id=? LIMIT 1",
+                        account,
+                    ).fetchone() is not None:
+                        return False
+                    if "profile_id" in columns and conn.execute(
+                        f"SELECT 1 FROM {quoted} WHERE profile_id=? LIMIT 1",
+                        (profile_id,),
+                    ).fetchone() is not None:
+                        return False
+                # Delete the parent and let the declared CASCADE remove its
+                # status.  A future trigger that suppresses the parent delete
+                # must abort this transaction instead of committing a partial
+                # status deletion.
+                deleted = conn.execute(
+                    "DELETE FROM bot_profiles WHERE profile_id=?",
+                    (profile_id,),
+                ).rowcount
+                if deleted != 1:
+                    raise StoreError(
+                        "bot profile onboarding rollback was not applied"
+                    )
+                return True
+
+        return await self._call(op)
+
+    async def rollback_bot_profile_with_owner_registration(
+        self,
+        profile: BotProfileRecord | Mapping[str, Any] | Any,
+        principal_account: PrincipalAccountRecord | Mapping[str, Any] | Any,
+    ) -> bool:
+        """Remove only one exact, unused chat-onboarding profile/mapping bundle.
+
+        The ordinary live-onboarding rollback correctly refuses profiles that
+        have acquired *any* principal account.  Chat onboarding deliberately
+        creates one owner mapping in the same transaction, so its compensation
+        needs a distinct capability: both returned rows must still match
+        exactly, no other durable state may reference the profile/account, and
+        the mapping is deleted immediately before its profile in one
+        transaction.  Any ambiguity retains the complete bundle.
+        """
+
+        data = self._bot_profile_values(profile, {})
+        profile_id = self._required_store_identity(
+            data.get("profile_id"),
+            "profile_id",
+        )
+        if data.get("removed_at") is not None:
+            return False
+        created_at = data.get("created_at")
+        updated_at = data.get("updated_at")
+        if created_at is None or updated_at is None:
+            return False
+        expected_created_at = _utc_text(created_at)
+        expected_updated_at = _utc_text(updated_at)
+        values = self._bot_profile_registration_values(
+            profile,
+            {},
+            now=expected_created_at,
+        )
+        account_scope = (str(values["channel"]), str(values["bot_id"]))
+        expected_profile = (
+            profile_id,
+            *account_scope,
+            str(values["brand"]),
+            str(values["config_dir"]),
+            str(values["config_identity"]),
+            str(values["cli_version"]),
+            str(values["credential_ref"]),
+            int(bool(values["enabled"])),
+            str(values["mention_policy"]),
+            str(values["access_policy"]),
+            self._json_snapshot(values["restart_policy"]),
+            expected_created_at,
+            expected_updated_at,
+        )
+
+        def account_field(name: str, default: Any = None) -> Any:
+            if isinstance(principal_account, Mapping):
+                return principal_account.get(name, default)
+            return getattr(principal_account, name, default)
+
+        mapping_id = self._required_store_identity(
+            account_field("principal_account_id"),
+            "principal_account_id",
+        )
+        mapping_principal = self._required_store_identity(
+            account_field("principal_id"),
+            "principal_id",
+        )
+        mapping_channel = self._required_store_identity(
+            account_field("channel"),
+            "channel",
+        ).lower()
+        mapping_bot = self._required_store_identity(
+            account_field("bot_id"),
+            "bot_id",
+        )
+        mapping_user = self._required_store_identity(
+            account_field("external_user_id"),
+            "external_user_id",
+        )
+        mapping_kind = self._required_store_identity(
+            account_field("identifier_kind"),
+            "identifier_kind",
+        )
+        mapping_configured_by = self._required_store_identity(
+            account_field("configured_by"),
+            "configured_by",
+        )
+        try:
+            mapping_revision = int(account_field("mapping_revision"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("mapping_revision must be positive") from exc
+        mapping_created_at = account_field("created_at")
+        if mapping_created_at is None:
+            return False
+        expected_mapping_created_at = _utc_text(mapping_created_at)
+        if (
+            mapping_principal != "owner"
+            or mapping_channel != "lark"
+            or (mapping_channel, mapping_bot) != account_scope
+            or not _LARK_OPEN_ID.fullmatch(mapping_user)
+            or mapping_kind != "open_id"
+            or mapping_revision != 1
+            or not bool(account_field("active", False))
+            or account_field("retired_at") is not None
+        ):
+            return False
+        expected_mapping = (
+            mapping_id,
+            mapping_principal,
+            mapping_channel,
+            mapping_bot,
+            mapping_user,
+            mapping_kind,
+            mapping_revision,
+            1,
+            mapping_configured_by,
+            expected_mapping_created_at,
+            None,
+        )
+
+        def quoted_identifier(value: str) -> str:
+            return '"' + value.replace('"', '""') + '"'
+
+        def op(conn: sqlite3.Connection) -> bool:
+            with _transaction(conn):
+                profile_row = conn.execute(
+                    "SELECT * FROM bot_profiles WHERE profile_id=?",
+                    (profile_id,),
+                ).fetchone()
+                if profile_row is None or profile_row["removed_at"] is not None:
+                    return False
+                actual_profile = (
+                    str(profile_row["profile_id"]),
+                    str(profile_row["channel"]),
+                    str(profile_row["bot_id"]),
+                    str(profile_row["brand"]),
+                    str(profile_row["config_dir"]),
+                    str(profile_row["config_dir_identity"]),
+                    str(profile_row["cli_version"]),
+                    str(profile_row["credential_ref"]),
+                    int(profile_row["enabled"]),
+                    str(profile_row["mention_policy"]),
+                    str(profile_row["access_policy"]),
+                    self._json_snapshot(
+                        json_loads(profile_row["restart_policy_json"], {}) or {}
+                    ),
+                    str(profile_row["created_at"]),
+                    str(profile_row["updated_at"]),
+                )
+                if actual_profile != expected_profile:
+                    return False
+                if conn.execute(
+                    "SELECT 1 FROM bot_profile_status WHERE profile_id=?",
+                    (profile_id,),
+                ).fetchone() is None:
+                    return False
+
+                mapping_rows = conn.execute(
+                    """SELECT * FROM principal_accounts
+                        WHERE channel=? AND bot_id=?""",
+                    account_scope,
+                ).fetchall()
+                if len(mapping_rows) != 1:
+                    return False
+                mapping_row = mapping_rows[0]
+                actual_mapping = (
+                    str(mapping_row["principal_account_id"]),
+                    str(mapping_row["principal_id"]),
+                    str(mapping_row["channel"]),
+                    str(mapping_row["bot_id"]),
+                    str(mapping_row["external_user_id"]),
+                    str(mapping_row["identifier_kind"]),
+                    int(mapping_row["mapping_revision"]),
+                    int(mapping_row["active"]),
+                    str(mapping_row["configured_by"]),
+                    str(mapping_row["created_at"]),
+                    mapping_row["retired_at"],
+                )
+                if actual_mapping != expected_mapping:
+                    return False
+
+                # Discover all account/profile-scoped tables from the applied
+                # schema so a future durable feature cannot be silently lost
+                # by this narrow compensation path.
+                for table_row in conn.execute(
+                    "SELECT name FROM sqlite_schema "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall():
+                    table_name = str(table_row["name"])
+                    if table_name in {
+                        "bot_profiles",
+                        "bot_profile_status",
+                        "principal_accounts",
+                    }:
+                        continue
+                    quoted = quoted_identifier(table_name)
+                    columns = {
+                        str(column["name"])
+                        for column in conn.execute(
+                            f"PRAGMA table_info({quoted})"
+                        ).fetchall()
+                    }
+                    if {"channel", "bot_id"}.issubset(columns) and conn.execute(
+                        f"SELECT 1 FROM {quoted} "
+                        "WHERE channel=? AND bot_id=? LIMIT 1",
+                        account_scope,
+                    ).fetchone() is not None:
+                        return False
+                    if "profile_id" in columns and conn.execute(
+                        f"SELECT 1 FROM {quoted} WHERE profile_id=? LIMIT 1",
+                        (profile_id,),
+                    ).fetchone() is not None:
+                        return False
+                    if "principal_account_id" in columns and conn.execute(
+                        f"SELECT 1 FROM {quoted} "
+                        "WHERE principal_account_id=? LIMIT 1",
+                        (mapping_id,),
+                    ).fetchone() is not None:
+                        return False
+
+                deleted_mapping = conn.execute(
+                    "DELETE FROM principal_accounts "
+                    "WHERE principal_account_id=? AND active=1",
+                    (mapping_id,),
+                ).rowcount
+                if deleted_mapping != 1:
+                    raise StoreError(
+                        "Lark onboarding owner rollback was not applied"
+                    )
+                deleted_profile = conn.execute(
+                    "DELETE FROM bot_profiles WHERE profile_id=?",
+                    (profile_id,),
+                ).rowcount
+                if deleted_profile != 1:
+                    raise StoreError(
+                        "Lark onboarding profile rollback was not applied"
+                    )
+                return True
+
+        return await self._call(op)
+
+    put_bot_profile = create_bot_profile
+    register_bot_profile = create_bot_profile
+    add_bot_profile = create_bot_profile
+
+    async def create_bot_profile_with_principal_account(
+        self,
+        profile: BotProfileRecord | Mapping[str, Any] | None = None,
+        *,
+        principal_id: str = "owner",
+        external_user_id: str,
+        identifier_kind: str = "open_id",
+        configured_by: str,
+        principal_account_id: str | None = None,
+        now: datetime | str | None = None,
+        **fields: Any,
+    ) -> tuple[BotProfileRecord, PrincipalAccountRecord]:
+        """Atomically register one Lark profile and its canonical owner.
+
+        App onboarding authenticates a bot but cannot itself identify a human.
+        The caller therefore supplies the exact app-local ``ou_`` identity
+        authorized by the local owner.  Profile/status creation, owner
+        creation, and the revisioned account mapping commit together so a
+        crash cannot publish only half of the authorization state.
+        """
+
+        values = self._bot_profile_registration_values(
+            profile,
+            fields,
+            now=now,
+        )
+        pid = self._required_store_identity(principal_id, "principal_id")
+        if pid != "owner":
+            raise ValueError(
+                "atomic Lark profile registration requires principal owner"
+            )
+        user_value = self._required_store_identity(
+            external_user_id,
+            "external_user_id",
+        )
+        if not _LARK_OPEN_ID.fullmatch(user_value):
+            raise ValueError(
+                "atomic Lark profile registration requires a stable ou_ open_id"
+            )
+        kind_value = self._required_store_identity(
+            identifier_kind,
+            "identifier_kind",
+        )
+        if kind_value != "open_id":
+            raise ValueError("Lark principal accounts require a stable open_id")
+        configured_value = self._required_store_identity(
+            configured_by,
+            "configured_by",
+        )
+        account_value = (
+            self._required_store_identity(
+                principal_account_id,
+                "principal_account_id",
+            )
+            if principal_account_id is not None
+            else _uuid()
+        )
+        now_text = str(values["now"])
+
+        def op(
+            conn: sqlite3.Connection,
+        ) -> tuple[BotProfileRecord, PrincipalAccountRecord]:
+            with _transaction(conn):
+                created_profile = self._create_bot_profile_tx(conn, values)
+                principal_row = conn.execute(
+                    "SELECT * FROM principals WHERE principal_id=?",
+                    (pid,),
+                ).fetchone()
+                if principal_row is None:
+                    conn.execute(
+                        """INSERT INTO principals
+                               (principal_id, display_name, enabled,
+                                metadata_json, created_at, updated_at)
+                           VALUES (?, '', 1, '{}', ?, ?)""",
+                        (pid, now_text, now_text),
+                    )
+                owner = self._principal_from_row(
+                    conn.execute(
+                        "SELECT * FROM principals WHERE principal_id=?",
+                        (pid,),
+                    ).fetchone()
+                )
+                if owner is None:
+                    raise StoreError("owner principal could not be registered")
+                if not owner.enabled:
+                    raise StoreError("owner principal is disabled")
+                account = self._map_principal_account_tx(
+                    conn,
+                    principal_id=owner.principal_id,
+                    channel=str(values["channel"]),
+                    bot_id=str(values["bot_id"]),
+                    external_user_id=user_value,
+                    identifier_kind=kind_value,
+                    configured_by=configured_value,
+                    principal_account_id=account_value,
+                    now=now_text,
+                )
+                return created_profile, account
+
+        try:
+            return await self._call(op)
+        except sqlite3.IntegrityError as exc:
+            raise StoreError(
+                "bot profile or principal account identity is already in use"
+            ) from exc
+
+    async def get_bot_profile(
+        self, profile_id: str, *, include_removed: bool = False
+    ) -> BotProfileRecord | None:
+        identity = self._required_store_identity(profile_id, "profile_id")
+        suffix = "" if include_removed else " AND removed_at IS NULL"
+        return await self._call(
+            lambda conn: self._bot_profile_from_row(
+                conn.execute(
+                    "SELECT * FROM bot_profiles WHERE profile_id=?" + suffix,
+                    (identity,),
+                ).fetchone()
+            )
+        )
+
+    async def list_bot_profiles(
+        self,
+        *,
+        channel: str | None = None,
+        enabled: bool | None = None,
+        include_removed: bool = False,
+    ) -> list[BotProfileRecord]:
+        filters: list[str] = []
+        params: list[Any] = []
+        if not include_removed:
+            filters.append("removed_at IS NULL")
+        if channel is not None:
+            filters.append("channel=?")
+            params.append(self._required_store_identity(channel, "channel").lower())
+        if enabled is not None:
+            filters.append("enabled=?")
+            params.append(int(enabled))
+        where = " WHERE " + " AND ".join(filters) if filters else ""
+
+        def op(conn: sqlite3.Connection) -> list[BotProfileRecord]:
+            return [
+                record
+                for row in conn.execute(
+                    "SELECT * FROM bot_profiles" + where
+                    + " ORDER BY created_at, profile_id",
+                    params,
+                ).fetchall()
+                if (record := self._bot_profile_from_row(row)) is not None
+            ]
+
+        return await self._call(op)
+
+    async def update_bot_profile(
+        self,
+        profile_id: str,
+        *,
+        mention_policy: str | None = None,
+        access_policy: str | None = None,
+        restart_policy: Mapping[str, Any] | None = None,
+        enabled: bool | None = None,
+        now: datetime | str | None = None,
+        **immutable_fields: Any,
+    ) -> BotProfileRecord:
+        identity = self._required_store_identity(profile_id, "profile_id")
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> BotProfileRecord:
+            with _transaction(conn):
+                row = conn.execute(
+                    "SELECT * FROM bot_profiles WHERE profile_id=? AND removed_at IS NULL",
+                    (identity,),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"bot profile not found: {identity}")
+                for field in (
+                    "channel", "bot_id", "brand", "config_dir",
+                    "config_dir_identity", "cli_version", "credential_ref",
+                ):
+                    supplied = immutable_fields.get(field)
+                    if supplied is not None and str(supplied) != str(row[field]):
+                        raise StoreError(f"bot profile field is immutable: {field}")
+                next_mention = (
+                    self._required_store_identity(mention_policy, "mention_policy")
+                    if mention_policy is not None else str(row["mention_policy"])
+                )
+                next_access = (
+                    self._required_store_identity(access_policy, "access_policy")
+                    if access_policy is not None else str(row["access_policy"])
+                )
+                next_restart = (
+                    dict(restart_policy)
+                    if restart_policy is not None
+                    else json_loads(row["restart_policy_json"], {}) or {}
+                )
+                next_enabled = int(enabled) if enabled is not None else int(row["enabled"])
+                changed_enabled = next_enabled != int(row["enabled"])
+                conn.execute(
+                    """UPDATE bot_profiles SET mention_policy=?, access_policy=?,
+                           restart_policy_json=?, enabled=?, updated_at=?
+                       WHERE profile_id=? AND removed_at IS NULL""",
+                    (
+                        next_mention, next_access, json_dumps(next_restart),
+                        next_enabled, now_text, identity,
+                    ),
+                )
+                if changed_enabled:
+                    conn.execute(
+                        """UPDATE bot_profile_status
+                           SET generation=generation+1,
+                               connection_state=?, retry_after=NULL,
+                               last_error_code=NULL, updated_at=?
+                           WHERE profile_id=?""",
+                        (
+                            "not_started" if next_enabled else "disabled",
+                            now_text,
+                            identity,
+                        ),
+                    )
+                record = self._bot_profile_from_row(
+                    conn.execute(
+                        "SELECT * FROM bot_profiles WHERE profile_id=?",
+                        (identity,),
+                    ).fetchone()
+                )
+                assert record is not None
+                return record
+
+        return await self._call(op)
+
+    async def set_bot_profile_enabled(
+        self,
+        profile_id: str,
+        enabled: bool,
+        *,
+        now: datetime | str | None = None,
+    ) -> BotProfileRecord:
+        return await self.update_bot_profile(
+            profile_id, enabled=bool(enabled), now=now
+        )
+
+    update_bot_profile_enabled = set_bot_profile_enabled
+
+    async def enable_bot_profile(
+        self, profile_id: str, *, now: datetime | str | None = None
+    ) -> BotProfileRecord:
+        return await self.set_bot_profile_enabled(profile_id, True, now=now)
+
+    async def disable_bot_profile(
+        self, profile_id: str, *, now: datetime | str | None = None
+    ) -> BotProfileRecord:
+        return await self.set_bot_profile_enabled(profile_id, False, now=now)
+
+    async def get_bot_profile_status(
+        self, profile_id: str
+    ) -> BotProfileStatusRecord | None:
+        identity = self._required_store_identity(profile_id, "profile_id")
+        return await self._call(
+            lambda conn: self._bot_profile_status_from_row(
+                conn.execute(
+                    "SELECT * FROM bot_profile_status WHERE profile_id=?",
+                    (identity,),
+                ).fetchone()
+            )
+        )
+
+    async def set_bot_profile_status(
+        self,
+        profile_id: str,
+        *,
+        onboarding_state: str | None = None,
+        connection_state: str | None = None,
+        generation: int | None = None,
+        last_ready_at: datetime | str | None | object = _UNSET,
+        retry_after: datetime | str | None | object = _UNSET,
+        last_error_code: str | None | object = _UNSET,
+        now: datetime | str | None = None,
+    ) -> BotProfileStatusRecord:
+        identity = self._required_store_identity(profile_id, "profile_id")
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> BotProfileStatusRecord:
+            with _transaction(conn):
+                profile = conn.execute(
+                    "SELECT removed_at FROM bot_profiles WHERE profile_id=?",
+                    (identity,),
+                ).fetchone()
+                row = conn.execute(
+                    "SELECT * FROM bot_profile_status WHERE profile_id=?",
+                    (identity,),
+                ).fetchone()
+                if profile is None or row is None:
+                    raise NotFoundError(f"bot profile not found: {identity}")
+                if profile["removed_at"] is not None:
+                    raise StoreError("removed bot profile status is immutable")
+                next_generation = (
+                    int(generation) if generation is not None else int(row["generation"])
+                )
+                if next_generation < int(row["generation"]):
+                    raise StoreError("bot profile generation cannot regress")
+                next_onboarding = (
+                    self._required_store_identity(onboarding_state, "onboarding_state")
+                    if onboarding_state is not None
+                    else str(row["onboarding_state"])
+                )
+                next_connection = (
+                    self._required_store_identity(connection_state, "connection_state")
+                    if connection_state is not None
+                    else str(row["connection_state"])
+                )
+                ready_value = (
+                    row["last_ready_at"]
+                    if last_ready_at is _UNSET
+                    else _utc_text(last_ready_at)
+                    if last_ready_at is not None
+                    else None
+                )
+                retry_value = (
+                    row["retry_after"]
+                    if retry_after is _UNSET
+                    else _utc_text(retry_after)
+                    if retry_after is not None
+                    else None
+                )
+                error_value = (
+                    row["last_error_code"]
+                    if last_error_code is _UNSET
+                    else self._bot_error_code(last_error_code)
+                )
+                conn.execute(
+                    """UPDATE bot_profile_status
+                       SET onboarding_state=?, connection_state=?, generation=?,
+                           last_ready_at=?, retry_after=?, last_error_code=?,
+                           updated_at=? WHERE profile_id=?""",
+                    (
+                        next_onboarding, next_connection, next_generation,
+                        ready_value, retry_value, error_value, now_text, identity,
+                    ),
+                )
+                record = self._bot_profile_status_from_row(
+                    conn.execute(
+                        "SELECT * FROM bot_profile_status WHERE profile_id=?",
+                        (identity,),
+                    ).fetchone()
+                )
+                assert record is not None
+                return record
+
+        return await self._call(op)
+
+    async def update_bot_profile_credentials(
+        self,
+        profile_id: str,
+        credential_ref: str,
+        cli_version: str | None = None,
+        *,
+        restart_policy: Mapping[str, Any] | None = None,
+        bot_open_id: str | None = None,
+        now: datetime | str | None = None,
+    ) -> BotProfileRecord:
+        identity = self._required_store_identity(profile_id, "profile_id")
+        reference = self._credential_reference(credential_ref)
+        version = (
+            self._required_store_identity(cli_version, "cli_version")
+            if cli_version is not None else None
+        )
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> BotProfileRecord:
+            with _transaction(conn):
+                row = conn.execute(
+                    "SELECT * FROM bot_profiles WHERE profile_id=? AND removed_at IS NULL",
+                    (identity,),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"bot profile not found: {identity}")
+                next_restart_policy = dict(
+                    json_loads(row["restart_policy_json"], {}) or {}
+                )
+                if restart_policy is not None:
+                    next_restart_policy.update(dict(restart_policy))
+                if bot_open_id is not None:
+                    next_restart_policy["bot_open_id"] = self._required_store_identity(
+                        bot_open_id, "bot_open_id"
+                    )
+                conn.execute(
+                    """UPDATE bot_profiles SET credential_ref=?, cli_version=?,
+                           restart_policy_json=?, updated_at=?
+                       WHERE profile_id=? AND removed_at IS NULL""",
+                    (
+                        reference, version or row["cli_version"],
+                        json_dumps(next_restart_policy), now_text, identity,
+                    ),
+                )
+                conn.execute(
+                    """UPDATE bot_profile_status
+                       SET onboarding_state='registered',
+                           connection_state='not_started',
+                           generation=generation+1, retry_after=NULL,
+                           last_error_code=NULL, updated_at=?
+                       WHERE profile_id=?""",
+                    (now_text, identity),
+                )
+                record = self._bot_profile_from_row(
+                    conn.execute(
+                        "SELECT * FROM bot_profiles WHERE profile_id=?",
+                        (identity,),
+                    ).fetchone()
+                )
+                assert record is not None
+                return record
+
+        return await self._call(op)
+
+    reauthorize_bot_profile = update_bot_profile_credentials
+
+    async def remove_bot_profile(
+        self,
+        profile_id: str,
+        *,
+        now: datetime | str | None = None,
+    ) -> bool:
+        identity = self._required_store_identity(profile_id, "profile_id")
+        now_text = self._now(now)
+
+        def op(conn: sqlite3.Connection) -> bool:
+            with _transaction(conn):
+                row = conn.execute(
+                    "SELECT * FROM bot_profiles WHERE profile_id=?", (identity,)
+                ).fetchone()
+                if row is None:
+                    return False
+                if row["removed_at"] is not None:
+                    return True
+                account = (row["channel"], row["bot_id"])
+                pending = any(
+                    conn.execute(sql, account).fetchone() is not None
+                    for sql in (
+                        "SELECT 1 FROM tasks WHERE channel=? AND bot_id=? "
+                        "AND state NOT IN ('completed','failed','interrupted','cancelled') LIMIT 1",
+                        "SELECT 1 FROM user_outbox WHERE channel=? AND bot_id=? "
+                        "AND state NOT IN ('sent','failed_permanent','delivery_unknown') LIMIT 1",
+                        "SELECT 1 FROM outgoing_media WHERE channel=? AND bot_id=? "
+                        "AND state NOT IN ('sent','failed') LIMIT 1",
+                    )
+                )
+                if pending:
+                    raise StoreError("bot profile has pending work")
+                conn.execute(
+                    """UPDATE bot_profiles SET enabled=0, removed_at=?, updated_at=?
+                       WHERE profile_id=? AND removed_at IS NULL""",
+                    (now_text, now_text, identity),
+                )
+                conn.execute(
+                    """UPDATE bot_profile_status
+                       SET connection_state='disabled', generation=generation+1,
+                           retry_after=NULL, updated_at=? WHERE profile_id=?""",
+                    (now_text, identity),
+                )
+                # Principal/account rows are audit history, so profile removal
+                # retires rather than deletes them.  Leaving an active mapping
+                # behind would silently restore authorization if the same app
+                # ID were registered again later.
+                conn.execute(
+                    """UPDATE principal_accounts
+                       SET active=0, retired_at=?
+                       WHERE channel=? AND bot_id=? AND active=1""",
+                    (now_text, *account),
+                )
+                return True
+
+        return await self._call(op)
+
+    delete_bot_profile = remove_bot_profile
+
     async def reserve_child_task(
         self,
         parent_task_id: str,
@@ -33053,6 +45306,9 @@ class SQLiteStore:
                     raise InvalidTransition(f"transcription candidate is {status}")
 
                 route = confirmation_snapshot["route"]
+                conversation_route = confirmation_snapshot.get(
+                    "conversation_route", route
+                )
                 original_target = confirmation_snapshot["target"]
                 supplied_target = task_values.get("reply_target")
                 if supplied_target is not None:
@@ -33105,6 +45361,19 @@ class SQLiteStore:
                 if stored_metadata is not None:
                     task_values["metadata"] = stored_metadata or {}
                 task_values["reply_target"] = original_target
+                task_values["actor_external_user_id"] = confirmation_snapshot[
+                    "actor_external_user_id"
+                ]
+                task_values["principal_id"] = confirmation_snapshot["principal_id"]
+                task_values["principal_account_id"] = confirmation_snapshot[
+                    "principal_account_id"
+                ]
+                task_values["conversation_subject_id"] = confirmation_snapshot[
+                    "conversation_subject_id"
+                ]
+                task_values["identity_snapshot"] = dict(
+                    confirmation_snapshot["identity_snapshot"]
+                )
                 canonical_inputs = dict(confirmation_snapshot["inputs"])
                 supplied_inputs = self._mapping_snapshot(task_values.get("inputs"))
                 # Confirmation input is candidate-owned.  Permit callers to
@@ -33131,10 +45400,10 @@ class SQLiteStore:
                 supplied_conversation = str(task_values.get("conversation_id") or "")
                 if supplied_conversation and not conversation_id_matches(
                     supplied_conversation,
-                    route["channel"],
-                    route["bot_id"],
-                    route["external_user_id"],
-                    route["session_id"],
+                    conversation_route["channel"],
+                    conversation_route["bot_id"],
+                    conversation_route["external_user_id"],
+                    conversation_route["session_id"],
                     task_values["agent_id"],
                 ):
                     raise StoreError(
@@ -33196,19 +45465,19 @@ class SQLiteStore:
                 conversation_id = self._ensure_conversation_tx(
                     conn,
                     snapshot,
-                    channel=route["channel"],
-                    bot_id=route["bot_id"],
-                    external_user_id=route["external_user_id"],
-                    session_id=route["session_id"],
+                    channel=conversation_route["channel"],
+                    bot_id=conversation_route["bot_id"],
+                    external_user_id=conversation_route["external_user_id"],
+                    session_id=conversation_route["session_id"],
                     now=now_text,
                 )
                 role_snapshot = self._task_role_snapshot_tx(
                     conn,
                     metadata=snapshot.metadata,
-                    channel=route["channel"],
-                    bot_id=route["bot_id"],
-                    external_user_id=route["external_user_id"],
-                    session_id=route["session_id"],
+                    channel=conversation_route["channel"],
+                    bot_id=conversation_route["bot_id"],
+                    external_user_id=conversation_route["external_user_id"],
+                    session_id=conversation_route["session_id"],
                     agent_id=snapshot.agent_id,
                 )
                 role_version, role_hash, persona_version = role_binding_key(
@@ -33249,20 +45518,29 @@ class SQLiteStore:
                             external_user_id, session_id, agent_id, agent_incarnation, conversation_id,
                             thread_id, mode_id, profile_version, policy_version,
                             model, reasoning_effort, reply_target_json, inputs_json,
-                            metadata_json, state, attempts, next_attempt_at,
+                            metadata_json, actor_external_user_id, principal_id,
+                            principal_account_id, conversation_subject_id,
+                            identity_snapshot_json, state, attempts, next_attempt_at,
                             parent_task_id, child_depth, request_id, created_at, updated_at)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                   ?, ?, ?, ?, ?,
                                    'queued', 0, ?, ?, ?, ?, ?, ?)""",
                         (
                             task_id, snapshot.dedupe_key, linked_inbound_id,
-                            route["channel"], route["bot_id"],
-                            route["external_user_id"], route["session_id"], snapshot.agent_id,
+                            conversation_route["channel"], conversation_route["bot_id"],
+                            conversation_route["external_user_id"],
+                            conversation_route["session_id"], snapshot.agent_id,
                             agent_incarnation,
                             conversation_id, thread_id, snapshot.mode_id,
                             int(snapshot.profile_version), int(snapshot.policy_version),
                             snapshot.model, snapshot.reasoning_effort,
                             json_dumps(target.to_dict()), json_dumps(_snapshot_value(snapshot.inputs)),
                             json_dumps(_snapshot_value(snapshot.metadata, text_key="value")),
+                            snapshot.actor_external_user_id,
+                            snapshot.principal_id,
+                            snapshot.principal_account_id,
+                            snapshot.conversation_subject_id,
+                            json_dumps(_snapshot_value(snapshot.identity_snapshot)),
                             None, snapshot.parent_task_id, int(snapshot.child_depth),
                             snapshot.request_id, now_text, now_text,
                         ),
@@ -33282,10 +45560,10 @@ class SQLiteStore:
                         inbound_message_id=confirmation_snapshot["inbound_id"],
                         inputs=snapshot.inputs,
                         agent_id=snapshot.agent_id,
-                        channel=route["channel"],
-                        bot_id=route["bot_id"],
-                        external_user_id=route["external_user_id"],
-                        session_id=route["session_id"],
+                        channel=conversation_route["channel"],
+                        bot_id=conversation_route["bot_id"],
+                        external_user_id=conversation_route["external_user_id"],
+                        session_id=conversation_route["session_id"],
                     )
                     self._retain_task_input_attachments_tx(
                         conn,
@@ -33299,6 +45577,8 @@ class SQLiteStore:
                         now=now_text,
                         max_agent_queue=self.max_agent_queue,
                         max_global_queue=self.max_global_queue,
+                        max_account_queue=self.max_account_queue,
+                        max_account_agent_queue=self.max_account_agent_queue,
                     )
                     existing = self._fetch_task_tx(conn, task_id)
                 if existing is None:

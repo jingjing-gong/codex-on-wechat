@@ -302,6 +302,29 @@ def log_task_started(
     _write_structured(logger, logging.INFO, "agent_task_started", payload)
 
 
+def log_agent_creation_failed(
+    logger: logging.Logger,
+    *,
+    agent_id: Any,
+    phase: Any,
+    exception: BaseException,
+) -> None:
+    """Record one bounded failure without exposing config or provider secrets."""
+
+    _write_structured(
+        logger,
+        logging.ERROR,
+        "agent_creation_failed",
+        {
+            "agent_id": sanitize_diagnostic_text(agent_id, maximum=128),
+            "phase": sanitize_diagnostic_text(phase, maximum=128),
+            "exception_type": type(exception).__name__,
+            "exception": sanitize_diagnostic_text(exception)
+            or type(exception).__name__,
+        },
+    )
+
+
 def log_task_terminal(
     logger: logging.Logger,
     task: Any,
@@ -339,6 +362,7 @@ __all__ = [
     "DEFAULT_LOG_BACKUP_COUNT",
     "DEFAULT_LOG_MAX_BYTES",
     "configure_persistent_logging",
+    "log_agent_creation_failed",
     "log_task_started",
     "log_task_terminal",
     "runtime_log_path",

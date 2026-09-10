@@ -69,6 +69,16 @@ class ReplyTarget:
     source_message_id: str = ""
     source_sequence: int | None = None
     context_token: str | None = None
+    # The authenticated actor remains ``external_user_id``.  Channels whose
+    # conversation is owned by a chat or topic carry that independent routing
+    # subject and exact delivery address alongside the legacy fields.
+    conversation_subject_id: str = ""
+    conversation_subject_scope: str = ""
+    destination_kind: str = ""
+    destination_id: str = ""
+    thread_id: str = ""
+    root_message_id: str = ""
+    transport_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.session_id:
@@ -80,8 +90,14 @@ class ReplyTarget:
 
         return self.external_user_id
 
+    @property
+    def routing_subject_id(self) -> str:
+        """Return the bot-local subject used for mutable conversation state."""
+
+        return self.conversation_subject_scope or self.external_user_id
+
     def as_dict(self) -> dict[str, Any]:
-        return {
+        values = {
             "channel": self.channel,
             "bot_id": self.bot_id,
             "external_user_id": self.external_user_id,
@@ -90,6 +106,32 @@ class ReplyTarget:
             "source_sequence": self.source_sequence,
             "context_token": self.context_token,
         }
+        # Preserve the exact legacy WeChat contract when no adapter supplied
+        # channel-neutral destination fields.  Lark snapshots include the
+        # complete immutable chat/thread address.
+        if any(
+            (
+                self.conversation_subject_id,
+                self.conversation_subject_scope,
+                self.destination_kind,
+                self.destination_id,
+                self.thread_id,
+                self.root_message_id,
+                self.transport_metadata,
+            )
+        ):
+            values.update(
+                {
+                    "conversation_subject_id": self.conversation_subject_id,
+                    "conversation_subject_scope": self.conversation_subject_scope,
+                    "destination_kind": self.destination_kind,
+                    "destination_id": self.destination_id,
+                    "thread_id": self.thread_id,
+                    "root_message_id": self.root_message_id,
+                    "transport_metadata": dict(self.transport_metadata),
+                }
+            )
+        return values
 
     # Store/channel adapters historically use ``to_dict``; retaining the alias
     # keeps this SDK-independent value interoperable without importing store
@@ -124,6 +166,10 @@ class AgentTask:
     child_depth: int = 0
     metadata: Mapping[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=utc_now)
+    # Appended for positional-constructor compatibility. The durable source
+    # row is only a trusted provenance marker for narrow runtime capabilities;
+    # the child cannot resolve or mutate an inbound row by this ID.
+    inbound_message_id: str | None = None
 
     def __post_init__(self) -> None:
         target = self.reply_target
@@ -386,6 +432,18 @@ class AgentResult:
 EmitCallback = Callable[[AgentEvent], Awaitable[None]]
 
 
+class AgentSteeringUnavailableError(RuntimeError):
+    """Steering was definitely not submitted to the native runner."""
+
+    execution_uncertain = False
+
+
+class AgentSteeringUncertainError(RuntimeError):
+    """Steering may have been accepted before its acknowledgement failed."""
+
+    execution_uncertain = True
+
+
 @runtime_checkable
 class AgentRuntime(Protocol):
     """Runtime interface implemented by Codex and future Agent backends."""
@@ -397,6 +455,16 @@ class AgentRuntime(Protocol):
         ...
 
     async def run(self, task: AgentTask, emit: EmitCallback) -> AgentResult:
+        ...
+
+    async def steer(
+        self,
+        task_id: str,
+        inputs: Any,
+        *,
+        steering_id: str = "",
+        execution_id: str = "",
+    ) -> bool:
         ...
 
     async def interrupt(self, task_id: str) -> bool:
@@ -426,6 +494,8 @@ __all__ = [
     "AgentResult",
     "AgentRuntime",
     "AgentTask",
+    "AgentSteeringUnavailableError",
+    "AgentSteeringUncertainError",
     "EmitCallback",
     "EventPriority",
     "EventVisibility",

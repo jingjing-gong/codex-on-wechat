@@ -13,7 +13,9 @@ import hashlib
 import inspect
 import logging
 import math
+import os
 import shlex
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -23,6 +25,8 @@ from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 from .base import (
     AgentEvent,
     AgentResult,
+    AgentSteeringUnavailableError,
+    AgentSteeringUncertainError,
     AgentTask,
     EmitCallback,
     EventPriority,
@@ -52,13 +56,15 @@ try:  # Keep importing the domain contracts possible without the optional SDK.
         ApprovalMode,
         AsyncCodex,
         AsyncThread,
+        CodexConfig,
+        InvalidRequestError,
         LocalImageInput,
         SkillInput,
         Sandbox,
         TextInput,
     )
 except ImportError:  # pragma: no cover - only used in minimal installations
-    ApprovalMode = AsyncCodex = AsyncThread = LocalImageInput = SkillInput = Sandbox = TextInput = None  # type: ignore[assignment,misc]
+    ApprovalMode = AsyncCodex = AsyncThread = CodexConfig = InvalidRequestError = LocalImageInput = SkillInput = Sandbox = TextInput = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +76,20 @@ logger = logging.getLogger(__name__)
 # the shell fallback enforces the cap, while agents can still page through
 # larger results with focused commands.
 CODEX_TOOL_OUTPUT_TOKEN_LIMIT = 500
+
+
+def _create_codex_client() -> Any:
+    executable = os.environ.get("CODEX_WECHAT_CODEX_BIN", "").strip() or "codex"
+    codex_bin = shutil.which(os.path.expanduser(executable))
+    if codex_bin is None:
+        raise FileNotFoundError(
+            "Codex executable not found or not executable. Install Codex on PATH "
+            "or set CODEX_WECHAT_CODEX_BIN to its executable path. "
+            "The SDK-bundled runtime is not used."
+        )
+    codex_bin = str(Path(codex_bin).absolute())
+    logger.info("using external Codex executable: %s", codex_bin)
+    return AsyncCodex(config=CodexConfig(codex_bin=codex_bin))
 
 
 def _thread_config_overrides(
@@ -127,6 +147,16 @@ class ThreadBinding:
             self.role_snapshot_hash,
             self.persona_composition_version,
         )
+
+
+@dataclass(slots=True)
+class _ActiveSteeringState:
+    """Latch and serialize input for one exact active task."""
+
+    ready_or_done: asyncio.Event
+    lock: asyncio.Lock
+    deadline: float | None
+    accepting: bool = True
 
 
 def sandbox_for_policy(policy: str | Any) -> Any:
@@ -242,7 +272,9 @@ class CodexRuntime:
         if codex is not None and codex_factory is not None:
             raise ValueError("pass codex or codex_factory, not both")
         self._codex = codex
-        self._codex_factory = codex_factory or (lambda: AsyncCodex()) if AsyncCodex is not None else codex_factory
+        self._codex_factory = codex_factory
+        if self._codex_factory is None and AsyncCodex is not None:
+            self._codex_factory = _create_codex_client
         self._owns_codex = codex is None
         if model_context_resolver is not None and not (
             callable(model_context_resolver)
@@ -265,6 +297,7 @@ class CodexRuntime:
         self._active_turns: dict[str, Any] = {}
         self._active_tasks: dict[str, AgentTask] = {}
         self._active_messages: dict[str, str] = {}
+        self._active_steering: dict[str, _ActiveSteeringState] = {}
         self._interrupt_requested: set[str] = set()
         # Interactive ``chat_stream`` consumers opt into delta callbacks. A
         # normal durable task still receives only stable message events.
@@ -384,7 +417,14 @@ class CodexRuntime:
     async def stop(self) -> None:
         self._assert_loop()
         async with self._lifecycle_lock:
+            steering_states = tuple(self._active_steering.values())
+            for state in steering_states:
+                state.accepting = False
+                state.ready_or_done.set()
             if not self._started and not self._codex_entered:
+                for state in steering_states:
+                    async with state.lock:
+                        pass
                 return
             errors: list[BaseException] = []
             try:
@@ -415,6 +455,9 @@ class CodexRuntime:
                                 await result
                         except BaseException as exc:
                             errors.append(exc)
+                for state in steering_states:
+                    async with state.lock:
+                        pass
             finally:
                 # Lifecycle state is cleared even when interruption, context
                 # shutdown, or cancellation fails partway through stopping.
@@ -426,6 +469,7 @@ class CodexRuntime:
                 self._active_turns.clear()
                 self._active_tasks.clear()
                 self._active_messages.clear()
+                self._active_steering.clear()
                 self._interrupt_requested.clear()
                 self._streaming_task_ids.clear()
                 self._run_locks.clear()
@@ -439,6 +483,65 @@ class CodexRuntime:
 
     # ------------------------------------------------------------------
     # Public status/control helpers
+    async def steer(
+        self,
+        task_id: str,
+        inputs: Any,
+        *,
+        steering_id: str = "",
+        execution_id: str = "",
+    ) -> bool:
+        """Send ordered user input to one exact native turn when still active."""
+
+        del steering_id  # The public SDK does not expose clientUserMessageId.
+        self._assert_loop()
+        canonical_task_id = str(task_id)
+        state = self._active_steering.get(canonical_task_id)
+        if state is None:
+            return False
+        async with state.lock:
+            active_task = self._active_tasks.get(canonical_task_id)
+            if (
+                execution_id
+                and (
+                    active_task is None
+                    or str(active_task.execution_id or "") != str(execution_id)
+                )
+            ):
+                return False
+            await state.ready_or_done.wait()
+            if (
+                not state.accepting
+                or self._active_steering.get(canonical_task_id) is not state
+            ):
+                return False
+            turn = self._active_turns.get(canonical_task_id)
+            steer = getattr(turn, "steer", None)
+            if not callable(steer):
+                return False
+            translated = self._translate_input(inputs)
+            if state.deadline is not None and state.deadline <= time.monotonic():
+                raise AgentSteeringUnavailableError(
+                    "Codex turn deadline elapsed before steering submission"
+                )
+            try:
+                outcome = steer(translated)
+                if inspect.isawaitable(outcome):
+                    await self._await_with_deadline(outcome, state.deadline)
+            except asyncio.CancelledError:
+                # The worker fences cancellation as delivery-unknown.  Keep
+                # cancellation semantics intact for orderly shutdown.
+                raise
+            except BaseException as exc:
+                if self._inactive_steer_error(exc):
+                    return False
+                if isinstance(exc, AgentSteeringUncertainError):
+                    raise
+                raise AgentSteeringUncertainError(
+                    "Codex steering acknowledgement is uncertain"
+                ) from exc
+            return True
+
     async def interrupt(self, task_id: str) -> bool:
         self._assert_loop()
         turn = self._active_turns.get(str(task_id))
@@ -1151,8 +1254,27 @@ class CodexRuntime:
             task = task.with_execution(f"exec-{uuid.uuid4().hex}")
         lock = self._run_locks.setdefault(self._run_lock_key(task), asyncio.Lock())
         async with lock:
+            task_id = str(task.task_id)
+            deadline = (
+                time.monotonic() + self.turn_timeout
+                if self.turn_timeout is not None
+                else None
+            )
+            state = _ActiveSteeringState(
+                asyncio.Event(), asyncio.Lock(), deadline
+            )
+            if task_id in self._active_steering:
+                return AgentResult(
+                    task_id=task.task_id,
+                    execution_id=task.execution_id or None,
+                    status="failed",
+                    error="Agent task identity is already active",
+                )
+            self._active_steering[task_id] = state
+            self._active_tasks[task_id] = task
+            self._active_messages[task_id] = self._input_preview(task.inputs)
             try:
-                return await self._run_locked(task, emit)
+                return await self._run_locked(task, emit, steering_state=state)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1169,8 +1291,27 @@ class CodexRuntime:
                         )
                     },
                 )
+            finally:
+                state.accepting = False
+                state.ready_or_done.set()
+                # A steer that was accepted while the turn was live owns this
+                # lock through the SDK acknowledgement.  Do not tear down its
+                # handle or permit a successor task until that outcome is
+                # known.
+                async with state.lock:
+                    if self._active_steering.get(task_id) is state:
+                        self._active_steering.pop(task_id, None)
+                        self._active_turns.pop(task_id, None)
+                        self._active_tasks.pop(task_id, None)
+                        self._active_messages.pop(task_id, None)
 
-    async def _run_locked(self, task: AgentTask, emit: EmitCallback) -> AgentResult:
+    async def _run_locked(
+        self,
+        task: AgentTask,
+        emit: EmitCallback,
+        *,
+        steering_state: _ActiveSteeringState,
+    ) -> AgentResult:
         self._assert_loop()
         if not task.conversation_id:
             raise ValueError("AgentTask.conversation_id is required for Codex execution")
@@ -1186,7 +1327,7 @@ class CodexRuntime:
         # The timeout covers client initialization, thread binding/resume, and
         # turn startup as well as event streaming.  A hung RPC before the
         # first notification must not leave a worker lease occupied forever.
-        deadline = time.monotonic() + self.turn_timeout if self.turn_timeout is not None else None
+        deadline = steering_state.deadline
         try:
             await self._await_with_deadline(self.start(), deadline)
             binding = await self._await_with_deadline(
@@ -1255,8 +1396,7 @@ class CodexRuntime:
             )
         task_id = str(task.task_id)
         self._active_turns[task_id] = turn
-        self._active_tasks[task_id] = task
-        self._active_messages[task_id] = self._input_preview(task.inputs)
+        steering_state.ready_or_done.set()
         emitted: list[AgentEvent] = []
         sequence = 0
         # Count every completed SDK item, including ineligible tool/reasoning
@@ -1414,11 +1554,11 @@ class CodexRuntime:
                 )
             )
         finally:
+            # Close admission at the stream boundary, before queued steering
+            # callers can acquire their FIFO lock ahead of outer teardown.
+            steering_state.accepting = False
             interrupt_requested = task_id in self._interrupt_requested
             self._interrupt_requested.discard(task_id)
-            self._active_turns.pop(task_id, None)
-            self._active_tasks.pop(task_id, None)
-            self._active_messages.pop(task_id, None)
             if stream is not None:
                 close = getattr(stream, "aclose", None)
                 if close is not None:
@@ -1470,6 +1610,20 @@ class CodexRuntime:
                 if status != "completed"
                 else {}
             ),
+        )
+
+    @staticmethod
+    def _inactive_steer_error(exc: BaseException) -> bool:
+        """Return true only when the SDK proves the expected turn is gone."""
+
+        if InvalidRequestError is None or not isinstance(exc, InvalidRequestError):
+            return False
+        message = str(getattr(exc, "message", "") or str(exc)).strip().lower()
+        if message == "no active turn to steer":
+            return True
+        return (
+            message.startswith("expected active turn id ")
+            and " but found " in message
         )
 
     @staticmethod
@@ -2363,13 +2517,13 @@ class CodexRuntime:
         return value
 
     def _with_agent_bridge_context(self, task: AgentTask, value: Any) -> Any:
-        """Prepend a task-scoped collaboration capability when policy allows.
+        """Prepend task-scoped collaboration and scheduling capabilities.
 
         Thread developer instructions are policy-bound and may be reused by
         several tasks, so they cannot safely carry a task ID.  This context is
         attached to the individual turn instead.  The local bridge revalidates
-        the running task and its immutable policy before every list/send call;
-        the text here is discovery, not authorization.
+        the running task, execution, durable origin, and immutable policy for
+        every call; the text here is discovery, not authorization.
         """
 
         command = self._agent_bridge_command
@@ -2382,18 +2536,37 @@ class CodexRuntime:
             if policy is not None
             else None
         )
-        # Discovery is exposed only by an explicit immutable policy grant.
-        # Falling back to a raw mode would advertise the bridge to legacy
-        # v1/v2 tasks whose Profile ACL intentionally denies collaboration.
+        can_execute = (
+            policy.get("can_execute_commands")
+            if isinstance(policy, Mapping)
+            else getattr(policy, "can_execute_commands", None)
+            if policy is not None
+            else None
+        )
+        # Collaboration discovery is exposed only by an explicit immutable
+        # policy grant. Falling back to a raw mode would advertise it to legacy
+        # tasks whose Profile ACL intentionally denies collaboration.
         metadata = task.metadata if isinstance(task.metadata, Mapping) else {}
         # Mailbox workers create claim-scoped synthetic tasks rather than rows
         # in the durable task table. Do not advertise a task bridge that would
         # necessarily fail active-task validation for those internal turns.
-        if (
-            not command
-            or issuer is None
-            or can_send is not True
-            or bool(metadata.get("internal_mailbox"))
+        internal_mailbox = bool(metadata.get("internal_mailbox"))
+        collaboration_allowed = can_send is True and not internal_mailbox
+        # Scheduling is intentionally narrower than generic command execution.
+        # It is available only to a top-level task created by real channel
+        # ingress. Cron firings, mailbox work, and child/background tasks must
+        # never acquire a recursive scheduling surface.
+        scheduling_allowed = bool(
+            can_execute is True
+            and task.inbound_message_id
+            and not task.parent_task_id
+            and not task.child_depth
+            and not internal_mailbox
+            and not metadata.get("cron")
+            and not metadata.get("cron_job_id")
+        )
+        if not command or issuer is None or not (
+            collaboration_allowed or scheduling_allowed
         ):
             return value
         task_id = str(task.task_id or "").strip()
@@ -2405,19 +2578,61 @@ class CodexRuntime:
             raise RuntimeError("Agent bridge capability issuer returned no token")
         quoted_task_id = shlex.quote(task_id)
         quoted_capability = shlex.quote(capability)
-        context_text = (
-            "Codex-on-WeChat collaboration capability for this turn:\n"
-            "You may communicate with Agents created by /agent through the "
-            "durable local mailbox. Discover authorized peers with:\n"
-            f"  {command} --task-id {quoted_task_id} "
-            f"--capability {quoted_capability} list\n"
-            "Send a request with:\n"
-            f"  {command} --task-id {quoted_task_id} "
-            f"--capability {quoted_capability} send <agent-id> "
-            "'<message>'\n"
-            "Use only these commands for named-Agent communication. The bridge "
-            "enforces this task's immutable ACL and returns a durable request ID."
+        prefix = (
+            f"{command} --task-id {quoted_task_id} "
+            f"--capability {quoted_capability}"
         )
+        sections = ["Codex-on-WeChat task-scoped capabilities for this turn:"]
+        if collaboration_allowed:
+            sections.append(
+                "You may communicate with Agents created by /agent through the "
+                "durable local mailbox. Discover authorized peers with:\n"
+                f"  {prefix} list\n"
+                "Send a request with:\n"
+                f"  {prefix} send <agent-id> '<message>'\n"
+                "Use only these commands for named-Agent communication. The "
+                "bridge enforces this task's immutable ACL and returns a "
+                "durable request ID."
+            )
+        if scheduling_allowed:
+            sections.append(
+                "You may interpret an explicit natural-language request to "
+                "schedule future Agent work, but creation uses a mandatory "
+                "two-turn confirmation protocol. Questions about schedules are "
+                "not scheduling requests. If the date, clock time, recurrence, "
+                "timezone, or work prompt is ambiguous, ask the user and do not "
+                "call the bridge. The default timezone is Asia/Shanghai. "
+                "Translate an unambiguous request to exactly one validated form: "
+                "`at <ISO datetime> [--tz <IANA timezone>]`, `every <duration> "
+                "[--tz <IANA timezone>]`, or `cron <minute> <hour> "
+                "<day-of-month> <month> <day-of-week> [--tz <IANA timezone>]`. "
+                "`every` is recurring; convert a relative one-shot such as 'in "
+                "two hours' to an absolute `at` time. For example, '每天工作日"
+                "上午9点总结待办' becomes `cron 0 9 * * 1-5 --tz "
+                "Asia/Shanghai` with the summary request as its work prompt, "
+                "whereas '两小时后提醒我提交报告' becomes one absolute `at` "
+                "schedule, not `every 2h`. Then create only a draft:\n"
+                f"  {prefix} cron propose --schedule '<schedule>' "
+                "--prompt '<work prompt>'\n"
+                "A successful proposal explicitly returns `created: false`. Show "
+                "the user its exact schedule, timezone, next firing time, prompt, "
+                "draft ID, and expiry; say that no job exists yet; and ask them "
+                "to reply exactly `确认` or `confirm`. Never call `cron confirm` "
+                "during the same user input that proposed the draft.\n"
+                "Only after a later user input explicitly confirms the displayed "
+                "draft may you run:\n"
+                f"  {prefix} cron confirm <draft-id>\n"
+                "Only after a later user input is exactly `取消` or `cancel` may "
+                "you run:\n"
+                f"  {prefix} cron cancel <draft-id>\n"
+                "If prior context no longer contains the draft ID, inspect drafts "
+                "owned by this exact conversation origin with:\n"
+                f"  {prefix} cron pending\n"
+                "Never claim that a cron job was created unless `cron confirm` "
+                "returns `ok: true` and `created: true`. Never use direct SQLite, "
+                "`/cron`, or any other shell command to create or mutate a job."
+            )
+        context_text = "\n\n".join(sections)
         context = TextInput(context_text) if TextInput is not None else context_text
         if isinstance(value, list):
             return [context, *value]

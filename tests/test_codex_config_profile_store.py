@@ -175,7 +175,7 @@ def test_schema_v35_migrates_populated_v34_profiles_to_default_config(
         with sqlite3.connect(path) as connection:
             assert connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
-            ).fetchall() == [(version,) for version in range(1, 36)]
+            ).fetchall() == [(version,) for version in range(1, 42)]
             column = next(
                 row
                 for row in connection.execute("PRAGMA table_info(agent_profiles)")
@@ -201,6 +201,11 @@ def test_schema_v35_marker_without_profile_column_fails_closed(
         seeded = SQLiteStore(path)
         await seeded.initialize()
         await seeded.close()
+        with sqlite3.connect(path) as connection:
+            # Retain the deliberately corrupt v35 marker while removing the
+            # later additive migration that would otherwise fail first.
+            connection.execute("DELETE FROM schema_migrations WHERE version>35")
+            connection.commit()
         _remove_v35_profile_column(path, retain_marker=True)
 
         reopened = SQLiteStore(path)

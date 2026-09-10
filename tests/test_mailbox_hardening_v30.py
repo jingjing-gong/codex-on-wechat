@@ -466,7 +466,7 @@ def test_v28_migration_canonicalizes_semantically_equal_expiry(tmp_path):
                 (noncanonical, mailbox.current_invocation_id),
             )
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (28,29,30,31,32,33,34,35)"
+                "DELETE FROM schema_migrations WHERE version IN (28,29,30,31,32,33,34,35,36,37,38,39,40,41)"
             )
             connection.commit()
 
@@ -539,7 +539,7 @@ def test_v29_to_v30_expiry_normalizes_atomically_and_conflicts_roll_back(
             for statement in trigger_sql:
                 connection.execute(statement)
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35)"
+                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35,36,37,38,39,40,41)"
             )
             connection.commit()
         return mailbox, mailbox_expiry
@@ -647,7 +647,7 @@ def test_v28_marker_replay_rejects_each_noncanonical_sequence_one_field(
                 (value, task.execution_id),
             )
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (28,29,30,31,32,33,34,35)"
+                "DELETE FROM schema_migrations WHERE version IN (28,29,30,31,32,33,34,35,36,37,38,39,40,41)"
             )
             connection.commit()
 
@@ -698,7 +698,7 @@ def test_v30_rejects_lone_migration_snapshot_timestamp_corruption(tmp_path):
             )
             connection.execute(trigger_sql)
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35)"
+                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35,36,37,38,39,40,41)"
             )
             connection.commit()
 
@@ -895,7 +895,7 @@ def test_v30_migration_rejects_preexisting_cross_mailbox_review_atomically(
             )
             connection.execute(insert_trigger)
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35)"
+                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35,36,37,38,39,40,41)"
             )
             connection.commit()
 
@@ -947,7 +947,7 @@ def test_v29_review_history_migrates_losslessly_as_legacy_audit(
                 "DROP COLUMN authorization_grant_digest"
             )
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35)"
+                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35,36,37,38,39,40,41)"
             )
             connection.execute(
                 """INSERT INTO mailbox_orphan_reviews (
@@ -1051,7 +1051,7 @@ def test_v29_review_history_migrates_losslessly_as_legacy_audit(
             )
             assert after["review"] == before["review"]
             assert after["events"] == 1
-            assert after["version"] == 35
+            assert after["version"] == 41
             assert after["foreign_keys"] == []
         finally:
             await migrated.close()
@@ -1108,7 +1108,7 @@ def test_v30_replay_rejects_malformed_reviewed_at_without_losing_history(
             )
             connection.execute(trigger_sql)
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35)"
+                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35,36,37,38,39,40,41)"
             )
             connection.commit()
 

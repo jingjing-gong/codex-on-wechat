@@ -25,12 +25,20 @@ from src.agents.workspace import (
 )
 
 from .dispatcher import SQLiteDispatcher, _call_compatible
+from .cron_schedule import (
+    DEFAULT_TIMEZONE,
+    CronScheduleError,
+    first_fire_at,
+    parse_schedule,
+)
+from .diagnostics import log_agent_creation_failed
 from .identity import (
     conversation_id,
+    conversation_id_candidates,
     conversation_id_matches,
     mailbox_conversation_id,
 )
-from .models import iter_model_descriptors
+from .models import iter_model_descriptors, text_to_datetime
 from .registry import AgentRegistry, DYNAMIC_AGENT_SUMMARY, codex_profile
 from .worker import TaskWorker
 from .modes import ModeRegistry
@@ -57,7 +65,9 @@ from .skills import (
 )
 from .store import (
     MAILBOX_OPERATOR_CANCEL_REASON,
+    NotFoundError,
     QueueFullError,
+    StoreError,
     format_working_directory_response,
 )
 
@@ -162,6 +172,30 @@ def _get(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
     return getattr(value, name, default)
+
+
+def _routing_external_user_id(value: Any) -> str:
+    """Return the bot-local subject key without replacing the actor identity.
+
+    New Lark envelopes expose ``conversation_subject_scope`` directly.  Store
+    records may instead carry it in the immutable identity snapshot.  Legacy
+    WeChat values have neither and therefore retain their exact historical
+    ``external_user_id`` key.
+    """
+
+    scope = str(_get(value, "conversation_subject_scope", "") or "").strip()
+    if scope:
+        return scope
+    identity = _get(value, "identity_snapshot", {})
+    if isinstance(identity, Mapping):
+        subject = identity.get("conversation_subject", {})
+        if isinstance(subject, Mapping):
+            scope = str(subject.get("scope_key", "") or "").strip()
+            if scope:
+                return scope
+    return str(
+        _get(value, "external_user_id", _get(value, "user_id", "")) or ""
+    )
 
 
 def _route_agent(value: Any, default: str | None = None) -> str | None:
@@ -347,6 +381,7 @@ class TaskManager:
         require_process_isolation: bool = False,
         workspace_root: str | os.PathLike[str] | None = None,
         reconcile_interval: float | None = 15.0,
+        cron_tick_interval: float | None = 1.0,
     ) -> None:
         if worker_count < 0:
             raise ValueError("worker_count cannot be negative")
@@ -428,6 +463,9 @@ class TaskManager:
         ] = {}
         self._authorized_execute_modes: set[tuple[str, str, str, str, str]] = set()
         self._control_locks: dict[tuple[str, str, str, str], asyncio.Lock] = {}
+        self._provider_control_locks: dict[
+            tuple[str, str, str], asyncio.Lock
+        ] = {}
         # Named-Agent creation is an explicit deployment capability.  The
         # durable WeChat startup enables it; generic embedders remain
         # fail-closed unless they opt in.
@@ -473,6 +511,11 @@ class TaskManager:
             dynamic_agent_template_id or self.default_agent_id
         ).strip() or self.default_agent_id
         self._dynamic_agent_lock = asyncio.Lock()
+        # Durable force retirement precedes owned-runtime shutdown.  Preserve
+        # its exact report while a failed stop keeps the cleanup handle
+        # registered, so a retry can finish reaping without losing the
+        # already-committed cancellation details.
+        self._pending_force_delete_reports: dict[str, Mapping[str, Any]] = {}
         # Dynamic aliases registered before the supervisor starts remain
         # process-local until their child runtime has actually passed startup.
         # Publishing them earlier would let a crash or failed child leave an
@@ -484,6 +527,26 @@ class TaskManager:
         self.reconcile_interval = normalized_reconcile_interval
         self._reconcile_stop = asyncio.Event()
         self._reconcile_task: asyncio.Task[None] | None = None
+        if cron_tick_interval is None:
+            normalized_cron_tick_interval = None
+        else:
+            try:
+                normalized_cron_tick_interval = float(cron_tick_interval)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "cron_tick_interval must be a finite positive number or None"
+                ) from exc
+            if (
+                not math.isfinite(normalized_cron_tick_interval)
+                or normalized_cron_tick_interval <= 0
+            ):
+                raise ValueError(
+                    "cron_tick_interval must be a finite positive number or None"
+                )
+        self.cron_tick_interval = normalized_cron_tick_interval
+        self._cron_stop = asyncio.Event()
+        self._cron_wake = asyncio.Event()
+        self._cron_task: asyncio.Task[None] | None = None
         self._mailbox_cancel_handler: Any | None = None
 
     @property
@@ -623,6 +686,59 @@ class TaskManager:
     ) -> asyncio.Lock:
         key = (channel, bot_id, external_user_id, session_id or "default")
         return self._control_locks.setdefault(key, asyncio.Lock())
+
+    async def _provider_scope_lock(
+        self,
+        target: ReplyTarget,
+        agent_id: str,
+    ) -> asyncio.Lock:
+        """Return the cross-channel control lock for proven direct accounts."""
+
+        route_target = self._routing_target(target, target)
+        principal_id = ""
+        resolver = getattr(self.store, "resolve_principal_account", None)
+        if (
+            resolver is not None
+            and route_target.channel
+            and route_target.bot_id
+            and route_target.external_user_id
+        ):
+            resolved = await _call_compatible(
+                resolver,
+                channel=route_target.channel,
+                bot_id=route_target.bot_id,
+                external_user_id=route_target.external_user_id,
+            )
+            principal_id = str(_get(resolved, "principal_id", "") or "").strip()
+        if principal_id:
+            key = (
+                principal_id,
+                str(agent_id),
+                str(route_target.session_id or "default"),
+            )
+        else:
+            key = (
+                "transport:" + str(route_target.channel),
+                str(route_target.bot_id),
+                str(route_target.external_user_id)
+                + ":"
+                + str(route_target.session_id or "default")
+                + ":"
+                + str(agent_id),
+            )
+        return self._provider_control_locks.setdefault(key, asyncio.Lock())
+
+    def _notify_task_steering(self, result: Any) -> None:
+        """Wake the worker that may own a newly durable active-turn input."""
+
+        steering = _get(result, "steering", None)
+        task_id = str(_get(steering, "target_task_id", "") or "").strip()
+        if not task_id:
+            return
+        for worker in self._workers:
+            notify = getattr(worker, "notify_steering", None)
+            if callable(notify):
+                notify(task_id)
 
     def _default_mode_selection(self, agent_id: str) -> tuple[str, int]:
         """Return the Agent's configured default mode and immutable version."""
@@ -980,6 +1096,7 @@ class TaskManager:
                 started_workers.append(worker)
                 await worker.start()
                 self._active_workers.add(worker.worker_id)
+            await self._start_cron_loop()
             self._start_reconcile_loop()
             self._provisional_dynamic_agent_ids.difference_update(
                 provisional_agent_ids
@@ -987,6 +1104,7 @@ class TaskManager:
             self._started = True
         except BaseException as startup_error:
             self._started = False
+            await self._stop_cron_loop()
             await self._stop_reconcile_loop()
             for worker in reversed(started_workers):
                 try:
@@ -1091,6 +1209,20 @@ class TaskManager:
                 raise
             except Exception:
                 logger.exception("periodic lease reconciliation failed")
+            steering_recover = getattr(
+                self.store, "recover_task_steering", None
+            )
+            if steering_recover is not None:
+                try:
+                    recovered = steering_recover()
+                    if inspect.isawaitable(recovered):
+                        recovered = await recovered
+                    if int(recovered or 0) > 0:
+                        self.dispatcher.wake()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("periodic task steering recovery failed")
 
     async def _stop_reconcile_loop(self) -> None:
         self._reconcile_stop.set()
@@ -1099,6 +1231,82 @@ class TaskManager:
             return
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+    async def _start_cron_loop(self) -> None:
+        """Reconcile durable schedules and start their supervisor-owned loop.
+
+        Compatibility stores that predate cron simply leave the capability
+        absent.  Production starts this loop only after every task worker is
+        ready, so an occurrence can never be published without a consumer.
+        """
+
+        fire = getattr(self.store, "fire_next_due_cron_job", None)
+        if (
+            self.cron_tick_interval is None
+            or fire is None
+            or (self._cron_task is not None and not self._cron_task.done())
+        ):
+            return
+        reconcile = getattr(self.store, "reconcile_cron_jobs", None)
+        if reconcile is not None:
+            await _call_compatible(reconcile, now=utc_now())
+        self._cron_stop.clear()
+        self._cron_wake.clear()
+        self._cron_task = asyncio.create_task(
+            self._run_cron_loop(),
+            name="task-manager-cron-scheduler",
+        )
+
+    async def _run_cron_loop(self) -> None:
+        """Atomically materialize each due occurrence, then await a wake/tick."""
+
+        interval = self.cron_tick_interval
+        fire = getattr(self.store, "fire_next_due_cron_job", None)
+        if interval is None or fire is None:
+            return
+        while not self._cron_stop.is_set():
+            # Clear before checking SQLite.  An add racing after this point
+            # sets the Event and therefore cannot be lost before the wait.
+            self._cron_wake.clear()
+            try:
+                result = await _call_compatible(fire, now=utc_now())
+            except asyncio.CancelledError:
+                raise
+            except QueueFullError:
+                # The store rolls the entire occurrence back when admission
+                # is full, leaving it due for a later bounded retry.
+                logger.warning("cron firing deferred because the task queue is full")
+                result = None
+            except Exception:
+                logger.exception("cron scheduler tick failed")
+                result = None
+            if result is not None:
+                # The task and schedule advance are already committed. Wake
+                # dispatch immediately; the eventual Agent result is the sole
+                # origin-channel delivery. Then drain another due job without
+                # imposing one tick of latency per schedule.
+                self.dispatcher.wake()
+                continue
+            try:
+                await asyncio.wait_for(self._cron_wake.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _stop_cron_loop(self) -> None:
+        """Stop cron before workers/store so no occurrence can race teardown."""
+
+        self._cron_stop.set()
+        self._cron_wake.set()
+        task, self._cron_task = self._cron_task, None
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    def wake_cron_scheduler(self) -> None:
+        """Wake the due-job loop after an add/delete operation."""
+
+        self._cron_wake.set()
 
     def _validate_trusted_default_execute(self) -> None:
         """Validate the administrator-owned writable startup configuration.
@@ -1159,6 +1367,10 @@ class TaskManager:
         if not self._started:
             errors: list[BaseException] = []
             try:
+                await self._stop_cron_loop()
+            except BaseException as exc:
+                errors.append(exc)
+            try:
                 await self._stop_reconcile_loop()
             except BaseException as exc:
                 errors.append(exc)
@@ -1183,6 +1395,10 @@ class TaskManager:
                 raise errors[0]
             return
         errors: list[BaseException] = []
+        try:
+            await self._stop_cron_loop()
+        except BaseException as exc:
+            errors.append(exc)
         try:
             await self._stop_reconcile_loop()
         except BaseException as exc:
@@ -1240,7 +1456,8 @@ class TaskManager:
         """
 
         self._assert_loop()
-        target_for_route = self._reply_target(inbound)
+        reply_target = self._reply_target(inbound)
+        target_for_route = self._routing_target(inbound, reply_target)
         replay = await self._replay_existing_inbound_task(
             inbound,
             create_task=create_task,
@@ -1255,7 +1472,7 @@ class TaskManager:
         # leaves it unset, so the durable front-Agent route remains
         # authoritative across restarts.
         if agent_id is None:
-            resolved_agent = await self._resolve_active_agent(inbound)
+            resolved_agent = await self._resolve_active_agent(target_for_route)
             # The in-memory cache is only a fast path; query SQLite as well so
             # a route changed by a previous process is observed before the
             # task snapshot is created.
@@ -1281,7 +1498,10 @@ class TaskManager:
         if self.allow_dynamic_agents:
             await self.ensure_agent(resolved_agent)
         self.registry.require(resolved_agent)
-        target = target_for_route
+        # Routing/conversation state may be owned by a group or topic subject,
+        # but delivery must retain the authenticated actor and exact transport
+        # destination captured by the channel adapter.
+        target = reply_target
         try:
             execution_workspace = await self._execution_workspace_for_target(
                 target_for_route,
@@ -1386,6 +1606,9 @@ class TaskManager:
             }
         task_values = {
             "agent_id": resolved_agent,
+            "conversation_id": self._conversation_id(
+                target_for_route, resolved_agent
+            ),
             "mode_id": resolved_mode,
             "profile_version": resolved_profile_version,
             "policy_version": resolved_policy_version,
@@ -1394,6 +1617,20 @@ class TaskManager:
             "reply_target": target,
             "inputs": task_inputs,
             "metadata": metadata,
+            # Authorization/audit provenance remains actor/principal based;
+            # none of these snapshots participates in delivery routing.
+            "actor_external_user_id": str(
+                _get(inbound, "external_user_id", "") or ""
+            ),
+            "principal_id": str(_get(inbound, "principal_id", "") or "") or None,
+            "principal_account_id": str(
+                _get(inbound, "principal_account_id", "") or ""
+            )
+            or None,
+            "conversation_subject_id": str(
+                _get(inbound, "conversation_subject_id", "") or ""
+            )
+            or None,
         }
         # Candidate ownership must be captured under the same route/mode
         # serialization as the inbound row.  A gateway may have prepared a
@@ -1495,7 +1732,13 @@ class TaskManager:
         }
         # Store can derive channel/user from the envelope; include explicit
         # values only when the method advertises them or accepts **kwargs.
-        result = await _call_compatible(method, inbound, **kwargs)
+        provider_lock = await self._provider_scope_lock(
+            target_for_route,
+            resolved_agent,
+        )
+        async with provider_lock:
+            result = await _call_compatible(method, inbound, **kwargs)
+        self._notify_task_steering(result)
         self.dispatcher.wake()
         return result
 
@@ -1540,7 +1783,7 @@ class TaskManager:
             )
         if _synthetic_command_name not in {None, "__queue_full__"}:
             raise PermissionError("unsupported synthetic command marker")
-        target = self._reply_target(inbound)
+        target = self._routing_target(inbound, self._reply_target(inbound))
         key = (
             target.channel,
             target.bot_id,
@@ -1627,14 +1870,15 @@ class TaskManager:
 
         self._assert_loop()
         target = self._coerce_target(reply_target)
+        route_target = self._routing_target(target, target)
         if parent_task_id is not None and str(_child_parent_id or "") != str(
             parent_task_id
         ):
             raise PermissionError(
                 "child tasks must be submitted through submit_child_task()"
             )
-        if agent_id is None and target.external_user_id:
-            resolved_agent = await self._resolve_active_agent(target)
+        if agent_id is None and route_target.external_user_id:
+            resolved_agent = await self._resolve_active_agent(route_target)
         else:
             resolved_agent = str(agent_id).strip() if agent_id else self.default_agent_id
             if self.allow_dynamic_agents:
@@ -1656,7 +1900,7 @@ class TaskManager:
             ]
         if workspace_override is None:
             execution_workspace = await self._execution_workspace_for_target(
-                target,
+                route_target,
                 resolved_agent,
             )
         else:
@@ -1665,7 +1909,7 @@ class TaskManager:
             )
         route_mode = None
         if mode_id is None:
-            route_mode = await self._get_mode_for_target(target, resolved_agent)
+            route_mode = await self._get_mode_for_target(route_target, resolved_agent)
         default_mode, default_mode_version = self._default_mode_selection(resolved_agent)
         resolved_mode = str(mode_id or (route_mode[0] if route_mode else default_mode)).strip().lower()
         resolved_profile_version = (
@@ -1686,7 +1930,7 @@ class TaskManager:
                 )
             )
         preferred_model, preferred_effort = await self._get_model_for_target(
-            target, resolved_agent
+            route_target, resolved_agent
         )
         resolved_model = preferred_model if model is None else str(model)
         resolved_reasoning_effort = (
@@ -1704,7 +1948,7 @@ class TaskManager:
                 explicit=explicit or (
                     resolved_mode == "execute"
                     and self._execute_authorized(
-                        target,
+                        route_target,
                         resolved_agent,
                         resolved_policy_version,
                     )
@@ -1722,7 +1966,7 @@ class TaskManager:
             }
         if _role_snapshot_override is None:
             session_role = await self._session_role_for_target(
-                target, resolved_agent
+                route_target, resolved_agent
             )
         else:
             try:
@@ -1775,7 +2019,9 @@ class TaskManager:
                 inputs = {**dict(inputs), "skill": skill}
             else:
                 inputs = {"text": str(inputs or ""), "skill": skill}
-        conversation = conversation_id or self._conversation_id(target, resolved_agent)
+        conversation = conversation_id or self._conversation_id(
+            route_target, resolved_agent
+        )
         task_values: dict[str, Any] = {
             "agent_id": resolved_agent,
             "conversation_id": conversation,
@@ -1793,6 +2039,8 @@ class TaskManager:
             "request_id": request_id,
             "parent_task_id": parent_task_id,
             "child_depth": child_depth,
+            "actor_external_user_id": target.external_user_id,
+            "conversation_subject_id": target.conversation_subject_id or None,
         }
         if task_id:
             task_values["task_id"] = task_id
@@ -1814,7 +2062,7 @@ class TaskManager:
             "dedupe_key": dedupe_key,
             "channel": target.channel,
             "bot_id": target.bot_id,
-            "external_user_id": target.external_user_id,
+            "external_user_id": route_target.external_user_id,
             "session_id": target.session_id,
             "initial_reply": initial_reply,
             "delivery_reply_scope_id": delivery_reply_scope_id,
@@ -1866,6 +2114,7 @@ class TaskManager:
                 "execution workspace overrides are manager-controlled"
             )
         target = self._coerce_target(reply_target)
+        route_target = self._routing_target(target, target)
         kwargs = {
             "task_id": task_id,
             "agent_id": agent_id,
@@ -1890,19 +2139,1043 @@ class TaskManager:
             "_child_max_children": _child_max_children,
             "_workspace_snapshot_override": _workspace_snapshot_override,
         }
-        if not target.external_user_id:
+        if not route_target.external_user_id:
             return await self._submit_impl(inputs, target, **kwargs)
         async with self._scope_lock(
-            channel=target.channel,
-            bot_id=target.bot_id,
-            external_user_id=target.external_user_id,
-            session_id=target.session_id,
+            channel=route_target.channel,
+            bot_id=route_target.bot_id,
+            external_user_id=route_target.external_user_id,
+            session_id=route_target.session_id,
         ):
             return await self._submit_impl(inputs, target, **kwargs)
 
     enqueue = submit
     create_task = submit
     queue_task = submit
+
+    # ------------------------------------------------------------------ durable cron
+    async def _cron_principal_snapshot(
+        self,
+        *,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        principal_id: str = "",
+        principal_account_id: str = "",
+        principal_mapping_revision: int | None = None,
+    ) -> tuple[str, str, int | None]:
+        """Resolve command-time principal claims against durable ownership."""
+
+        supplied_principal = str(principal_id or "").strip()
+        supplied_account = str(principal_account_id or "").strip()
+        if bool(supplied_principal) != bool(supplied_account):
+            raise PermissionError(
+                "principal_id and principal_account_id must be supplied together"
+            )
+        supplied_revision: int | None
+        if principal_mapping_revision is None:
+            supplied_revision = None
+        else:
+            if isinstance(principal_mapping_revision, bool):
+                raise PermissionError("principal mapping revision is invalid")
+            try:
+                supplied_revision = int(principal_mapping_revision)
+            except (TypeError, ValueError) as exc:
+                raise PermissionError(
+                    "principal mapping revision is invalid"
+                ) from exc
+            if supplied_revision < 0:
+                raise PermissionError("principal mapping revision is invalid")
+            if supplied_revision == 0 and (
+                supplied_principal or supplied_account
+            ):
+                raise PermissionError(
+                    "unmapped principal snapshot cannot name an account"
+                )
+            if supplied_revision > 0 and not supplied_principal:
+                raise PermissionError(
+                    "mapped principal snapshot requires an account"
+                )
+        resolver = getattr(self.store, "resolve_principal_account", None)
+        resolved = None
+        if resolver is not None and channel and bot_id and external_user_id:
+            resolved = await _call_compatible(
+                resolver,
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+            )
+        durable_principal = str(_get(resolved, "principal_id", "") or "").strip()
+        durable_account = str(
+            _get(resolved, "principal_account_id", _get(resolved, "account_id", ""))
+            or ""
+        ).strip()
+        revision_value = _get(resolved, "mapping_revision", None)
+        if durable_principal:
+            if not durable_account:
+                raise PermissionError("principal mapping is incomplete")
+            if isinstance(revision_value, bool):
+                raise PermissionError("principal mapping revision is invalid")
+            try:
+                durable_revision = int(revision_value)
+            except (TypeError, ValueError) as exc:
+                raise PermissionError(
+                    "principal mapping revision is invalid"
+                ) from exc
+            if durable_revision <= 0:
+                raise PermissionError("principal mapping revision is invalid")
+        else:
+            durable_revision = None
+
+        # A durable zero is an authenticated *unmapped* snapshot.  Do not
+        # silently upgrade an already accepted command if the account becomes
+        # mapped before its effect executes; the store repeats this fence in
+        # the same transaction as the requested cron operation.
+        if supplied_revision == 0:
+            if durable_principal or durable_account:
+                raise PermissionError("principal mapping changed before cron operation")
+            return "", "", 0
+
+        if supplied_principal and (
+            supplied_principal != durable_principal
+            or supplied_account != durable_account
+            or (
+                supplied_revision is not None
+                and supplied_revision != durable_revision
+            )
+        ):
+            raise PermissionError("principal mapping changed before cron operation")
+        return durable_principal, durable_account, durable_revision
+
+    async def _build_cron_task_template(
+        self,
+        *,
+        job_id: str,
+        prompt: str,
+        target: ReplyTarget,
+        agent_id: str,
+        actor_external_user_id: str,
+        principal_id: str,
+        principal_account_id: str,
+        mapping_revision: int | None,
+        conversation_subject_id: str,
+        conversation_subject_scope: str,
+        conversation_subject_kind: str,
+    ) -> dict[str, Any]:
+        """Freeze the complete future task context without enqueueing work."""
+
+        route_target = self._routing_target(target, target)
+        route_mode = await self._get_mode_for_target(route_target, agent_id)
+        default_mode, default_policy_version = self._default_mode_selection(agent_id)
+        mode_id = str(route_mode[0] if route_mode else default_mode)
+        policy_version = int(
+            route_mode[1] if route_mode else default_policy_version
+        )
+        profile_version = self._default_profile_version(agent_id)
+        model, reasoning_effort = await self._get_model_for_target(
+            route_target, agent_id
+        )
+        metadata = self._policy_snapshot(
+            agent_id,
+            mode_id,
+            profile_version,
+            policy_version,
+            actor=principal_id or actor_external_user_id,
+            explicit=(
+                mode_id == "execute"
+                and self._execute_authorized(
+                    route_target,
+                    agent_id,
+                    policy_version,
+                )
+            ),
+        )
+        metadata["session_role"] = await self._session_role_for_target(
+            route_target, agent_id
+        )
+        execution_workspace = await self._execution_workspace_for_target(
+            route_target, agent_id
+        )
+        if execution_workspace is not None:
+            metadata[EXECUTION_WORKSPACE_KEY] = execution_workspace
+        metadata["cron_job_id"] = job_id
+
+        subject_id = str(
+            conversation_subject_id or target.conversation_subject_id or ""
+        )
+        subject_scope = str(
+            conversation_subject_scope
+            or target.conversation_subject_scope
+            or route_target.external_user_id
+            or actor_external_user_id
+        )
+        subject_kind = str(conversation_subject_kind or "direct").strip().lower()
+        parent_subject_id: str | None = None
+        subject_reader = getattr(self.store, "get_conversation_subject", None)
+        if subject_id and subject_reader is not None:
+            durable_subject = await _call_compatible(subject_reader, subject_id)
+            if durable_subject is None:
+                raise ValueError("cron conversation subject is unavailable")
+            if (
+                str(_get(durable_subject, "channel", "") or "") != target.channel
+                or str(_get(durable_subject, "bot_id", "") or "")
+                != target.bot_id
+                or str(_get(durable_subject, "scope_key", "") or "")
+                != subject_scope
+            ):
+                raise PermissionError("cron conversation subject conflicts")
+            subject_kind = str(
+                _get(durable_subject, "subject_kind", subject_kind)
+                or subject_kind
+            ).strip().lower()
+            parent_subject_id = (
+                str(_get(durable_subject, "parent_subject_id", "") or "")
+                or None
+            )
+        identity_snapshot = {
+            "actor": {
+                "channel": target.channel,
+                "bot_id": target.bot_id,
+                "external_user_id": actor_external_user_id,
+            },
+            "principal": {
+                "principal_id": principal_id or None,
+                "principal_account_id": principal_account_id or None,
+                "mapping_revision": mapping_revision,
+                "source": "configured" if principal_id else "unmapped",
+            },
+            "conversation_subject": {
+                "conversation_subject_id": subject_id or None,
+                "kind": subject_kind,
+                "scope_key": subject_scope,
+                "parent_subject_id": parent_subject_id,
+            },
+            "destination": {
+                "kind": target.destination_kind,
+                "id": target.destination_id,
+                "thread_id": target.thread_id,
+                "root_message_id": target.root_message_id,
+                "transport_metadata": dict(target.transport_metadata),
+            },
+        }
+        conversation = await self._provider_conversation_id(
+            route_target,
+            agent_id,
+            strict=False,
+        )
+        return {
+            "agent_id": agent_id,
+            "conversation_id": conversation,
+            "mode_id": mode_id,
+            "profile_version": profile_version,
+            "policy_version": policy_version,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "reply_target": target,
+            "inputs": {"text": prompt},
+            "metadata": metadata,
+            "actor_external_user_id": actor_external_user_id,
+            "principal_id": principal_id or None,
+            "principal_account_id": principal_account_id or None,
+            "conversation_subject_id": subject_id or None,
+            "identity_snapshot": identity_snapshot,
+        }
+
+    def _cron_reply_target_snapshot(self, value: Any) -> tuple[Any, ...]:
+        """Normalize stable route fields for semantic command replay checks."""
+
+        target = self._coerce_target(value)
+        return (
+            str(target.channel or ""),
+            str(target.bot_id or ""),
+            str(target.external_user_id or ""),
+            str(target.session_id or "default"),
+            str(target.source_message_id or ""),
+            target.source_sequence,
+            str(target.context_token or ""),
+            str(target.conversation_subject_id or ""),
+            str(target.conversation_subject_scope or ""),
+            str(target.destination_kind or ""),
+            str(target.destination_id or ""),
+            str(target.thread_id or ""),
+            str(target.root_message_id or ""),
+            dict(target.transport_metadata or {}),
+        )
+
+    def _require_cron_replay_match(
+        self,
+        existing: Any,
+        *,
+        principal_id: str,
+        principal_account_id: str,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+        session_id: str,
+        conversation_subject_id: str,
+        conversation_subject_scope: str,
+        target: ReplyTarget,
+        agent_id: str,
+        schedule_kind: str,
+        schedule_expression: str,
+        timezone_name: str,
+        prompt: str,
+        expires_at: Any | None,
+    ) -> None:
+        """Authorize an idempotent add and compare only semantic inputs.
+
+        Mutable task-template fields are deliberately absent: mode, model,
+        role, cwd, and next-fire state may all change after the original
+        command committed, while its deterministic job ID still names the
+        same frozen schedule.
+        """
+
+        stored_principal = str(_get(existing, "principal_id", "") or "")
+        stored_account = str(
+            _get(existing, "principal_account_id", "") or ""
+        )
+        owner_matches = (
+            stored_principal == principal_id
+            and (not stored_principal or stored_account == principal_account_id)
+        ) or (
+            not stored_principal
+            and str(_get(existing, "origin_channel", "") or "") == channel
+            and str(_get(existing, "origin_bot_id", "") or "") == bot_id
+            and str(_get(existing, "origin_external_user_id", "") or "")
+            == external_user_id
+        )
+        if not owner_matches:
+            raise PermissionError("cron job identity conflicts")
+
+        expected_expiry = text_to_datetime(expires_at)
+        stored_expiry = text_to_datetime(_get(existing, "expires_at", None))
+        conflicts = []
+        for name, actual, expected in (
+            ("origin_channel", _get(existing, "origin_channel", ""), channel),
+            ("origin_bot_id", _get(existing, "origin_bot_id", ""), bot_id),
+            (
+                "origin_external_user_id",
+                _get(existing, "origin_external_user_id", ""),
+                external_user_id,
+            ),
+            (
+                "origin_session_id",
+                _get(existing, "origin_session_id", "default"),
+                session_id,
+            ),
+            (
+                "origin_conversation_subject_id",
+                _get(existing, "origin_conversation_subject_id", "") or "",
+                conversation_subject_id,
+            ),
+            (
+                "origin_conversation_subject_scope",
+                _get(existing, "origin_conversation_subject_scope", ""),
+                conversation_subject_scope,
+            ),
+            ("agent_id", _get(existing, "agent_id", ""), agent_id),
+            (
+                "schedule_kind",
+                _get(existing, "schedule_kind", ""),
+                schedule_kind,
+            ),
+            (
+                "schedule_expression",
+                _get(existing, "schedule_expression", ""),
+                schedule_expression,
+            ),
+            (
+                "timezone_name",
+                _get(existing, "timezone_name", ""),
+                timezone_name,
+            ),
+            ("prompt", _get(existing, "prompt", ""), prompt),
+        ):
+            if str(actual or "") != str(expected or ""):
+                conflicts.append(name)
+        if self._cron_reply_target_snapshot(
+            _get(existing, "origin_reply_target", None)
+        ) != self._cron_reply_target_snapshot(target):
+            conflicts.append("origin_reply_target")
+        if stored_expiry != expected_expiry:
+            conflicts.append("expires_at")
+        if conflicts:
+            raise StoreError(
+                "cron job identity conflicts: "
+                + ", ".join(dict.fromkeys(conflicts))
+            )
+
+    async def _cron_agent_incarnation(self, agent_id: str) -> int | None:
+        """Return the exact enabled lifecycle incarnation when supported."""
+
+        reader = getattr(self.store, "get_agent_lifecycle", None)
+        if reader is None:
+            # Compatibility stores predate lifecycle fencing.  Production
+            # SQLite always exposes this method and therefore never uses the
+            # unfenced fallback.
+            return None
+        lifecycle = await _call_compatible(reader, agent_id)
+        if lifecycle is None:
+            raise StoreError(f"target Agent lifecycle is unavailable: {agent_id}")
+        state_value = _model_field(
+            lifecycle, "lifecycle_state", "state", default=""
+        )
+        desired_value = _model_field(
+            lifecycle, "desired_process_state", default=""
+        )
+        state = getattr(state_value, "value", state_value)
+        desired = getattr(desired_value, "value", desired_value)
+        incarnation = _model_field(
+            lifecycle, "agent_incarnation", "incarnation", default=None
+        )
+        try:
+            incarnation_value = int(incarnation)
+        except (TypeError, ValueError) as exc:
+            raise StoreError(
+                f"target Agent incarnation is invalid: {agent_id}"
+            ) from exc
+        if (
+            incarnation_value <= 0
+            or str(state).casefold() != "enabled"
+            or str(desired).casefold() != "running"
+        ):
+            raise StoreError(f"target Agent is not enabled: {agent_id}")
+        return incarnation_value
+
+    async def add_cron_job(
+        self,
+        schedule: str,
+        prompt: str,
+        *,
+        job_id: str | None = None,
+        reply_target: ReplyTarget | Mapping[str, Any] | None = None,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        session_id: str = "",
+        conversation_subject_id: str = "",
+        conversation_subject_scope: str = "",
+        conversation_subject_kind: str = "direct",
+        principal_id: str = "",
+        principal_account_id: str = "",
+        principal_mapping_revision: int | None = None,
+        agent_id: str | None = None,
+        now: Any | None = None,
+        expires_at: Any | None = None,
+    ) -> Any:
+        """Validate and durably register a schedule owned by its origin."""
+
+        self._assert_loop()
+        prompt = str(prompt or "").strip()
+        if not prompt:
+            raise CronScheduleError("cron prompt is required")
+        spec = parse_schedule(schedule, default_timezone=DEFAULT_TIMEZONE)
+        created_at = text_to_datetime(now) if now is not None else utc_now()
+        if created_at is None:
+            raise CronScheduleError("cron creation time is invalid")
+
+        target = self._coerce_target(reply_target)
+        expected_route = (
+            str(channel or target.channel),
+            str(bot_id or target.bot_id),
+            str(external_user_id or target.external_user_id),
+            str(session_id or target.session_id or "default"),
+        )
+        if not all(expected_route[:3]):
+            raise ValueError("cron origin channel, bot, and actor are required")
+        if any(
+            supplied and supplied != expected
+            for supplied, expected in zip(
+                (target.channel, target.bot_id, target.external_user_id),
+                expected_route[:3],
+            )
+        ):
+            raise PermissionError("cron reply target does not match its origin")
+        target = replace(
+            target,
+            channel=expected_route[0],
+            bot_id=expected_route[1],
+            external_user_id=expected_route[2],
+            session_id=expected_route[3],
+        )
+        route_target = self._routing_target(target, target)
+        resolved_job_id = str(job_id or f"cron-{uuid.uuid4().hex}").strip()
+        if not resolved_job_id:
+            raise ValueError("cron job_id is required")
+        subject_id = str(
+            conversation_subject_id or target.conversation_subject_id or ""
+        )
+        subject_scope = str(
+            conversation_subject_scope
+            or target.conversation_subject_scope
+            or route_target.external_user_id
+        )
+
+        async with self._scope_lock(
+            channel=route_target.channel,
+            bot_id=route_target.bot_id,
+            external_user_id=route_target.external_user_id,
+            session_id=route_target.session_id,
+        ):
+            selected = str(agent_id or "").strip()
+            if not selected:
+                selected = await self._resolve_active_agent(route_target)
+            if self.allow_dynamic_agents:
+                # Canonicalization validates an absent Agent ID without
+                # creating it.  An idempotent replay can therefore return its
+                # frozen job even after the target Agent was retired.
+                selected = self._canonical_route_agent(selected)
+            resolved_principal, resolved_account, mapping_revision = (
+                await self._cron_principal_snapshot(
+                    channel=expected_route[0],
+                    bot_id=expected_route[1],
+                    external_user_id=expected_route[2],
+                    principal_id=principal_id,
+                    principal_account_id=principal_account_id,
+                    principal_mapping_revision=principal_mapping_revision,
+                )
+            )
+            owner_scope = {
+                "principal_id": resolved_principal,
+                "principal_account_id": resolved_account,
+                "principal_mapping_revision": mapping_revision,
+                "origin_channel": expected_route[0],
+                "origin_bot_id": expected_route[1],
+                "origin_external_user_id": expected_route[2],
+            }
+
+            # The deterministic command job ID is checked before consulting
+            # mutable Agent/session state.  A replay after a firing or after a
+            # mode/model/role/cwd change must return the original frozen job,
+            # rather than rebuilding a template and reporting a false
+            # conflict.  Production uses an owner-authenticated transaction;
+            # the raw getter is retained only for compatibility stores.
+            existing = None
+            owner_getter = getattr(self.store, "get_cron_job_for_owner", None)
+            if owner_getter is not None:
+                try:
+                    existing = await _call_compatible(
+                        owner_getter,
+                        resolved_job_id,
+                        **owner_scope,
+                    )
+                except NotFoundError:
+                    existing = None
+            else:
+                getter = getattr(self.store, "get_cron_job", None)
+                if getter is not None:
+                    existing = await _call_compatible(getter, resolved_job_id)
+            if existing is not None:
+                self._require_cron_replay_match(
+                    existing,
+                    principal_id=resolved_principal,
+                    principal_account_id=resolved_account,
+                    channel=expected_route[0],
+                    bot_id=expected_route[1],
+                    external_user_id=expected_route[2],
+                    session_id=expected_route[3],
+                    conversation_subject_id=subject_id,
+                    conversation_subject_scope=subject_scope,
+                    target=target,
+                    agent_id=selected,
+                    schedule_kind=spec.kind,
+                    schedule_expression=spec.expression,
+                    timezone_name=spec.timezone_name,
+                    prompt=prompt,
+                    expires_at=expires_at,
+                )
+                return existing
+
+            next_fire = first_fire_at(spec, created_at=created_at)
+            if next_fire is None:
+                raise CronScheduleError("schedule has no future occurrence")
+            if self.allow_dynamic_agents:
+                await self.ensure_agent(selected)
+            self.registry.require(selected)
+
+            # Serialize local deletion/recreation with lifecycle capture and
+            # store creation.  A second process can still retire this Agent,
+            # so SQLite validates the supplied exact incarnation again inside
+            # the insert transaction.
+            async with self._dynamic_agent_lock:
+                self.registry.require(selected)
+                agent_incarnation = await self._cron_agent_incarnation(selected)
+                task_template = await self._build_cron_task_template(
+                    job_id=resolved_job_id,
+                    prompt=prompt,
+                    target=target,
+                    agent_id=selected,
+                    actor_external_user_id=expected_route[2],
+                    principal_id=resolved_principal,
+                    principal_account_id=resolved_account,
+                    mapping_revision=mapping_revision,
+                    conversation_subject_id=subject_id,
+                    conversation_subject_scope=subject_scope,
+                    conversation_subject_kind=conversation_subject_kind,
+                )
+                method = getattr(self.store, "create_cron_job", None)
+                if method is None:
+                    raise AttributeError("store does not support cron jobs")
+                create_values: dict[str, Any] = {
+                    **owner_scope,
+                    "job_id": resolved_job_id,
+                    "origin_conversation_subject_id": subject_id or None,
+                    "origin_conversation_subject_scope": subject_scope,
+                    "origin_session_id": expected_route[3],
+                    "origin_reply_target": target,
+                    "agent_id": selected,
+                    "schedule_kind": spec.kind,
+                    "schedule_expression": spec.expression,
+                    "timezone_name": spec.timezone_name,
+                    "prompt": prompt,
+                    "created_at": created_at,
+                    "next_fire_at": next_fire,
+                    "expires_at": expires_at,
+                    "task_template": task_template,
+                }
+                if agent_incarnation is not None:
+                    create_values["agent_incarnation"] = agent_incarnation
+                result = await _call_compatible(method, **create_values)
+        self.wake_cron_scheduler()
+        return result
+
+    create_cron_job = add_cron_job
+
+    async def _natural_cron_task(
+        self,
+        task_id: str,
+        *,
+        required_execution_id: str,
+    ) -> Any:
+        """Authorize scheduling independently of the shared bridge bearer."""
+
+        self._assert_loop()
+        identity = str(task_id or "").strip()
+        execution_id = str(required_execution_id or "").strip()
+        if not identity or not execution_id:
+            raise PermissionError(
+                "natural cron requires an exact running task execution"
+            )
+        task = await self.get_task(identity)
+        if task is None:
+            raise PermissionError(f"task unavailable: {identity}")
+        source_agent = str(_get(task, "agent_id", "") or "").strip()
+        if not source_agent:
+            raise PermissionError("task Agent is unavailable")
+        policy = await self._collaboration_policy(
+            source_agent,
+            task_id=identity,
+            require_active_task=True,
+            required_execution_id=execution_id,
+        )
+        if _get(policy, "can_execute_commands", False) is not True:
+            raise PermissionError(
+                "natural cron requires command-execution permission"
+            )
+        metadata = _get(task, "metadata", {}) or {}
+        if not isinstance(metadata, Mapping):
+            raise PermissionError("task metadata is invalid")
+        if (
+            not str(_get(task, "inbound_message_id", "") or "").strip()
+            or _get(task, "parent_task_id", None) is not None
+            or int(_get(task, "child_depth", 0) or 0) != 0
+            or bool(metadata.get("internal_mailbox"))
+            or bool(metadata.get("cron"))
+            or bool(metadata.get("cron_job_id"))
+        ):
+            raise PermissionError(
+                "natural cron is limited to top-level human tasks"
+            )
+        return task
+
+    @staticmethod
+    def _natural_cron_ids(
+        *,
+        task_id: str,
+        execution_id: str,
+        schedule_kind: str,
+        schedule_expression: str,
+        timezone_name: str,
+        prompt: str,
+    ) -> tuple[str, str]:
+        material = "\x1f".join(
+            (
+                str(task_id),
+                str(execution_id),
+                str(schedule_kind),
+                str(schedule_expression),
+                str(timezone_name),
+                str(prompt),
+            )
+        )
+        draft_uuid = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "codex-natural-cron-draft:" + material,
+        ).hex
+        job_uuid = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "codex-natural-cron-job:" + draft_uuid,
+        ).hex
+        return f"cron-draft-{draft_uuid}", f"cron-{job_uuid}"
+
+    async def propose_natural_cron(
+        self,
+        task_id: str,
+        schedule: str,
+        prompt: str,
+        *,
+        required_execution_id: str,
+        now: Any | None = None,
+    ) -> Any:
+        """Validate and freeze a schedule proposal; never create a job."""
+
+        execution_id = str(required_execution_id or "").strip()
+        await self._natural_cron_task(
+            str(task_id),
+            required_execution_id=execution_id,
+        )
+        prompt_value = str(prompt or "").strip()
+        if not prompt_value:
+            raise CronScheduleError("cron prompt is required")
+        spec = parse_schedule(schedule, default_timezone=DEFAULT_TIMEZONE)
+        created_at = text_to_datetime(now) if now is not None else utc_now()
+        if created_at is None:
+            raise CronScheduleError("cron creation time is invalid")
+        next_fire_at = first_fire_at(spec, created_at=created_at)
+        if next_fire_at is None:
+            raise CronScheduleError("schedule has no future occurrence")
+        draft_id, job_id = self._natural_cron_ids(
+            task_id=str(task_id),
+            execution_id=execution_id,
+            schedule_kind=spec.kind,
+            schedule_expression=spec.expression,
+            timezone_name=spec.timezone_name,
+            prompt=prompt_value,
+        )
+        creator = getattr(self.store, "create_natural_cron_draft", None)
+        if creator is None:
+            raise AttributeError("store does not support natural cron drafts")
+        return await _call_compatible(
+            creator,
+            draft_id=draft_id,
+            job_id=job_id,
+            source_task_id=str(task_id),
+            source_execution_id=execution_id,
+            schedule_kind=spec.kind,
+            schedule_expression=spec.expression,
+            timezone_name=spec.timezone_name,
+            prompt=prompt_value,
+            next_fire_at=next_fire_at,
+            created_at=created_at,
+        )
+
+    async def confirm_natural_cron(
+        self,
+        task_id: str,
+        *,
+        draft_id: str = "",
+        required_execution_id: str,
+        now: Any | None = None,
+    ) -> Mapping[str, Any]:
+        """Atomically commit a pending proposal after later human confirmation."""
+
+        execution_id = str(required_execution_id or "").strip()
+        await self._natural_cron_task(
+            str(task_id),
+            required_execution_id=execution_id,
+        )
+        confirmer = getattr(self.store, "confirm_natural_cron_draft", None)
+        if confirmer is None:
+            raise AttributeError("store does not support natural cron confirmation")
+        result = await _call_compatible(
+            confirmer,
+            str(draft_id or "").strip(),
+            task_id=str(task_id),
+            execution_id=execution_id,
+            now=now,
+        )
+        draft = _get(result, "draft", None)
+        job = _get(result, "job", None)
+        if (
+            draft is None
+            or job is None
+            or not str(_get(draft, "draft_id", "") or "").strip()
+            or not str(_get(job, "job_id", "") or "").strip()
+        ):
+            raise StoreError("natural cron confirmation result is incomplete")
+        self.wake_cron_scheduler()
+        return {"draft": draft, "job": job}
+
+    async def cancel_natural_cron(
+        self,
+        task_id: str,
+        *,
+        draft_id: str = "",
+        required_execution_id: str,
+        now: Any | None = None,
+    ) -> Any:
+        """Cancel one pending draft after exact later human cancellation."""
+
+        execution_id = str(required_execution_id or "").strip()
+        await self._natural_cron_task(
+            str(task_id),
+            required_execution_id=execution_id,
+        )
+        method = getattr(self.store, "cancel_natural_cron_draft", None)
+        if method is None:
+            raise AttributeError("store does not support natural cron cancellation")
+        return await _call_compatible(
+            method,
+            str(draft_id or "").strip(),
+            task_id=str(task_id),
+            execution_id=execution_id,
+            now=now,
+        )
+
+    async def pending_natural_cron(
+        self,
+        task_id: str,
+        *,
+        required_execution_id: str,
+        now: Any | None = None,
+    ) -> list[Any]:
+        """Return unresolved drafts in the exact active origin scope."""
+
+        execution_id = str(required_execution_id or "").strip()
+        await self._natural_cron_task(
+            str(task_id),
+            required_execution_id=execution_id,
+        )
+        method = getattr(self.store, "list_natural_cron_drafts", None)
+        if method is None:
+            raise AttributeError("store does not support natural cron drafts")
+        return list(
+            await _call_compatible(
+                method,
+                task_id=str(task_id),
+                execution_id=execution_id,
+                states=("pending",),
+                now=now,
+            )
+            or ()
+        )
+
+    @staticmethod
+    def _cron_job_owned_by(
+        job: Any,
+        *,
+        principal_id: str,
+        channel: str,
+        bot_id: str,
+        external_user_id: str,
+    ) -> bool:
+        job_principal = str(_get(job, "principal_id", "") or "")
+        if principal_id and job_principal == principal_id:
+            return True
+        if job_principal:
+            return False
+        return (
+            str(_get(job, "origin_channel", "") or "") == channel
+            and str(_get(job, "origin_bot_id", "") or "") == bot_id
+            and str(_get(job, "origin_external_user_id", "") or "")
+            == external_user_id
+        )
+
+    async def list_cron_jobs(
+        self,
+        *,
+        principal_id: str = "",
+        principal_account_id: str = "",
+        principal_mapping_revision: int | None = None,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        enabled: bool | None = None,
+        limit: int = 100,
+        **_: Any,
+    ) -> list[Any]:
+        """List only jobs owned by the canonical principal/account caller."""
+
+        self._assert_loop()
+        if isinstance(limit, bool):
+            raise ValueError("cron list limit must be a non-negative integer")
+        try:
+            limit_value = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "cron list limit must be a non-negative integer"
+            ) from exc
+        if limit_value < 0:
+            raise ValueError("cron list limit must be a non-negative integer")
+        limit_value = min(100, limit_value)
+        origin = (str(channel or ""), str(bot_id or ""), str(external_user_id or ""))
+        if not all(origin):
+            raise PermissionError("cron ownership scope is incomplete")
+        principal_id, account_id, revision = await self._cron_principal_snapshot(
+            channel=origin[0],
+            bot_id=origin[1],
+            external_user_id=origin[2],
+            principal_id=principal_id,
+            principal_account_id=principal_account_id,
+            principal_mapping_revision=principal_mapping_revision,
+        )
+        owner_method = getattr(self.store, "list_cron_jobs_for_owner", None)
+        if owner_method is not None:
+            return list(
+                await _call_compatible(
+                    owner_method,
+                    principal_id=principal_id,
+                    principal_account_id=account_id,
+                    principal_mapping_revision=revision,
+                    origin_channel=origin[0],
+                    origin_bot_id=origin[1],
+                    origin_external_user_id=origin[2],
+                    enabled=enabled,
+                    limit=limit_value,
+                    order="desc",
+                )
+                or ()
+            )
+
+        # Compatibility stores lack the transactionally authenticated union
+        # query.  Ask each legacy index for newest rows, then merge and slice
+        # after dedupe so one source cannot crowd newer rows out of the list.
+        method = getattr(self.store, "list_cron_jobs", None)
+        if method is None:
+            raise AttributeError("store does not support cron jobs")
+        candidates: list[Any] = []
+        if principal_id:
+            candidates.extend(
+                list(
+                    await _call_compatible(
+                        method,
+                        principal_id=principal_id,
+                        enabled=enabled,
+                        limit=limit_value,
+                        order="desc",
+                    )
+                    or ()
+                )
+            )
+        # Include pre-mapping jobs created by this exact authenticated account,
+        # but never jobs durably owned by a different canonical principal.
+        if all(origin):
+            candidates.extend(
+                list(
+                    await _call_compatible(
+                        method,
+                        origin_channel=origin[0],
+                        origin_bot_id=origin[1],
+                        origin_external_user_id=origin[2],
+                        enabled=enabled,
+                        limit=limit_value,
+                        order="desc",
+                    )
+                    or ()
+                )
+            )
+        deduplicated: dict[str, Any] = {}
+        for job in candidates:
+            if not self._cron_job_owned_by(
+                job,
+                principal_id=principal_id,
+                channel=origin[0],
+                bot_id=origin[1],
+                external_user_id=origin[2],
+            ):
+                continue
+            identity = str(_get(job, "job_id", "") or "")
+            if identity:
+                deduplicated.setdefault(identity, job)
+        values = list(deduplicated.values())
+        values.sort(
+            key=lambda job: (
+                str(_get(job, "created_at", "") or ""),
+                str(_get(job, "job_id", "") or ""),
+            ),
+            reverse=True,
+        )
+        return values[:limit_value]
+
+    cron_jobs = list_cron_jobs
+
+    async def delete_cron_job(
+        self,
+        job_id: str,
+        *,
+        principal_id: str = "",
+        principal_account_id: str = "",
+        principal_mapping_revision: int | None = None,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        **_: Any,
+    ) -> Any:
+        """Disable one owned job without disclosing another owner's IDs."""
+
+        self._assert_loop()
+        identity = str(job_id or "").strip()
+        if not identity:
+            raise ValueError("cron job_id is required")
+        origin = (str(channel or ""), str(bot_id or ""), str(external_user_id or ""))
+        if not all(origin):
+            raise PermissionError("cron ownership scope is incomplete")
+        principal_id, account_id, revision = await self._cron_principal_snapshot(
+            channel=origin[0],
+            bot_id=origin[1],
+            external_user_id=origin[2],
+            principal_id=principal_id,
+            principal_account_id=principal_account_id,
+            principal_mapping_revision=principal_mapping_revision,
+        )
+        owner_disable = getattr(
+            self.store, "disable_cron_job_for_owner", None
+        )
+        if owner_disable is not None:
+            try:
+                result = await _call_compatible(
+                    owner_disable,
+                    identity,
+                    principal_id=principal_id,
+                    principal_account_id=account_id,
+                    principal_mapping_revision=revision,
+                    origin_channel=origin[0],
+                    origin_bot_id=origin[1],
+                    origin_external_user_id=origin[2],
+                )
+            except NotFoundError as exc:
+                raise KeyError("cron job does not exist") from exc
+            self.wake_cron_scheduler()
+            return result
+
+        getter = getattr(self.store, "get_cron_job", None)
+        disable = getattr(self.store, "disable_cron_job", None)
+        if getter is None or disable is None:
+            raise AttributeError("store does not support cron jobs")
+        job = await _call_compatible(getter, identity)
+        if job is None or not self._cron_job_owned_by(
+            job,
+            principal_id=principal_id,
+            channel=origin[0],
+            bot_id=origin[1],
+            external_user_id=origin[2],
+        ):
+            raise KeyError("cron job does not exist")
+        stored_principal = str(_get(job, "principal_id", "") or "")
+        disable_scope = (
+            {"principal_id": stored_principal}
+            if stored_principal
+            else {
+                "origin_channel": origin[0],
+                "origin_bot_id": origin[1],
+                "origin_external_user_id": origin[2],
+            }
+        )
+        result = await _call_compatible(disable, identity, **disable_scope)
+        self.wake_cron_scheduler()
+        return result
+
+    disable_cron_job = delete_cron_job
 
     # ------------------------------------------------------------------ task controls/status
     async def get_task(self, task_id: str) -> Any:
@@ -2107,6 +3380,56 @@ class TaskManager:
         if method is None:
             return []
         kwargs = {"limit": limit, **filters}
+        # Task rows for a mapped direct account use the principal conversation
+        # anchor, while channel commands deliberately persist the transport-local
+        # conversation ID they were accepted with.  Resolve that trusted alias at
+        # this facade before applying the store filter.  Keeping the conversion
+        # here also covers `/status`, `/report`, and no-argument `/cancel`, plus
+        # callers that invoke the manager without passing through a gateway.
+        #
+        # A caller that omits ``conversation_id`` is intentionally asking for a
+        # broader listing; do not add a filter or otherwise change that behavior.
+        supplied_conversation = filters.get("conversation_id")
+        channel = str(filters.get("channel") or "")
+        bot_id = str(filters.get("bot_id") or "")
+        external_user_id = str(filters.get("external_user_id") or "")
+        session_id = str(filters.get("session_id") or "default")
+        agent_id = str(filters.get("agent_id") or "")
+        if supplied_conversation is not None and all(
+            (channel, bot_id, external_user_id, agent_id)
+        ):
+            target = ReplyTarget(
+                channel=channel,
+                bot_id=bot_id,
+                external_user_id=external_user_id,
+                session_id=session_id,
+            )
+            kwargs["conversation_id"] = await self._provider_conversation_id(
+                target,
+                agent_id,
+                conversation_id=str(supplied_conversation or ""),
+            )
+            # The selected principal anchor controls future provider history,
+            # but adopting it must not hide this exact channel account's
+            # immutable pre-adoption task rows.  The store applies this set in
+            # one ordered/limited query together with the unchanged account,
+            # session, and Agent filters.  Keep the singular value as a safe
+            # fallback for compatibility stores that do not expose the new
+            # optional candidate-set parameter.
+            kwargs["conversation_ids"] = tuple(
+                dict.fromkeys(
+                    (
+                        kwargs["conversation_id"],
+                        *conversation_id_candidates(
+                            channel,
+                            bot_id,
+                            external_user_id,
+                            session_id,
+                            agent_id,
+                        ),
+                    )
+                )
+            )
         return await _call_compatible(method, **kwargs)
 
     tasks = list_tasks
@@ -2625,64 +3948,73 @@ class TaskManager:
                         )
                 await self._ensure_selected_process_ready(selected)
                 return False
-            runtime, template = self._dynamic_template()
-            retained_profile: AgentProfile | None = None
-            profile_reader = getattr(self.store, "get_profile", None)
-            if profile_reader is not None:
-                candidate = await _call_compatible(profile_reader, selected)
+            phase = "template"
+            registered = False
+            brand_new_profile = False
+            try:
+                runtime, template = self._dynamic_template()
+                phase = "retained_profile"
+                retained_profile: AgentProfile | None = None
+                profile_reader = getattr(self.store, "get_profile", None)
+                if profile_reader is not None:
+                    candidate = await _call_compatible(profile_reader, selected)
+                    if (
+                        isinstance(candidate, AgentProfile)
+                        and str(candidate.summary or "") == _DYNAMIC_AGENT_SUMMARY
+                    ):
+                        retained_profile = candidate
+                retained_config_profile = (
+                    self._require_allowed_codex_config_profile(
+                        retained_profile.codex_config_profile
+                    )
+                    if retained_profile is not None
+                    else ""
+                )
+                brand_new_profile = retained_profile is None and not was_deleted
                 if (
-                    isinstance(candidate, AgentProfile)
-                    and str(candidate.summary or "") == _DYNAMIC_AGENT_SUMMARY
+                    requested_config_profile is not None
+                    and retained_profile is not None
+                    and requested_config_profile != retained_config_profile
                 ):
-                    retained_profile = candidate
-            retained_config_profile = (
-                self._require_allowed_codex_config_profile(
-                    retained_profile.codex_config_profile
+                    raise ValueError(
+                        "Agent is already bound to a different Codex config profile"
+                    )
+                selected_config_profile = (
+                    requested_config_profile
+                    if requested_config_profile is not None
+                    else retained_config_profile
                 )
-                if retained_profile is not None
-                else ""
-            )
-            brand_new_profile = retained_profile is None and not was_deleted
-            if (
-                requested_config_profile is not None
-                and retained_profile is not None
-                and requested_config_profile != retained_config_profile
-            ):
-                raise ValueError(
-                    "Agent is already bound to a different Codex config profile"
+                if selected_config_profile:
+                    # Resolve only the authorized expected filename. Parsing
+                    # and credential-bearing values remain inside the child.
+                    phase = "config_profile"
+                    require_profile_file(selected_config_profile)
+                phase = "profile_definition"
+                profile = self._named_profile(
+                    selected,
+                    template,
+                    codex_config_profile=selected_config_profile,
                 )
-            selected_config_profile = (
-                requested_config_profile
-                if requested_config_profile is not None
-                else retained_config_profile
-            )
-            if selected_config_profile:
-                # Resolve only the authorized expected filename.  Parsing and
-                # credential-bearing values remain inside the Agent child.
-                # Existing live bindings intentionally avoid this probe so an
-                # idempotent switch cannot become a private-file oracle.
-                require_profile_file(selected_config_profile)
-            profile = self._named_profile(
-                selected,
-                template,
-                codex_config_profile=selected_config_profile,
-            )
-            self.registry.register(
-                selected,
-                _NamedAgentRuntime(
+                phase = "runtime_factory"
+                named_runtime = _NamedAgentRuntime(
                     selected,
                     runtime,
                     codex_config_profile=selected_config_profile,
-                ),
-                profile=profile,
-            )
-            try:
+                )
+                phase = "runtime_registration"
+                self.registry.register(
+                    selected,
+                    named_runtime,
+                    profile=profile,
+                )
+                registered = True
                 # `/delagent` disables retained immutable Profile versions and
                 # writes a tombstone.  An explicit later `/agent <same-id>` is
                 # a recreation request: atomically validate/restore those
                 # lifecycle bits before ordinary idempotent publication.
                 reactivator = getattr(self.store, "reactivate_agent", None)
                 if was_deleted and allow_deleted and reactivator is not None:
+                    phase = "profile_reactivation"
                     await _call_compatible(reactivator, profile)
                 if self._started:
                     # A brand-new alias is provisional until its isolated
@@ -2694,6 +4026,7 @@ class TaskManager:
                     # supervisor restart.  Recreated aliases are already
                     # protected by their retained tombstone until the route
                     # commit below.
+                    phase = "runtime_start"
                     await self.registry.start()
                     await self._ensure_selected_process_ready(selected)
                 if not self._started and brand_new_profile:
@@ -2702,17 +4035,31 @@ class TaskManager:
                     # definitions before any worker can reference them.
                     self._provisional_dynamic_agent_ids.add(selected)
                 else:
+                    phase = "profile_persistence"
                     await self._persist_registry_definitions(
                         only_agent_ids=(selected,)
                     )
-            except BaseException as startup_error:
-                try:
-                    await self._rollback_uncommitted_dynamic_agent(
-                        selected,
-                        retire_durable_profile=brand_new_profile,
-                    )
-                except BaseException as cleanup_error:
-                    raise cleanup_error from startup_error
+            except BaseException as creation_error:
+                log_agent_creation_failed(
+                    logger,
+                    agent_id=selected,
+                    phase=phase,
+                    exception=creation_error,
+                )
+                if registered:
+                    try:
+                        await self._rollback_uncommitted_dynamic_agent(
+                            selected,
+                            retire_durable_profile=brand_new_profile,
+                        )
+                    except BaseException as cleanup_error:
+                        log_agent_creation_failed(
+                            logger,
+                            agent_id=selected,
+                            phase="rollback",
+                            exception=cleanup_error,
+                        )
+                        raise cleanup_error from creation_error
                 raise
             return True
 
@@ -2720,12 +4067,20 @@ class TaskManager:
         self,
         agent_id: str,
         *,
+        force: bool = False,
         channel: str = "",
         bot_id: str = "",
         external_user_id: str = "",
         session_id: str = "default",
-    ) -> bool:
-        """Delete a dynamic Agent while preserving immutable task history."""
+    ) -> bool | Mapping[str, Any]:
+        """Delete a dynamic Agent while preserving immutable task history.
+
+        The safe default refuses retirement while resumable work exists.
+        ``force=True`` asks the durable store to terminalize that work in the
+        same transaction as Profile disablement, route fallback, and the
+        deletion tombstone.  The process-owned execution slot is released only
+        after the runtime has been interrupted and fully stopped.
+        """
         self._assert_loop()
         selected = self._validate_agent_id(agent_id)
         if selected == self.dynamic_agent_template_id or selected == self.default_agent_id:
@@ -2734,6 +4089,8 @@ class TaskManager:
         if registration is None:
             reader = getattr(self.store, "is_agent_deleted", None)
             if reader is not None and await _call_compatible(reader, selected):
+                if force:
+                    raise RuntimeError(f"Agent was already deleted: {selected}")
                 raise KeyError(f"Agent not found: {selected}")
             raise KeyError(f"Agent not found: {selected}")
         profile = registration.profile or self.registry.profile(selected)
@@ -2742,27 +4099,101 @@ class TaskManager:
         async with self._dynamic_agent_lock:
             current = self.registry.registration(selected)
             if current is None:
+                reader = getattr(self.store, "is_agent_deleted", None)
+                if (
+                    force
+                    and reader is not None
+                    and await _call_compatible(reader, selected)
+                ):
+                    raise RuntimeError(f"Agent was already deleted: {selected}")
                 raise KeyError(f"Agent not found: {selected}")
-            retire = getattr(self.store, "retire_agent", None)
+            reader = getattr(self.store, "is_agent_deleted", None)
+            cleanup_pending = bool(
+                force
+                and reader is not None
+                and await _call_compatible(reader, selected)
+            )
+            retire = getattr(
+                self.store,
+                "force_retire_agent" if force else "retire_agent",
+                None,
+            )
             marker = getattr(self.store, "mark_agent_deleted", None)
-            if retire is not None:
-                await _call_compatible(
+            if cleanup_pending:
+                # A previous force-delete may have committed its durable
+                # terminal transition before process shutdown failed.  The
+                # retained registration is deliberately the only cleanup
+                # handle; retry that cleanup without asking the store to
+                # apply the already-committed force transition again.
+                result = self._pending_force_delete_reports.get(
+                    selected,
+                    {
+                        "cancelled_task_ids": (),
+                        "active_task_ids": (),
+                        "rejected_mailbox_ids": (),
+                        "fenced_steering_ids": (),
+                        "released_execution_slot_ids": (),
+                        "disabled_profile_count": 0,
+                    },
+                )
+            elif retire is not None:
+                result = await _call_compatible(
                     retire, selected, default_agent_id=self.default_agent_id
                 )
-            elif marker is not None:
-                await _call_compatible(
+            elif marker is not None and not force:
+                result = await _call_compatible(
                     marker, selected, fallback_agent_id=self.default_agent_id
                 )
             else:
                 raise AttributeError(
-                    "store does not support durable Agent deletion"
+                    "store does not support durable Agent force deletion"
+                    if force
+                    else "store does not support durable Agent deletion"
                 )
+            if force:
+                if not cleanup_pending and isinstance(result, Mapping):
+                    self._pending_force_delete_reports[selected] = dict(result)
+                active_task_ids = tuple(
+                    str(task_id)
+                    for task_id in (
+                        _get(result, "active_task_ids", ()) or ()
+                    )
+                )
+                # The durable terminal state wins every completion race.  Ask
+                # the exact worker/runtime turn to stop cooperatively before
+                # stopping the owned Agent process and releasing its process
+                # budget slot.
+                for task_id in active_task_ids:
+                    interrupted = False
+                    for worker in self._workers:
+                        try:
+                            interrupted = (
+                                await worker.interrupt(task_id) or interrupted
+                            )
+                        except Exception:
+                            logger.warning(
+                                "runtime interruption failed during force-delete "
+                                "for task %s",
+                                task_id,
+                                exc_info=True,
+                            )
+                    if not interrupted:
+                        try:
+                            await self.registry.interrupt(selected, task_id)
+                        except Exception:
+                            logger.debug(
+                                "Agent runtime did not accept force-delete "
+                                "interrupt for task %s",
+                                task_id,
+                                exc_info=True,
+                            )
             # A process-backed named Agent owns its child lifecycle.  Stop it
             # while the registration is still reachable so a failed shutdown
             # cannot silently discard the only handle capable of reaping the
             # process.  Shared compatibility aliases have a no-op ``stop``.
             await current.runtime.stop()
             self.registry.unregister(selected, allow_started=True)
+            self._pending_force_delete_reports.pop(selected, None)
             self._active_agent = {key: value for key, value in self._active_agent.items() if value != selected}
             if channel or bot_id or external_user_id:
                 route = getattr(self.store, "set_route", None)
@@ -2775,7 +4206,30 @@ class TaskManager:
                         session_id=session_id or "default",
                         active_agent_id=self.default_agent_id,
                     )
-            return True
+            return result if force else True
+
+    async def force_delete_agent(
+        self,
+        agent_id: str,
+        *,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        session_id: str = "default",
+    ) -> Mapping[str, Any]:
+        """Fail-closed public entry point for `/delagent ... force`."""
+
+        result = await self.delete_agent(
+            agent_id,
+            force=True,
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+            session_id=session_id,
+        )
+        if not isinstance(result, Mapping):
+            raise RuntimeError("durable Agent force deletion returned no report")
+        return result
 
     def _canonical_route_agent(self, agent_id: Any) -> str:
         """Normalize persisted dynamic routes without rewriting static IDs."""
@@ -2790,9 +4244,10 @@ class TaskManager:
     # ------------------------------------------------------------------ routing/front Agent
     def active_agent_for(self, inbound_or_target: Any) -> str:
         self._assert_loop()
-        target = self._coerce_target(_get(inbound_or_target, "reply_target", None))
-        if not target.external_user_id:
-            target = self._coerce_target(inbound_or_target)
+        target = self._routing_target(
+            inbound_or_target,
+            self._reply_target(inbound_or_target),
+        )
         session_id = target.session_id or "default"
         key = (target.channel, target.bot_id, target.external_user_id, session_id)
         return self._active_agent.get(key, self.default_agent_id)
@@ -2800,7 +4255,10 @@ class TaskManager:
     async def _resolve_active_agent(self, inbound_or_target: Any) -> str:
         """Resolve the durable front-Agent route, falling back to local state."""
 
-        target = self._reply_target(inbound_or_target)
+        target = self._routing_target(
+            inbound_or_target,
+            self._reply_target(inbound_or_target),
+        )
         method = getattr(self.store, "get_route", None) or getattr(self.store, "active_agent", None)
         if method is not None and target.external_user_id:
             value = await _call_compatible(
@@ -2879,6 +4337,8 @@ class TaskManager:
                 if result is False:
                     raise RuntimeError("Agent route could not be persisted")
                 self._active_agent[key] = agent_id
+                if needs_reactivation_commit:
+                    self._pending_force_delete_reports.pop(agent_id, None)
                 return result
             if needs_reactivation_commit:
                 raise RuntimeError(
@@ -2907,8 +4367,12 @@ class TaskManager:
             if result is False:
                 raise RuntimeError("Agent route could not be persisted")
             self._active_agent[key] = agent_id
+            if needs_reactivation_commit:
+                self._pending_force_delete_reports.pop(agent_id, None)
             return result
         self._active_agent[key] = agent_id
+        if needs_reactivation_commit:
+            self._pending_force_delete_reports.pop(agent_id, None)
         return agent_id
 
     async def set_active_agent(
@@ -2966,14 +4430,72 @@ class TaskManager:
                         or was_deleted
                     ):
                         raise
+                    log_agent_creation_failed(
+                        logger,
+                        agent_id=agent_id,
+                        phase="route_persistence",
+                        exception=switch_error,
+                    )
                     try:
                         await self._rollback_uncommitted_dynamic_agent(
                             agent_id,
                             retire_durable_profile=True,
                         )
                     except BaseException as cleanup_error:
+                        log_agent_creation_failed(
+                            logger,
+                            agent_id=agent_id,
+                            phase="rollback",
+                            exception=cleanup_error,
+                        )
                         raise cleanup_error from switch_error
                     raise
+
+    async def set_existing_active_agent(
+        self,
+        agent_id: str,
+        *,
+        channel: str = "",
+        bot_id: str = "",
+        external_user_id: str = "",
+        session_id: str = "default",
+    ) -> Any:
+        """Switch only to an already-enabled Agent without creating it.
+
+        This is the restricted channel capability used by ordinary Lark
+        users.  The registry check and durable route commit share the same
+        lifecycle lock as deletion, so a concurrent ``/delagent`` cannot turn
+        an existing-only switch into implicit Agent recreation.
+        """
+
+        self._assert_loop()
+        session_id = session_id or "default"
+        async with self._scope_lock(
+            channel=channel,
+            bot_id=bot_id,
+            external_user_id=external_user_id,
+            session_id=session_id,
+        ):
+            selected = self._canonical_route_agent(agent_id)
+            async with self._dynamic_agent_lock:
+                deleted_reader = getattr(self.store, "is_agent_deleted", None)
+                if deleted_reader is not None and await _call_compatible(
+                    deleted_reader, selected
+                ):
+                    raise KeyError(f"Agent was deleted: {selected}")
+                registration = self.registry.registration(selected)
+                if registration is None:
+                    raise KeyError(f"Agent not found: {selected}")
+                self.registry.require(selected)
+                await self._ensure_selected_process_ready(selected)
+                return await self._commit_active_agent_route_locked(
+                    selected,
+                    was_deleted=False,
+                    channel=channel,
+                    bot_id=bot_id,
+                    external_user_id=external_user_id,
+                    session_id=session_id,
+                )
 
     switch_agent = set_active_agent
     set_agent = set_active_agent
@@ -3097,6 +4619,7 @@ class TaskManager:
         if root_snapshot is None:
             return None
         resolved_target = self._coerce_target(target)
+        resolved_target = self._routing_target(resolved_target, resolved_target)
         if not (
             resolved_target.channel
             and resolved_target.bot_id
@@ -3356,6 +4879,7 @@ class TaskManager:
         """Resolve one canonical future-task role without materializing it."""
 
         target = self._coerce_target(target)
+        target = self._routing_target(target, target)
         getter = getattr(self.store, "get_session_role", None) or getattr(
             self.store, "get_role", None
         )
@@ -3702,6 +5226,7 @@ class TaskManager:
         self, target: ReplyTarget, agent_id: str
     ) -> tuple[str, str]:
         target = self._coerce_target(target)
+        target = self._routing_target(target, target)
         session_id = target.session_id or "default"
         key = (
             target.channel,
@@ -3867,8 +5392,12 @@ class TaskManager:
         conversation_id: str = "",
         reset_thread: bool = False,
     ) -> dict[str, str]:
-        resolved_conversation = conversation_id or self._conversation_id(
-            target, agent_id
+        target = self._routing_target(target, target)
+        resolved_conversation = await self._provider_conversation_id(
+            target,
+            agent_id,
+            conversation_id=conversation_id,
+            strict=False,
         )
         runtime = self.registry.require(agent_id)
 
@@ -4191,6 +5720,7 @@ class TaskManager:
         self, target: ReplyTarget, agent_id: str
     ) -> tuple[str, int] | None:
         target = self._coerce_target(target)
+        target = self._routing_target(target, target)
         session_id = target.session_id or "default"
         key = (
             target.channel,
@@ -4279,6 +5809,7 @@ class TaskManager:
         agent_id: str,
         policy_version: int | None = None,
     ) -> bool:
+        target = self._routing_target(target, target)
         # A trusted startup configuration is durable authorization supplied by
         # the administrator, rather than a user/session selection.  It is
         # scoped to the configured default Agent and exact default execute
@@ -4413,101 +5944,100 @@ class TaskManager:
                 await self.ensure_agent(active)
             active = str(active or self.default_agent_id).strip()
             runtime = self.registry.require(active)
-
-            if conversation_id and not conversation_id_matches(
-                conversation_id,
-                channel,
-                bot_id,
-                external_user_id,
-                session_id,
-                active,
-            ):
-                raise ValueError(
-                    "conversation does not match the selected Agent session"
+            # Lock order matches clear_session and inbound acceptance:
+            # transport scope first, then the proven principal/provider scope.
+            # Two mapped channel accounts have different transport locks but
+            # operate on the same provider thread, so the second lock must span
+            # resolution, the idle check, binding lookup, and native compaction.
+            provider_lock = await self._provider_scope_lock(target, active)
+            async with provider_lock:
+                resolved_conversation = await self._provider_conversation_id(
+                    target,
+                    active,
+                    conversation_id=str(conversation_id or ""),
                 )
-            resolved_conversation = str(
-                conversation_id or self._conversation_id(target, active)
-            )
-            await self._assert_compaction_idle_unlocked(
-                resolved_conversation,
-                active,
-            )
+                await self._assert_compaction_idle_unlocked(
+                    resolved_conversation,
+                    active,
+                )
 
-            selected_mode = await self._get_mode_for_target(target, active)
-            if selected_mode is None:
-                selected_mode = self._default_mode_selection(active)
-            mode_id, policy_version = selected_mode
-            profile_version = self._default_profile_version(active)
-            session_role = await self._session_role_for_target(target, active)
-            model_id, _reasoning_effort = await self._get_model_for_target(
-                target,
-                active,
-            )
-            metadata = self._policy_snapshot(
-                active,
-                mode_id,
-                profile_version,
-                policy_version,
-                actor=actor or external_user_id,
-                explicit=(
-                    mode_id == "execute"
-                    and self._execute_authorized(
-                        target,
-                        active,
-                        policy_version,
+                selected_mode = await self._get_mode_for_target(target, active)
+                if selected_mode is None:
+                    selected_mode = self._default_mode_selection(active)
+                mode_id, policy_version = selected_mode
+                profile_version = self._default_profile_version(active)
+                session_role = await self._session_role_for_target(target, active)
+                model_id, _reasoning_effort = await self._get_model_for_target(
+                    target,
+                    active,
+                )
+                metadata = self._policy_snapshot(
+                    active,
+                    mode_id,
+                    profile_version,
+                    policy_version,
+                    actor=actor or external_user_id,
+                    explicit=(
+                        mode_id == "execute"
+                        and self._execute_authorized(
+                            target,
+                            active,
+                            policy_version,
+                        )
+                    ),
+                )
+                metadata["session_role"] = session_role
+                execution_workspace = await self._execution_workspace_for_target(
+                    target,
+                    active,
+                )
+                if execution_workspace is not None:
+                    metadata[EXECUTION_WORKSPACE_KEY] = execution_workspace
+
+                get_binding = getattr(
+                    self.store, "get_thread_binding", None
+                ) or getattr(self.store, "thread_binding", None)
+                if get_binding is None:
+                    raise AttributeError(
+                        "store does not support durable context bindings"
                     )
-                ),
-            )
-            metadata["session_role"] = session_role
-            execution_workspace = await self._execution_workspace_for_target(
-                target,
-                active,
-            )
-            if execution_workspace is not None:
-                metadata[EXECUTION_WORKSPACE_KEY] = execution_workspace
+                binding = await _call_compatible(
+                    get_binding,
+                    resolved_conversation,
+                    mode_id=mode_id,
+                    profile_version=profile_version,
+                    policy_version=policy_version,
+                    session_role=session_role,
+                )
+                thread_id = str(
+                    _get(binding, "thread_id", binding) or ""
+                ).strip()
+                if not thread_id:
+                    raise RuntimeError(
+                        "cannot compact session: no Codex thread is bound"
+                    )
 
-            get_binding = getattr(
-                self.store, "get_thread_binding", None
-            ) or getattr(self.store, "thread_binding", None)
-            if get_binding is None:
-                raise AttributeError(
-                    "store does not support durable context bindings"
+                compact = getattr(runtime, "compact_session", None) or getattr(
+                    runtime, "compact_conversation", None
                 )
-            binding = await _call_compatible(
-                get_binding,
-                resolved_conversation,
-                mode_id=mode_id,
-                profile_version=profile_version,
-                policy_version=policy_version,
-                session_role=session_role,
-            )
-            thread_id = str(_get(binding, "thread_id", binding) or "").strip()
-            if not thread_id:
-                raise RuntimeError(
-                    "cannot compact session: no Codex thread is bound"
+                if compact is None:
+                    raise AttributeError(
+                        "Agent runtime does not support context compaction"
+                    )
+                result = compact(
+                    resolved_conversation,
+                    mode_id=mode_id,
+                    profile_version=profile_version,
+                    policy_version=policy_version,
+                    session_role=session_role,
+                    thread_id=thread_id,
+                    agent_id=active,
+                    model=model_id,
+                    metadata=metadata,
                 )
-
-            compact = getattr(runtime, "compact_session", None) or getattr(
-                runtime, "compact_conversation", None
-            )
-            if compact is None:
-                raise AttributeError(
-                    "Agent runtime does not support context compaction"
-                )
-            result = compact(
-                resolved_conversation,
-                mode_id=mode_id,
-                profile_version=profile_version,
-                policy_version=policy_version,
-                session_role=session_role,
-                thread_id=thread_id,
-                agent_id=active,
-                model=model_id,
-                metadata=metadata,
-            )
-            if inspect.isawaitable(result):
-                result = await result
-            return result
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
 
     compact_conversation = compact_session
 
@@ -4632,13 +6162,17 @@ class TaskManager:
                 or self.default_agent_id
             ).strip()
             self.registry.require(active)
-            resolved_conversation = str(
-                conversation_id or self._conversation_id(target, active)
-            )
-            return await self._reset_thread_binding_unlocked(
-                resolved_conversation,
-                active,
-            )
+            provider_lock = await self._provider_scope_lock(target, active)
+            async with provider_lock:
+                resolved_conversation = await self._provider_conversation_id(
+                    target,
+                    active,
+                    conversation_id=str(conversation_id or ""),
+                )
+                return await self._reset_thread_binding_unlocked(
+                    resolved_conversation,
+                    active,
+                )
 
     reset_session = clear_session
     clear_conversation = clear_session
@@ -5031,19 +6565,20 @@ class TaskManager:
                     raise PermissionError("Agent bridge requires a running task")
 
             task_target = self._coerce_target(_get(task, "reply_target", None))
+            task_route_target = self._routing_target(task_target, task_target)
             supplied_scope = (channel, bot_id, external_user_id)
             expected_scope = (
-                task_target.channel,
-                task_target.bot_id,
-                task_target.external_user_id,
+                task_route_target.channel,
+                task_route_target.bot_id,
+                task_route_target.external_user_id,
             )
             for supplied, expected in zip(supplied_scope, expected_scope):
                 if supplied and str(supplied) != str(expected or ""):
                     raise PermissionError("task does not belong to this session")
             if (
                 (any(supplied_scope) or (session_id and session_id != "default"))
-                and task_target.session_id
-                and str(session_id or "default") != str(task_target.session_id)
+                and task_route_target.session_id
+                and str(session_id or "default") != str(task_route_target.session_id)
             ):
                 raise PermissionError("task does not belong to this session")
 
@@ -5735,13 +7270,14 @@ class TaskManager:
         target = self._coerce_target(
             reply_target or _get(parent, "reply_target", None)
         )
+        route_target = self._routing_target(target, target)
         policy = await self._collaboration_policy(
             source,
             task_id=parent_task_id,
-            channel=target.channel,
-            bot_id=target.bot_id,
-            external_user_id=target.external_user_id,
-            session_id=target.session_id,
+            channel=route_target.channel,
+            bot_id=route_target.bot_id,
+            external_user_id=route_target.external_user_id,
+            session_id=route_target.session_id,
         )
         depth = int(_get(parent, "child_depth", 0)) + 1
         existing = 0
@@ -5753,10 +7289,10 @@ class TaskManager:
                 inputs,
                 source_agent_id=source,
                 task_id=parent_task_id,
-                channel=target.channel,
-                bot_id=target.bot_id,
-                external_user_id=target.external_user_id,
-                session_id=target.session_id,
+                channel=route_target.channel,
+                bot_id=route_target.bot_id,
+                external_user_id=route_target.external_user_id,
+                session_id=route_target.session_id,
             )
             self.policy_engine.check_child_task(
                 policy,
@@ -5927,16 +7463,15 @@ class TaskManager:
             original_inbound = await _call_compatible(
                 inbound_getter, str(candidate_inbound_id)
             )
-        target = ReplyTarget(
-            channel=str(field("channel", channel)),
-            bot_id=str(field("bot_id", bot_id)),
-            external_user_id=str(field("external_user_id", external_user_id)),
-            session_id=str(field("session_id", session_id) or "default"),
-            source_message_id=str(
-                _get(original_inbound, "external_message_id", "") or ""
-            ),
-            source_sequence=_get(original_inbound, "source_sequence", None),
-            context_token=_get(original_inbound, "context_token", None),
+        target = (
+            self._reply_target(original_inbound)
+            if original_inbound is not None
+            else ReplyTarget(
+                channel=str(field("channel", channel)),
+                bot_id=str(field("bot_id", bot_id)),
+                external_user_id=str(field("external_user_id", external_user_id)),
+                session_id=str(field("session_id", session_id) or "default"),
+            )
         )
         default_mode, default_version = self._default_mode_selection(agent)
         mode_id = str(field("mode_id", default_mode) or default_mode)
@@ -6051,11 +7586,12 @@ class TaskManager:
             if isinstance(metadata, Mapping) and "session_role" in metadata
             else implicit_default_role()
         )
+        route_target = self._routing_target(original_inbound or target, target)
         async with self._scope_lock(
-            channel=target.channel,
-            bot_id=target.bot_id,
-            external_user_id=target.external_user_id,
-            session_id=target.session_id,
+            channel=route_target.channel,
+            bot_id=route_target.bot_id,
+            external_user_id=route_target.external_user_id,
+            session_id=route_target.session_id,
         ):
             task = await self._submit_impl(
                 confirmed_inputs,
@@ -6318,7 +7854,36 @@ class TaskManager:
         if not same_identity("session_id", target.session_id or "default", "default"):
             return None
 
+        stored_message_id = str(_get(existing, "message_id", "") or "").strip()
+        steering_getter = getattr(
+            self.store, "get_task_steering_by_inbound", None
+        )
+        existing_steering = None
+        if steering_getter is not None and stored_message_id:
+            try:
+                existing_steering = await _call_compatible(
+                    steering_getter, stored_message_id
+                )
+            except (AttributeError, TypeError, KeyError, ValueError):
+                return None
         task_id = str(_get(existing, "task_id", "") or "").strip()
+        if existing_steering is not None:
+            steering_inbound_id = str(
+                _get(existing_steering, "inbound_message_id", "") or ""
+            )
+            steering_target_id = str(
+                _get(existing_steering, "promoted_task_id", "")
+                or _get(existing_steering, "target_task_id", "")
+                or ""
+            )
+            if (
+                not stored_message_id
+                or steering_inbound_id != stored_message_id
+                or not steering_target_id
+                or (task_id and task_id != steering_target_id)
+            ):
+                raise PermissionError("inbound replay steering ownership conflicts")
+            task_id = steering_target_id
         if not task_id:
             return None
         task_getter = getattr(self.store, "get_task", None)
@@ -6330,20 +7895,38 @@ class TaskManager:
                 return None
             if existing_task is None:
                 return None
-            linked_inbound = str(
-                _get(existing_task, "inbound_message_id", "") or ""
-            ).strip()
-            stored_message_id = str(_get(existing, "message_id", "") or "").strip()
-            if linked_inbound and stored_message_id and linked_inbound != stored_message_id:
+            if existing_steering is None:
+                linked_inbound = str(
+                    _get(existing_task, "inbound_message_id", "") or ""
+                ).strip()
+                if (
+                    linked_inbound
+                    and stored_message_id
+                    and linked_inbound != stored_message_id
+                ):
+                    return None
+                replay_target = self._coerce_target(
+                    _get(existing_task, "reply_target", None)
+                )
+            else:
+                # The active task intentionally retains the channel that
+                # initiated it.  Validate a steering replay against its own
+                # frozen fallback target, not against that active reply target.
+                replay_target = self._coerce_target(
+                    _get(existing_steering, "reply_target", None)
+                )
+            if (
+                replay_target.external_user_id
+                and replay_target.external_user_id != target.external_user_id
+            ):
                 return None
-            task_target = self._coerce_target(_get(existing_task, "reply_target", None))
-            if task_target.external_user_id and task_target.external_user_id != target.external_user_id:
+            if replay_target.channel and replay_target.channel != target.channel:
                 return None
-            if task_target.channel and task_target.channel != target.channel:
+            if replay_target.bot_id and replay_target.bot_id != target.bot_id:
                 return None
-            if task_target.bot_id and task_target.bot_id != target.bot_id:
-                return None
-            if (task_target.session_id or "default") != (target.session_id or "default"):
+            if (replay_target.session_id or "default") != (
+                target.session_id or "default"
+            ):
                 return None
 
         # Do not pass a live task/skill snapshot: SQLite's duplicate branch
@@ -6365,6 +7948,11 @@ class TaskManager:
         replay_task_id = str(_get(replay_task, "task_id", "") or "").strip()
         if replay_task is not None and replay_task_id and replay_task_id != task_id:
             raise PermissionError("inbound replay returned a foreign task")
+        replay_steering = _get(result, "steering", None)
+        if existing_steering is not None and str(
+            _get(replay_steering, "steering_id", "") or ""
+        ) != str(_get(existing_steering, "steering_id", "") or ""):
+            raise PermissionError("inbound replay returned foreign steering")
         replay_inbound = _get(result, "inbound", result)
         if replay_inbound is not None:
             replay_user = str(_get(replay_inbound, "external_user_id", "") or "")
@@ -6373,6 +7961,7 @@ class TaskManager:
                 raise PermissionError("inbound replay returned a foreign user")
             if replay_session != (target.session_id or "default"):
                 raise PermissionError("inbound replay returned a foreign session")
+        self._notify_task_steering(result)
         self.dispatcher.wake()
         return result
 
@@ -6574,12 +8163,25 @@ class TaskManager:
             # ``message_id`` instead of the canonical reply-target spelling.
             # Preserve that identity so a task can always be delivered after
             # a restart, even when the caller supplied a plain mapping.
-            fields = {name: value.get(name) for name in ReplyTarget.__dataclass_fields__}
+            fields = {
+                name: value[name]
+                for name in ReplyTarget.__dataclass_fields__
+                if name in value
+            }
             if not fields.get("source_message_id"):
                 fields["source_message_id"] = value.get(
                     "external_message_id", value.get("message_id", "")
                 )
             return ReplyTarget(**fields)
+        for converter in ("to_dict", "as_dict"):
+            method = getattr(value, converter, None)
+            if callable(method):
+                try:
+                    converted = method()
+                except TypeError:
+                    converted = None
+                if isinstance(converted, Mapping):
+                    return TaskManager._coerce_target(converted)
         if hasattr(value, "target"):
             target = value.target()
             if target is not value:
@@ -6592,6 +8194,19 @@ class TaskManager:
             source_message_id=_get(value, "source_message_id", _get(value, "message_id", None)),
             source_sequence=_get(value, "source_sequence", None),
             context_token=_get(value, "context_token", None),
+            conversation_subject_id=str(
+                _get(value, "conversation_subject_id", "") or ""
+            ),
+            conversation_subject_scope=str(
+                _get(value, "conversation_subject_scope", "") or ""
+            ),
+            destination_kind=str(_get(value, "destination_kind", "") or ""),
+            destination_id=str(_get(value, "destination_id", "") or ""),
+            thread_id=str(_get(value, "thread_id", "") or ""),
+            root_message_id=str(_get(value, "root_message_id", "") or ""),
+            transport_metadata=dict(
+                _get(value, "transport_metadata", {}) or {}
+            ),
         )
 
     @staticmethod
@@ -6602,14 +8217,104 @@ class TaskManager:
         return TaskManager._coerce_target(inbound)
 
     @staticmethod
+    def _routing_target(inbound: Any, target: ReplyTarget | None = None) -> ReplyTarget:
+        """Project an inbound actor/destination onto its local state owner.
+
+        Direct chats deliberately retain the historical external-user key.
+        Group roots and topic threads use the authenticated bot-local
+        conversation subject instead, while the original ``ReplyTarget`` is
+        kept unchanged on the task for exact outbound delivery.
+        """
+
+        resolved = target or TaskManager._reply_target(inbound)
+        subject_scope = str(
+            _get(inbound, "conversation_subject_scope", "")
+            or resolved.conversation_subject_scope
+            or ""
+        ).strip()
+        if not subject_scope:
+            identity = _get(inbound, "identity_snapshot", {})
+            if isinstance(identity, Mapping):
+                subject = identity.get("conversation_subject", {})
+                if isinstance(subject, Mapping):
+                    subject_scope = str(subject.get("scope_key", "") or "").strip()
+        # Direct subjects intentionally use the same scope key as the actor,
+        # so this replacement is also byte-for-byte compatible with WeChat.
+        if subject_scope:
+            return replace(resolved, external_user_id=subject_scope)
+        return resolved
+
+    @staticmethod
     def _conversation_id(target: ReplyTarget, agent_id: str) -> str:
         return conversation_id(
             target.channel,
             target.bot_id,
-            target.external_user_id,
+            _routing_external_user_id(target),
             target.session_id,
             agent_id,
         )
+
+    async def _provider_conversation_id(
+        self,
+        target: ReplyTarget,
+        agent_id: str,
+        *,
+        conversation_id: str = "",
+        strict: bool = True,
+    ) -> str:
+        """Resolve a transport alias to a store-proven history anchor.
+
+        The returned value is used only for provider continuity and related
+        controls.  Delivery continues to use the immutable task-local
+        ``ReplyTarget`` captured from the initiating channel.
+        """
+
+        route_target = self._routing_target(target, target)
+        local = self._conversation_id(route_target, agent_id)
+        requested = str(conversation_id or "").strip() or local
+        resolver = getattr(
+            self.store,
+            "resolve_principal_conversation",
+            None,
+        )
+        if (
+            resolver is not None
+            and route_target.channel
+            and route_target.bot_id
+            and route_target.external_user_id
+        ):
+            try:
+                return str(
+                    await _call_compatible(
+                        resolver,
+                        requested,
+                        channel=route_target.channel,
+                        bot_id=route_target.bot_id,
+                        external_user_id=route_target.external_user_id,
+                        session_id=route_target.session_id,
+                        agent_id=agent_id,
+                    )
+                )
+            except (StoreError, ValueError) as exc:
+                if not strict:
+                    return local
+                raise ValueError(
+                    "conversation does not match the selected Agent session"
+                ) from exc
+        if not conversation_id_matches(
+            requested,
+            route_target.channel,
+            route_target.bot_id,
+            route_target.external_user_id,
+            route_target.session_id,
+            agent_id,
+        ):
+            if not strict:
+                return local
+            raise ValueError(
+                "conversation does not match the selected Agent session"
+            )
+        return requested
 
     def submit_threadsafe(self, coroutine: Any, *, timeout: float | None = None) -> Any:
         """Submit a manager coroutine from a gateway thread.

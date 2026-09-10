@@ -1,12 +1,12 @@
-"""Durable bridge between one real WeChat account and process-isolated Agents.
+"""Durable bridge between peer channel accounts and process-isolated Agents.
 
-The supervisor owns WeChat, SQLite, routing, and delivery. Its background
-asyncio loop hosts only orchestration and one ``ProcessAgentRuntime`` proxy per
-enabled Agent; every proxy starts a persistent child process containing that
-Agent's private ``CodexRuntime``, SDK client, event loop, and thread state.
-Monitor worker threads submit channel work to the supervisor loop with
-``asyncio.run_coroutine_threadsafe``. Agent turns then cross the private IPC
-boundary and never execute in the supervisor process.
+The supervisor owns WeChat plus every enabled Lark/Feishu bot account, SQLite,
+routing, and delivery. Its background asyncio loop hosts only orchestration and
+one ``ProcessAgentRuntime`` proxy per enabled Agent; every proxy starts a
+persistent child process containing that Agent's private ``CodexRuntime``, SDK
+client, event loop, and thread state. Monitor worker threads and account-local
+Lark consumers submit channel work to the supervisor loop. Agent turns then
+cross the private IPC boundary and never execute in the supervisor process.
 
 Usage:
     python src/codex_wechat_bot.py
@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -31,7 +32,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import qrcode
 
@@ -62,8 +63,10 @@ from src.runtime.supervisor import (  # noqa: E402
     ChannelAccountOwnership,
     CredentialMutationOwnership,
     SupervisorOwnership,
+    SupervisorAccountSetOwnership,
     SupervisorResourcesStillLive,
 )
+from src.runtime.identity import PrincipalResolver  # noqa: E402
 from src.runtime.shell import run_bounded_shell_process  # noqa: E402
 from src.runtime.worker import AgentMailboxSupervisor, _mailbox_result_content  # noqa: E402
 from src.channels.wechat import (  # noqa: E402
@@ -75,6 +78,14 @@ from src.channels.wechat import (  # noqa: E402
     _format_shell_markdown as _format_bounded_shell_markdown,
     send_media_delivery,
 )
+from src.channels.lark import (  # noqa: E402
+    LarkBotProfile,
+    LarkCliProcess,
+    LarkPermanentDeliveryError,
+)
+from src.lark_chat_onboarding import LarkChatOnboardingService  # noqa: E402
+from src.lark_cli import lark_config_root, lark_onboarding_timeout  # noqa: E402
+from src.lark_runtime_accounts import LarkRuntimeAccountController  # noqa: E402
 from src.runtime.skills import (  # noqa: E402
     SkillSyntaxError,
     find_skill,
@@ -140,7 +151,7 @@ HELP_TEXT = """## Commands
 - `/report <message>` - Record an operator report in the persistent log
 
 -### Models And Sessions
-- `/model [<model-id> <effort|default>|effort <effort|default>]` - Show or set the model and reasoning effort
+- `/model [<model-id> [<effort|default>]|effort <effort|default>]` - Show or set the model and reasoning effort
 - `/models` - List available models and reasoning levels
 - `/session [id]` - Switch to or create a session
 - `/sessions` - List your sessions
@@ -157,7 +168,7 @@ HELP_TEXT = """## Commands
 _MAX_SHELL_OUTPUT = 6000
 _SHELL_TIMEOUT = 30
 _CODEX_TASK_TIMEOUT = None
-_DEFAULT_MAX_AGENT_PROCESSES = 16
+_DEFAULT_MAX_AGENT_PROCESSES = 32
 # The durable bot's operating mode is administrator-selected at startup.  A
 # new immutable profile version avoids conflicting with databases seeded by
 # earlier releases whose Codex profile defaulted to read-only ``chat``.
@@ -218,9 +229,9 @@ def _parse_model_command(argument: str) -> tuple[str, str, str]:
         if len(parts) != 2:
             raise ValueError("usage: /model effort <effort|default>")
         return "set-effort", "", parts[1]
-    if len(parts) != 2:
-        raise ValueError("usage: /model <model-id> <effort>")
-    return "set-model", parts[0], parts[1]
+    if len(parts) > 2:
+        raise ValueError("usage: /model <model-id> [<effort|default>]")
+    return "set-model", parts[0], parts[1] if len(parts) == 2 else "default"
 
 
 def _is_command(text: str) -> bool:
@@ -307,7 +318,7 @@ def _format_models(
                 )
         suffix = f" [{', '.join(details)}]" if details else ""
         lines.append(f"  reasoning: {efforts}{suffix}")
-    lines.append("use /model <model-id> <effort> to switch")
+    lines.append("use /model <model-id> [<effort|default>] to switch")
     return "\n".join(lines)
 
 
@@ -1345,7 +1356,8 @@ def _durable_main() -> None:
         return
 
     database = _durable_database()
-    ownership: SupervisorOwnership | None = None
+    ownership: SupervisorOwnership | SupervisorAccountSetOwnership | None = None
+    lark_profiles: tuple[dict[str, Any], ...] = ()
     try:
         # This is the one global lock order: credential mutation, then the
         # database/account pair.  Credential discovery and QR authentication
@@ -1354,11 +1366,10 @@ def _durable_main() -> None:
         # owned.
         with CredentialMutationOwnership(accounts_dir()):
             credentials, should_save = _load_or_authenticate_credentials()
-            ownership = SupervisorOwnership(
+            ownership, lark_profiles = _acquire_runtime_ownership(
                 database,
-                channel="wechat",
-                bot_id=credentials.ilink_bot_id,
-            ).acquire()
+                wechat_bot_id=credentials.ilink_bot_id,
+            )
             if should_save:
                 save_credentials(credentials)
                 logger.info("login successful, credentials saved")
@@ -1371,11 +1382,21 @@ def _durable_main() -> None:
     with ownership:
         wechat_client = Client(credentials)
         try:
-            _run_owned_durable(
-                wechat_client,
-                database=database,
-                ownership=ownership,
-            )
+            if lark_profiles:
+                _run_owned_durable(
+                    wechat_client,
+                    database=database,
+                    ownership=ownership,
+                    lark_profiles=lark_profiles,
+                )
+            else:
+                # Preserve the compatibility call shape for existing launch
+                # wrappers and deployments with no configured Lark account.
+                _run_owned_durable(
+                    wechat_client,
+                    database=database,
+                    ownership=ownership,
+                )
         except SupervisorResourcesStillLive:
             # The live loop may still be using both SQLite and the HTTP client.
             # Let SupervisorOwnership retain both locks until process exit.
@@ -1396,6 +1417,387 @@ def _durable_database() -> Path:
             str(Path.home() / ".codex-wechat-bot" / "runtime.sqlite3"),
         )
     ).expanduser().resolve()
+
+
+def _configured_lark_profiles(database: Path) -> tuple[dict[str, Any], ...]:
+    """Read enabled Lark account identities before acquiring the lock set.
+
+    This is a read-only bootstrap discovery, not a second runtime store.  The
+    returned account set is immediately protected by the database plus sorted
+    account locks before SQLiteStore opens or performs recovery.  Older and
+    fresh databases simply have no profile table and retain the exact legacy
+    WeChat startup path.
+    """
+
+    if not database.exists():
+        return ()
+    if not database.is_file():
+        raise RuntimeError("runtime database path is not a regular file")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"{database.as_uri()}?mode=ro",
+            uri=True,
+            timeout=1.0,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        migration_table = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='schema_migrations'"
+        ).fetchone()
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bot_profiles'"
+        ).fetchone()
+        latest = (
+            int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+                ).fetchone()[0]
+                or 0
+            )
+            if migration_table is not None
+            else 0
+        )
+        if table is None:
+            # A database predating the Lark migration is a valid WeChat-only
+            # bootstrap and will be migrated after ownership is acquired.  A
+            # database claiming schema v36 without the table is corrupt and
+            # must never silently start without its configured accounts.
+            if migration_table is not None:
+                if latest >= 36:
+                    raise RuntimeError(
+                        "runtime database schema v36 is missing bot_profiles"
+                    )
+            return ()
+        if migration_table is None or latest < 36:
+            raise RuntimeError(
+                "runtime database has an incomplete Lark bot-profile migration"
+            )
+        status_table = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='bot_profile_status'"
+        ).fetchone()
+        if status_table is None:
+            raise RuntimeError(
+                "runtime database schema v36 is missing bot_profile_status"
+            )
+        rows = connection.execute(
+            """SELECT profile_id, bot_id, brand, config_dir, cli_version,
+                      enabled, mention_policy, access_policy,
+                      restart_policy_json
+                 FROM bot_profiles
+                WHERE channel='lark' AND enabled=1 AND removed_at IS NULL
+                ORDER BY profile_id"""
+        ).fetchall()
+        profiles: list[dict[str, Any]] = []
+        config_directories: set[str] = set()
+        for row in rows:
+            try:
+                restart_policy = json.loads(row["restart_policy_json"] or "{}")
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "Lark bot profile has malformed restart policy JSON"
+                ) from exc
+            value = {
+                    "profile_id": str(row["profile_id"]),
+                    "app_id": str(row["bot_id"]),
+                    "brand": str(row["brand"]),
+                    "config_dir": str(row["config_dir"]),
+                    "cli_version": str(row["cli_version"]),
+                    "enabled": bool(row["enabled"]),
+                    "mention_policy": str(row["mention_policy"]),
+                    "access_policy": str(row["access_policy"]),
+                    "restart_policy": restart_policy,
+                }
+            # Apply the adapter's full non-secret profile validation before an
+            # account identity can influence the ownership lock set.
+            profile = LarkBotProfile.from_value(value)
+            config_directory = str(profile.config_dir)
+            if config_directory in config_directories:
+                raise RuntimeError(
+                    "enabled Lark bot profiles reuse one CLI config directory"
+                )
+            config_directories.add(config_directory)
+            profiles.append(value | {"app_id": profile.app_id})
+        if len({profile["app_id"] for profile in profiles}) != len(profiles):
+            raise RuntimeError("duplicate enabled Lark app IDs in bot profiles")
+        return tuple(profiles)
+    except sqlite3.Error as exc:
+        raise RuntimeError("could not read Lark profiles from runtime database") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _lark_profile_lock_signature(
+    profiles: tuple[dict[str, Any], ...],
+) -> tuple[tuple[str, str], ...]:
+    """Return every field whose change requires a fresh account composition."""
+
+    return tuple(
+        sorted(
+            (
+                str(profile.get("profile_id") or ""),
+                json.dumps(profile, sort_keys=True, separators=(",", ":")),
+            )
+            for profile in profiles
+        )
+    )
+
+
+def _acquire_runtime_ownership(
+    database: Path,
+    *,
+    wechat_bot_id: str,
+    max_discovery_attempts: int = 32,
+) -> tuple[
+    SupervisorOwnership | SupervisorAccountSetOwnership,
+    tuple[dict[str, Any], ...],
+]:
+    """Atomically converge profile discovery with the sorted account lock set.
+
+    Profile onboarding commits under the database lock.  Discovery must occur
+    before that lock is available so the required account locks are known, then
+    be repeated while the database lock is held.  A mutation can win between
+    any release/reacquire pair, so convergence is a bounded loop rather than a
+    one-shot retry.
+    """
+
+    profiles = _configured_lark_profiles(database)
+    for _attempt in range(max(1, int(max_discovery_attempts))):
+        if profiles:
+            candidate: SupervisorOwnership | SupervisorAccountSetOwnership = (
+                SupervisorAccountSetOwnership(
+                    database,
+                    accounts=(
+                        ("wechat", wechat_bot_id),
+                        *(("lark", profile["app_id"]) for profile in profiles),
+                    ),
+                )
+            )
+        else:
+            candidate = SupervisorOwnership(
+                database,
+                channel="wechat",
+                bot_id=wechat_bot_id,
+            )
+        candidate.acquire()
+        try:
+            confirmed = _configured_lark_profiles(database)
+            if _lark_profile_lock_signature(confirmed) == _lark_profile_lock_signature(
+                profiles
+            ):
+                return candidate, confirmed
+        except BaseException:
+            candidate.close()
+            raise
+        candidate.close()
+        profiles = confirmed
+    raise RuntimeError(
+        "Lark bot profiles changed repeatedly during startup; retry when onboarding is idle"
+    )
+
+
+def _build_lark_media_callbacks(
+    attachment_store: AttachmentStore,
+    client: LarkCliProcess,
+) -> tuple[Any, Any, Any]:
+    """Bind one Lark CLI to the shared managed-attachment authority.
+
+    SQLite owns durable references and delivery state, while ``AttachmentStore``
+    revalidates the immutable path/checksum/size immediately before upload.  A
+    raw path read from the metadata database must never bypass that filesystem
+    fence.
+    """
+
+    async def upload_lark_media(row: Any) -> Any:
+        attachment_id = str(getattr(row, "attachment_id", "") or "")
+        try:
+            attachment = await attachment_store.aget(attachment_id)
+            payload = await attachment_store.aread_bytes(attachment_id)
+        except Exception as exc:
+            raise LarkPermanentDeliveryError(
+                "managed Lark attachment is unavailable"
+            ) from exc
+        metadata = getattr(row, "metadata", {}) or {}
+        kind = str(
+            metadata.get("kind") if isinstance(metadata, Mapping) else ""
+        ).lower() or (
+            "image"
+            if str(attachment.mime_type).startswith("image/")
+            else "file"
+        )
+        suffix = Path(str(attachment.filename or attachment.path)).suffix
+        try:
+            temporary = tempfile.TemporaryDirectory(prefix="codex-lark-upload-")
+        except Exception as exc:
+            raise LarkPermanentDeliveryError(
+                "managed Lark attachment snapshot is unavailable"
+            ) from exc
+        with temporary as directory:
+            try:
+                descriptor, snapshot_value = tempfile.mkstemp(
+                    prefix="attachment-",
+                    suffix=suffix,
+                    dir=directory,
+                )
+                snapshot = Path(snapshot_value)
+                try:
+                    handle = os.fdopen(descriptor, "wb")
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+                with handle:
+                    handle.write(payload)
+                    handle.flush()
+            except Exception as exc:
+                raise LarkPermanentDeliveryError(
+                    "managed Lark attachment snapshot is unavailable"
+                ) from exc
+            return await client.upload_media(
+                snapshot,
+                kind=kind,
+                filename=attachment.filename,
+                mime_type=attachment.mime_type,
+            )
+
+    async def send_lark_media(row: Any, uploaded: Any) -> Any:
+        remote_id = str(
+            (
+                uploaded.get("remote_id", "")
+                if isinstance(uploaded, Mapping)
+                else getattr(uploaded, "remote_id", "")
+            )
+            or ""
+        )
+        metadata = getattr(row, "metadata", {}) or {}
+        kind = str(
+            (
+                uploaded.get("kind", "")
+                if isinstance(uploaded, Mapping)
+                else getattr(uploaded, "kind", "")
+            )
+            or (
+                metadata.get("kind", "")
+                if isinstance(metadata, Mapping)
+                else ""
+            )
+            or "file"
+        )
+        return await client.send_media(
+            getattr(row, "reply_target", {}),
+            remote_id,
+            kind=kind,
+            idempotency_key=str(getattr(row, "idempotency_key", "") or ""),
+        )
+
+    async def send_lark_bundle_text(row: Any) -> Any:
+        return await client.send_text(
+            getattr(row, "reply_target", {}),
+            str(getattr(row, "content", "") or ""),
+            idempotency_key=str(
+                getattr(row, "text_idempotency_key", "") or ""
+            ),
+        )
+
+    return upload_lark_media, send_lark_media, send_lark_bundle_text
+
+
+def _build_lark_runtime_composition(
+    *,
+    store: SQLiteStore | Any,
+    manager: TaskManager | Any,
+    attachment_store: AttachmentStore | Any,
+    ownership: SupervisorOwnership | SupervisorAccountSetOwnership | Any,
+    principal_resolver: PrincipalResolver | Any,
+    administrator: Any,
+    executable: str,
+    shell_cwd: Path,
+) -> tuple[LarkRuntimeAccountController, LarkChatOnboardingService]:
+    """Build one shared live-account registry and owner onboarding service.
+
+    Gateways for both startup profiles and profiles added later resolve the
+    service through the same holder.  Construction itself starts no subprocess
+    or worker, so the caller can install both lifecycle references before the
+    first account is prepared.
+    """
+
+    service_holder: dict[str, LarkChatOnboardingService] = {}
+    controller = LarkRuntimeAccountController(
+        store,
+        manager,
+        principal_resolver,
+        attachment_store,
+        ownership,
+        executable=executable,
+        administrator=administrator,
+        onboarding_service_factory=lambda _profile: service_holder["service"],
+        media_callbacks_factory=_build_lark_media_callbacks,
+        shell_cwd=shell_cwd,
+    )
+    service = LarkChatOnboardingService(
+        store=store,
+        manager=manager,
+        attachment_store=attachment_store,
+        account_controller=controller,
+        ownership=ownership,
+        principal_resolver=principal_resolver,
+        config_root=lark_config_root(),
+        binary=executable,
+        timeout=lark_onboarding_timeout(),
+    )
+    service_holder["service"] = service
+    return controller, service
+
+
+async def _stop_lark_runtime_composition(
+    onboarding_service: LarkChatOnboardingService | Any | None,
+    account_controller: LarkRuntimeAccountController | Any | None,
+) -> None:
+    """Drain credential transactions before stopping account-local workers."""
+
+    errors: list[BaseException] = []
+    for label, resource, method_name in (
+        ("Lark chat onboarding", onboarding_service, "stop"),
+        ("Lark account controller", account_controller, "stop_all"),
+    ):
+        if resource is None:
+            continue
+        try:
+            await getattr(resource, method_name)()
+        except BaseException as exc:
+            errors.append(exc)
+            logger.debug("failed to stop %s", label, exc_info=True)
+    if errors:
+        raise errors[0]
+
+
+async def _start_configured_lark_accounts(
+    account_controller: LarkRuntimeAccountController | Any,
+    profiles: tuple[dict[str, Any], ...],
+) -> tuple[Any, ...]:
+    """Preflight the complete startup set before exposing any Lark ingress."""
+
+    prepared = []
+    for profile_value in profiles:
+        prepared.append(
+            await account_controller.prepare(
+                LarkBotProfile.from_value(profile_value),
+                acquire_ownership=False,
+                preflight=True,
+            )
+        )
+    results = await asyncio.gather(
+        *(account_controller.activate(handle) for handle in prepared),
+        return_exceptions=True,
+    )
+    failures = tuple(
+        result for result in results if isinstance(result, BaseException)
+    )
+    if failures:
+        raise failures[0]
+    return tuple(results)
 
 
 def _positive_environment_integer(name: str, default: int) -> int:
@@ -1575,12 +1977,17 @@ def _run_owned_durable(
     wechat_client: Client,
     *,
     database: Path,
-    ownership: SupervisorOwnership,
+    ownership: SupervisorOwnership | SupervisorAccountSetOwnership,
+    lark_profiles: tuple[dict[str, Any], ...] = (),
 ) -> None:
     """Run only after both supervisor ownership locks are held."""
 
     if not ownership.held:
         raise RuntimeError("durable runtime requires supervisor ownership")
+    ownership_channel = str(getattr(ownership, "channel", "wechat") or "wechat")
+    ownership_bot_id = str(
+        getattr(ownership, "bot_id", getattr(wechat_client, "bot_id", "")) or ""
+    )
     agent_socket = Path(
         os.environ.get(
             "CODEX_WECHAT_AGENT_SOCKET",
@@ -1623,6 +2030,12 @@ def _run_owned_durable(
     max_global_queue = _positive_environment_integer(
         "CODEX_WECHAT_MAX_GLOBAL_QUEUE", DEFAULT_MAX_GLOBAL_AGENT_QUEUE
     )
+    max_account_queue = _positive_environment_integer(
+        "CODEX_WECHAT_MAX_ACCOUNT_QUEUE", max_global_queue
+    )
+    max_account_agent_queue = _positive_environment_integer(
+        "CODEX_WECHAT_MAX_ACCOUNT_AGENT_QUEUE", max_agent_queue
+    )
     mailbox_ttl_seconds = _nonnegative_environment_number(
         "CODEX_WECHAT_MAILBOX_TTL", DEFAULT_MAILBOX_TTL_SECONDS
     )
@@ -1639,7 +2052,16 @@ def _run_owned_durable(
             "CODEX_WECHAT_MAX_AGENT_QUEUE cannot exceed "
             "CODEX_WECHAT_MAX_GLOBAL_QUEUE"
         )
-
+    if max_account_queue > max_global_queue:
+        raise RuntimeError(
+            "CODEX_WECHAT_MAX_ACCOUNT_QUEUE cannot exceed "
+            "CODEX_WECHAT_MAX_GLOBAL_QUEUE"
+        )
+    if max_account_agent_queue > max_agent_queue:
+        raise RuntimeError(
+            "CODEX_WECHAT_MAX_ACCOUNT_AGENT_QUEUE cannot exceed "
+            "CODEX_WECHAT_MAX_AGENT_QUEUE"
+        )
     # Validate/create local configuration before starting the loop.  If this
     # fails (for example, an unwritable attachment directory), there is no
     # background thread to leak.
@@ -1656,11 +2078,14 @@ def _run_owned_durable(
     delivery_future: Any | None = None
     media_future: Any | None = None
     mailbox_future: Any | None = None
+    lark_account_controller: LarkRuntimeAccountController | None = None
+    lark_onboarding_service: LarkChatOnboardingService | None = None
     monitor: Monitor | None = None
 
     async def setup() -> None:
         nonlocal store, manager, delivery_worker, media_worker
         nonlocal mailbox_supervisor, agent_bridge
+        nonlocal lark_account_controller, lark_onboarding_service
         # Keep SQLite attachment metadata and the managed filesystem under
         # the same canonical root.  Without this, ``register_attachment``
         # cannot enforce the configured path boundary after a restart.
@@ -1669,6 +2094,8 @@ def _run_owned_durable(
             attachment_root=managed_root,
             max_agent_queue=max_agent_queue,
             max_global_queue=max_global_queue,
+            max_account_queue=max_account_queue,
+            max_account_agent_queue=max_account_agent_queue,
             mailbox_ttl_seconds=mailbox_ttl_seconds,
             reply_aggregation_max_age_seconds=(
                 reply_aggregation_max_age_seconds
@@ -1681,15 +2108,50 @@ def _run_owned_durable(
             await store.initialize(recover_startup_state=False)
             epoch = await store.activate_supervisor_epoch(
                 owner_instance_id=ownership.owner_instance_id,
-                channel=ownership.channel,
-                bot_id=ownership.bot_id,
+                channel=ownership_channel,
+                bot_id=ownership_bot_id,
             )
             logger.info(
                 "activated supervisor epoch %s for %s/%s",
                 epoch.epoch,
-                ownership.channel,
-                ownership.bot_id,
+                ownership_channel,
+                ownership_bot_id,
             )
+            auto_mapping_results = await store.auto_map_owner_principal_accounts(
+                accounts=(
+                    ("wechat", wechat_client.bot_id),
+                    *(
+                        ("lark", str(profile["app_id"]))
+                        for profile in lark_profiles
+                    ),
+                )
+            )
+            for mapping_result in auto_mapping_results:
+                outcome = str(mapping_result["outcome"])
+                if outcome == "mapped":
+                    logger.info(
+                        "auto-mapped owner principal for %s/%s "
+                        "identifier_kind=%s",
+                        mapping_result["channel"],
+                        mapping_result["bot_id"],
+                        mapping_result["identifier_kind"],
+                    )
+                elif outcome in {"no_senders", "multiple_senders"}:
+                    logger.info(
+                        "skipped owner principal auto-map for %s/%s: %s "
+                        "(sender_count=%s)",
+                        mapping_result["channel"],
+                        mapping_result["bot_id"],
+                        outcome,
+                        mapping_result["sender_count"],
+                    )
+                else:
+                    logger.info(
+                        "owner principal auto-map unchanged for %s/%s: %s",
+                        mapping_result["channel"],
+                        mapping_result["bot_id"],
+                        outcome,
+                    )
             # SQLite owns attachment references across process restarts.  The
             # async cleanup boundary must consult that durable source before
             # removing a file; a process-local AttachmentStore ref map is only
@@ -1819,11 +2281,49 @@ def _run_owned_durable(
             manager.set_mailbox_cancel_handler(
                 mailbox_supervisor.request_cancel
             )
+
+            if lark_profiles:
+                principal_resolver = PrincipalResolver(store)
+                administrator_ids = frozenset(
+                    value.strip()
+                    for value in os.environ.get(
+                        "CODEX_LARK_ADMIN_PRINCIPALS", ""
+                    ).split(",")
+                    if value.strip()
+                )
+                lark_executable = os.environ.get("CODEX_LARK_CLI", "lark-cli")
+                administrator = lambda envelope, allowed=administrator_ids: (
+                    bool(envelope.principal_id)
+                    and envelope.principal_id in allowed
+                )
+                (
+                    lark_account_controller,
+                    lark_onboarding_service,
+                ) = _build_lark_runtime_composition(
+                    store=store,
+                    manager=manager,
+                    attachment_store=attachment_store,
+                    ownership=ownership,
+                    principal_resolver=principal_resolver,
+                    administrator=administrator,
+                    executable=lark_executable,
+                    shell_cwd=workspace_path,
+                )
         except BaseException:
             # ``TaskManager.start`` rolls back workers, but a failure during
             # store initialization or registry startup can happen before its
             # normal started flag is set.  Close both lifecycle boundaries
             # here; their stop/close methods are idempotent.
+            try:
+                await _stop_lark_runtime_composition(
+                    lark_onboarding_service,
+                    lark_account_controller,
+                )
+            except BaseException:
+                logger.debug(
+                    "failed to clean up Lark accounts after startup error",
+                    exc_info=True,
+                )
             try:
                 await _stop_runtime_boundaries(
                     agent_bridge=agent_bridge,
@@ -1895,10 +2395,38 @@ def _run_owned_durable(
         mailbox_future = asyncio.run_coroutine_threadsafe(
             mailbox_supervisor.run(), agent_loop.loop
         )
+        if lark_profiles:
+            assert lark_account_controller is not None
+            # Shared runtime/mailbox and WeChat delivery are live before any
+            # account-local Lark ingress.  All startup Lark profiles still pass
+            # preflight before the first consumer is exposed.
+            lark_startup_timeout = 60 + 120 * len(lark_profiles)
+            agent_loop.run_coro(
+                _start_configured_lark_accounts(
+                    lark_account_controller,
+                    lark_profiles,
+                ),
+                timeout=lark_startup_timeout,
+            )
     except BaseException:
         # ``setup`` handles failures inside manager.start.  This path covers
         # loop, gateway, monitor, and delivery-task startup.
         cleanup_errors: list[BaseException] = []
+        if loop_started:
+            try:
+                agent_loop.run_coro(
+                    _stop_lark_runtime_composition(
+                        lark_onboarding_service,
+                        lark_account_controller,
+                    ),
+                    timeout=30,
+                )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                logger.debug(
+                    "failed to stop Lark runtime during startup rollback",
+                    exc_info=True,
+                )
         for worker in (delivery_worker, media_worker):
             if worker is not None:
                 try:
@@ -1929,7 +2457,11 @@ def _run_owned_durable(
                 )
         auxiliary_futures = [
             future
-            for future in (delivery_future, media_future, mailbox_future)
+            for future in (
+                delivery_future,
+                media_future,
+                mailbox_future,
+            )
             if future is not None
         ]
         for future in auxiliary_futures:
@@ -2034,6 +2566,17 @@ def _run_owned_durable(
             assert media_worker is not None
             assert delivery_future is not None
             errors: list[BaseException] = []
+            # A chat onboarding transaction may own a staged credential tree
+            # and a newly acquired account lock.  Drain it before stopping the
+            # shared controller, which then fences every Lark ingress and
+            # account-local delivery worker without disturbing WeChat.
+            try:
+                await _stop_lark_runtime_composition(
+                    lark_onboarding_service,
+                    lark_account_controller,
+                )
+            except BaseException as exc:
+                errors.append(exc)
             for label, worker in (
                 ("delivery worker", delivery_worker),
                 ("media worker", media_worker),
@@ -2055,7 +2598,11 @@ def _run_owned_durable(
             # durable failure/sent state.
             auxiliary_futures = [
                 future
-                for future in (delivery_future, media_future, mailbox_future)
+                for future in (
+                    delivery_future,
+                    media_future,
+                    mailbox_future,
+                )
                 if future is not None
             ]
             for future in auxiliary_futures:

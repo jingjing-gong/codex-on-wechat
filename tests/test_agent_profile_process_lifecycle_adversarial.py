@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +85,7 @@ def _process_budget(manager: TaskManager) -> Any:
 def test_real_start_and_capacity_failures_are_atomic_and_reusable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def scenario() -> None:
         config_home = tmp_path / "codex-home"
@@ -131,9 +134,10 @@ def test_real_start_and_capacity_failures_are_atomic_and_reusable(
             assert budget.active == 2
             assert _process_runtime(manager, "survivor").health == "ready"
 
+            caplog.set_level(logging.ERROR, logger="src.runtime.manager")
             with pytest.raises(ProcessAgentCapacityError):
                 await manager.set_active_agent(
-                    "saturated",
+                    "astra",
                     codex_config_profile="qwen",
                     channel="wechat",
                     bot_id="bot",
@@ -141,14 +145,28 @@ def test_real_start_and_capacity_failures_are_atomic_and_reusable(
                     session_id="default",
                 )
             assert budget.active == 2
-            assert manager.registry.registration("saturated") is None
-            assert await manager.store.get_profile("saturated", 1) is None
+            assert manager.registry.registration("astra") is None
+            assert await manager.store.get_profile("astra", 1) is None
             assert await manager.store.get_route(
                 channel="wechat",
                 bot_id="bot",
                 external_user_id="capacity-failure",
                 session_id="default",
             ) == "codex"
+            failure_records = [
+                record
+                for record in caplog.records
+                if record.getMessage().startswith("agent_creation_failed ")
+                and '"agent_id":"astra"' in record.getMessage()
+            ]
+            assert len(failure_records) == 1
+            _, encoded = failure_records[0].getMessage().split(" ", 1)
+            assert json.loads(encoded) == {
+                "agent_id": "astra",
+                "exception": "Agent process limit reached (2)",
+                "exception_type": "ProcessAgentCapacityError",
+                "phase": "runtime_start",
+            }
 
             assert await manager.delete_agent("survivor")
             assert budget.active == 1

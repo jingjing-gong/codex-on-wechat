@@ -157,7 +157,7 @@ def test_v28_migrates_expiry_and_seeds_append_only_invocation_history(tmp_path):
                 "WHERE work_kind='mailbox'"
             )
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (28, 29, 30, 31, 32, 33, 34, 35)"
+                "DELETE FROM schema_migrations WHERE version IN (28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41)"
             )
             connection.commit()
 
@@ -198,7 +198,7 @@ def test_v28_migrates_expiry_and_seeds_append_only_invocation_history(tmp_path):
                 },
                 allow_deferred_startup=True,
             )
-            assert facts["version"] == 35
+            assert facts["version"] == 41
             assert facts["mailbox_expiry"] == facts["invocation_expiry"]
             assert facts["mailbox_expiry"] == (
                 BASE + timedelta(days=1)

@@ -158,6 +158,18 @@ class ExecutionState(StrEnum):
     ORPHANED = "orphaned"
 
 
+class TaskSteeringState(StrEnum):
+    """Durable delivery state for input absorbed by an active task."""
+
+    PENDING = "pending"
+    DELIVERING = "delivering"
+    APPLIED = "applied"
+    PROMOTED = "promoted"
+    # The runner may have accepted the input before its process/IPC response
+    # was lost.  Such rows must never be retried or promoted automatically.
+    DELIVERY_UNKNOWN = "delivery_unknown"
+
+
 class EventVisibility(StrEnum):
     INTERNAL = "internal"
     USER = "user"
@@ -184,6 +196,15 @@ class OutboxState(StrEnum):
     RETRY_WAIT = "retry_wait"
     FAILED_PERMANENT = "failed_permanent"
     DELIVERY_UNKNOWN = "delivery_unknown"
+
+
+class DeliveryOutcome(StrEnum):
+    """Transport-neutral result of one externally visible delivery attempt."""
+
+    SENT = "sent"
+    RETRYABLE_FAILURE = "retryable_failure"
+    PERMANENT_FAILURE = "permanent_failure"
+    UNKNOWN = "unknown"
 
 
 class ReplyFragmentState(StrEnum):
@@ -341,6 +362,121 @@ class MediaDeliveryState(StrEnum):
 
 
 @dataclass(frozen=True)
+class DeliveryAddress:
+    """Exact logical destination without channel-specific wire vocabulary."""
+
+    channel: str = ""
+    bot_id: str = ""
+    destination_kind: str = "direct"
+    destination_id: str = ""
+    session_id: str = "default"
+    source_message_id: str | None = None
+    thread_id: str | None = None
+    root_message_id: str | None = None
+    transport_metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "channel": self.channel,
+            "bot_id": self.bot_id,
+            "destination_kind": self.destination_kind,
+            "destination_id": self.destination_id,
+            "session_id": self.session_id or "default",
+            "source_message_id": self.source_message_id,
+            "thread_id": self.thread_id,
+            "root_message_id": self.root_message_id,
+            "transport_metadata": dict(self.transport_metadata),
+        }
+
+    @classmethod
+    def from_value(cls, value: Any) -> "DeliveryAddress | None":
+        if value is None:
+            return None
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, Mapping):
+            allowed = cls.__dataclass_fields__
+            return cls(**{name: value[name] for name in allowed if name in value})
+        converted = getattr(value, "to_dict", None) or getattr(value, "as_dict", None)
+        if callable(converted):
+            result = converted()
+            if isinstance(result, Mapping):
+                return cls.from_value(result)
+        return None
+
+
+@dataclass(frozen=True)
+class PrincipalRecord:
+    principal_id: str
+    display_name: str = ""
+    enabled: bool = True
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class PrincipalAccountRecord:
+    principal_account_id: str
+    principal_id: str
+    channel: str
+    bot_id: str
+    external_user_id: str
+    identifier_kind: str
+    mapping_revision: int = 1
+    active: bool = True
+    configured_by: str = ""
+    created_at: datetime | None = None
+    retired_at: datetime | None = None
+    principal_enabled: bool = True
+
+
+@dataclass(frozen=True)
+class ConversationSubjectRecord:
+    conversation_subject_id: str
+    channel: str
+    bot_id: str
+    subject_kind: str
+    scope_key: str
+    external_chat_id: str = ""
+    external_thread_id: str = ""
+    parent_subject_id: str | None = None
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class BotProfileRecord:
+    profile_id: str
+    channel: str
+    bot_id: str
+    brand: str
+    config_dir: str
+    config_dir_identity: str
+    cli_version: str
+    credential_ref: str
+    enabled: bool = True
+    mention_policy: str = "direct_or_mention"
+    access_policy: str = "all"
+    restart_policy: Mapping[str, Any] = field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    removed_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class BotProfileStatusRecord:
+    profile_id: str
+    onboarding_state: str
+    connection_state: str
+    generation: int = 0
+    last_ready_at: datetime | None = None
+    retry_after: datetime | None = None
+    last_error_code: str | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
 class OutgoingMediaRecord:
     media_id: str
     attachment_id: str
@@ -371,11 +507,25 @@ class OutgoingMediaRecord:
     reply_slot_id: str | None = None
     reply_ordinal: int | None = None
     client_id: str = ""
+    # Slotless channel bundles carry their parent text alongside every child
+    # claim.  This is an overlay from ``user_outbox`` (not duplicated media
+    # state) so an account-local media worker can deliver mixed text/files
+    # under the same canonical parent lease.
+    content: str = ""
     contextless_client_id: str | None = None
     active_wire_variant: str = "primary"
     from_user_id: str = ""
     context_token: str | None = None
     reply_target: Mapping[str, Any] = field(default_factory=dict)
+    delivery_address: DeliveryAddress | None = None
+    transport_metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Canonical bundle ownership is distinct from the child's upload lease.
+    # They share a token while the child is unfinished, but a previously sent
+    # sibling deliberately has no child claim and is still readable under the
+    # actively claimed parent on an exact-account retry.
+    outbox_claim_token: str | None = field(default=None, repr=False)
+    outbox_lease_expires_at: datetime | None = None
+    outbox_state: OutboxState | None = None
 
     @property
     def delivery_id(self) -> str:
@@ -401,10 +551,37 @@ class ReplyTarget:
     source_message_id: str | None = None
     source_sequence: int | None = None
     context_token: str | None = None
+    # Transport-neutral destination provenance.  Legacy WeChat rows leave
+    # these values empty and continue to route by ``external_user_id`` plus
+    # the optional iLink context token.  Channels with chat/thread addressing
+    # persist the exact immutable destination here instead of overloading the
+    # authenticated actor identity.
+    conversation_subject_id: str = ""
+    conversation_subject_scope: str = ""
+    destination_kind: str = ""
+    destination_id: str = ""
+    thread_id: str = ""
+    root_message_id: str = ""
+    transport_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.session_id:
             object.__setattr__(self, "session_id", "default")
+        for name in (
+            "channel",
+            "bot_id",
+            "external_user_id",
+            "conversation_subject_id",
+            "conversation_subject_scope",
+            "destination_kind",
+            "destination_id",
+            "thread_id",
+            "root_message_id",
+        ):
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, "")
+        if self.transport_metadata is None:
+            object.__setattr__(self, "transport_metadata", {})
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -415,6 +592,13 @@ class ReplyTarget:
             "source_message_id": self.source_message_id,
             "source_sequence": self.source_sequence,
             "context_token": self.context_token,
+            "conversation_subject_id": self.conversation_subject_id,
+            "conversation_subject_scope": self.conversation_subject_scope,
+            "destination_kind": self.destination_kind,
+            "destination_id": self.destination_id,
+            "thread_id": self.thread_id,
+            "root_message_id": self.root_message_id,
+            "transport_metadata": dict(self.transport_metadata),
         }
 
     @classmethod
@@ -422,7 +606,11 @@ class ReplyTarget:
         if isinstance(value, cls):
             return value
         if isinstance(value, Mapping):
-            fields = {name: value.get(name) for name in cls.__dataclass_fields__}
+            fields = {
+                name: value[name]
+                for name in cls.__dataclass_fields__
+                if name in value
+            }
             return cls(**fields)
         return cls()
 
@@ -443,6 +631,17 @@ class InboundMessage:
     status: InboundState = InboundState.RECEIVED
     reply_target: ReplyTarget | None = None
     task_id: str | None = None
+    principal_id: str | None = None
+    principal_account_id: str | None = None
+    conversation_subject_id: str | None = None
+    conversation_subject_scope: str = ""
+    conversation_subject_kind: str = "direct"
+    destination_kind: str = ""
+    destination_id: str = ""
+    thread_id: str = ""
+    root_message_id: str = ""
+    transport_metadata: Mapping[str, Any] = field(default_factory=dict)
+    identity_snapshot: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Keep provenance for replay validation without exposing transport
@@ -471,6 +670,13 @@ class InboundMessage:
             source_message_id=self.external_message_id,
             source_sequence=self.source_sequence,
             context_token=self.context_token,
+            conversation_subject_id=str(self.conversation_subject_id or ""),
+            conversation_subject_scope=self.conversation_subject_scope,
+            destination_kind=self.destination_kind,
+            destination_id=self.destination_id,
+            thread_id=self.thread_id,
+            root_message_id=self.root_message_id,
+            transport_metadata=dict(self.transport_metadata),
         )
 
 
@@ -496,6 +702,11 @@ class AgentTask:
     parent_task_id: str | None = None
     child_depth: int = 0
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    actor_external_user_id: str = ""
+    principal_id: str | None = None
+    principal_account_id: str | None = None
+    conversation_subject_id: str | None = None
+    identity_snapshot: Mapping[str, Any] = field(default_factory=dict)
 
     def with_execution(self, execution_id: str) -> "AgentTask":
         values = asdict(self)
@@ -653,6 +864,11 @@ class TaskRecord:
     # (for example explicit `/retry`).  It is cleared when snapshotted into
     # TaskExecution and never rewrites the task's immutable ReplyTarget.
     pending_delivery_reply_scope_id: str | None = None
+    actor_external_user_id: str = ""
+    principal_id: str | None = None
+    principal_account_id: str | None = None
+    conversation_subject_id: str | None = None
+    identity_snapshot: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def is_terminal(self) -> bool:
@@ -674,6 +890,108 @@ class TaskRecord:
 
 
 @dataclass(frozen=True)
+class CronJobRecord:
+    """Durable recurring/one-shot prompt bound to one transport origin.
+
+    The task execution fields are snapshotted when the job is created.  A
+    later mutable route, mode, model, or Agent recreation therefore cannot
+    silently change what an already-authorized schedule will execute.
+    """
+
+    job_id: str
+    principal_id: str
+    principal_account_id: str | None
+    origin_channel: str
+    origin_bot_id: str
+    origin_external_user_id: str
+    origin_conversation_subject_id: str | None
+    origin_conversation_subject_scope: str
+    origin_session_id: str
+    origin_reply_target: ReplyTarget
+    agent_id: str
+    agent_incarnation: int
+    schedule_kind: str
+    schedule_expression: str
+    timezone_name: str
+    prompt: str
+    enabled: bool
+    created_at: datetime | None
+    updated_at: datetime | None
+    next_fire_at: datetime | None
+    last_fired_at: datetime | None = None
+    expires_at: datetime | None = None
+    disabled_at: datetime | None = None
+    disabled_reason: str | None = None
+    task_template: Mapping[str, Any] = field(default_factory=dict)
+    conversation_id: str = ""
+    mode_id: str = "chat"
+    profile_version: int = 1
+    policy_version: int = 1
+    model: str = ""
+    reasoning_effort: str = ""
+    task_metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class NaturalCronDraftRecord:
+    """Durable, user-confirmable schedule proposed by an active Agent turn.
+
+    The draft freezes the authority, destination, and task template used by
+    the eventual cron job. New confirmations create that job and publish the
+    confirmed state atomically, so no intermediate state can survive a crash.
+    """
+
+    draft_id: str
+    job_id: str
+    source_task_id: str
+    source_execution_id: str
+    source_inbound_message_id: str
+    principal_id: str | None
+    principal_account_id: str | None
+    principal_mapping_revision: int | None
+    origin_channel: str
+    origin_bot_id: str
+    origin_external_user_id: str
+    origin_conversation_subject_id: str | None
+    origin_conversation_subject_scope: str
+    origin_session_id: str
+    origin_reply_target: ReplyTarget
+    conversation_id: str
+    agent_id: str
+    agent_incarnation: int
+    task_template: Mapping[str, Any]
+    schedule_kind: str
+    schedule_expression: str
+    timezone_name: str
+    prompt: str
+    next_fire_at: datetime | None
+    state: str
+    created_at: datetime | None
+    updated_at: datetime | None
+    expires_at: datetime | None
+    resolved_at: datetime | None = None
+    confirmation_task_id: str | None = None
+    confirmation_execution_id: str | None = None
+    confirmation_inbound_message_id: str | None = None
+    confirmation_steering_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CronFiringRecord:
+    """Immutable audit row for one materialized scheduled occurrence."""
+
+    firing_id: str
+    job_id: str
+    scheduled_for: datetime | None
+    task_id: str
+    # Schema v39 created an eager raw-prompt reminder for every occurrence.
+    # New firings leave this legacy audit reference empty and rely on the
+    # task's normal result projection instead.
+    outbox_id: str | None
+    fired_at: datetime | None
+
+
+@dataclass(frozen=True)
 class TaskExecution:
     execution_id: str
     task_id: str
@@ -690,6 +1008,88 @@ class TaskExecution:
     last_error: str | None = None
     external_turn_id: str | None = None
     delivery_reply_scope_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TaskSteeringRecord:
+    """One ordered follow-up destined for an exact task execution.
+
+    ``task_snapshot`` is the immutable normal-task projection captured when
+    ingress was accepted.  It is used only if the target turn finishes before
+    the runner can acknowledge the steer; live delivery consumes ``inputs``.
+    """
+
+    steering_id: str
+    inbound_message_id: str
+    target_task_id: str
+    target_execution_id: str
+    agent_id: str
+    agent_incarnation: int
+    conversation_id: str
+    sequence: int
+    state: TaskSteeringState
+    task_snapshot: Mapping[str, Any] = field(default_factory=dict)
+    fallback_task_id: str = ""
+    promoted_task_id: str | None = None
+    claimed_by: str | None = None
+    claim_token: str | None = field(default=None, repr=False)
+    lease_expires_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    applied_at: datetime | None = None
+    promoted_at: datetime | None = None
+
+    @property
+    def inputs(self) -> Any:
+        return self.task_snapshot.get("inputs", {})
+
+    @property
+    def reply_target(self) -> ReplyTarget:
+        return ReplyTarget.from_value(self.task_snapshot.get("reply_target", {}))
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state in {
+            TaskSteeringState.APPLIED,
+            TaskSteeringState.PROMOTED,
+            TaskSteeringState.DELIVERY_UNKNOWN,
+        }
+
+    @property
+    def delivery_uncertain(self) -> bool:
+        return self.state is TaskSteeringState.DELIVERY_UNKNOWN
+
+
+@dataclass(frozen=True)
+class TaskSteeringClaim:
+    """A lease-fenced steering delivery claim returned to a task worker."""
+
+    steering: TaskSteeringRecord
+    claim_token: str = field(repr=False)
+
+    @property
+    def steering_id(self) -> str:
+        return self.steering.steering_id
+
+    @property
+    def target_task_id(self) -> str:
+        return self.steering.target_task_id
+
+    @property
+    def target_execution_id(self) -> str:
+        return self.steering.target_execution_id
+
+    @property
+    def sequence(self) -> int:
+        return self.steering.sequence
+
+    @property
+    def inputs(self) -> Any:
+        return self.steering.inputs
+
+    @property
+    def state(self) -> TaskSteeringState:
+        return self.steering.state
 
 
 @dataclass(frozen=True)
@@ -762,6 +1162,11 @@ class UserOutboxItem:
     from_user_id: str = ""
     contextless_client_id: str | None = None
     active_wire_variant: str = "primary"
+    transport_idempotency_key: str | None = None
+    sender: Mapping[str, Any] = field(default_factory=dict)
+    delivery_address: DeliveryAddress | None = None
+    transport_metadata: Mapping[str, Any] = field(default_factory=dict)
+    remote_delivery_id: str | None = None
 
     @property
     def visibility(self) -> EventVisibility:
@@ -783,6 +1188,18 @@ class UserOutboxItem:
         if self.active_wire_variant == "contextless":
             return str(self.contextless_client_id or self.client_id)
         return self.client_id
+
+
+@dataclass(frozen=True)
+class CronFireResult:
+    """One cron occurrence committed with its executable Agent task."""
+
+    job: CronJobRecord
+    firing: CronFiringRecord
+    task: TaskRecord
+    # Compatibility view for callers written against schema v39.  A v40
+    # firing never creates an eager prompt reminder, so this is always None.
+    reminder: UserOutboxItem | None = None
 
 
 @dataclass(frozen=True)
@@ -1029,6 +1446,8 @@ class AgentInvocationRecord:
     state: InvocationState
     dispatch_backend: DispatchBackend
     ready_sequence: int
+    account_channel: str = ""
+    account_bot_id: str = ""
     task_id: str | None = None
     execution_id: str | None = None
     mailbox_id: str | None = None
@@ -1096,6 +1515,29 @@ class AgentAdmissionCounterRecord:
     agent_incarnation: int
     unfinished_count: int
     next_ready_sequence: int
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AccountAdmissionCounterRecord:
+    """Global unfinished debit for one exact transport account."""
+
+    channel: str
+    bot_id: str
+    unfinished_count: int
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AgentAccountAdmissionCounterRecord:
+    """Per-Agent account debit plus durable round-robin position."""
+
+    agent_id: str
+    agent_incarnation: int
+    channel: str
+    bot_id: str
+    unfinished_count: int
+    last_served_ordinal: int = 0
     updated_at: datetime | None = None
 
 
@@ -1396,6 +1838,7 @@ class InboundAcceptance:
     # Current WeChat voice ingress queues the transcript directly and leaves
     # this tuple empty.
     confirmation_ids: tuple[str, ...] = ()
+    steering: TaskSteeringRecord | None = None
 
     @property
     def accepted(self) -> bool:
@@ -1404,3 +1847,11 @@ class InboundAcceptance:
     @property
     def task_id(self) -> str | None:
         return self.task.task_id if self.task else None
+
+    @property
+    def steering_id(self) -> str | None:
+        return self.steering.steering_id if self.steering else None
+
+    @property
+    def steered(self) -> bool:
+        return self.steering is not None

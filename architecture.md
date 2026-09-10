@@ -1,31 +1,36 @@
 # Implemented Architecture
 
-This document describes the code that `./cow` actually runs as of 2026-08-17.
-It is an implemented one-process-per-Agent system: the supervisor owns WeChat,
-SQLite, routing, and delivery, while every enabled Agent owns a persistent,
-independent OS child process containing its own `CodexRuntime` and SDK client.
+This document describes the code that `./cow` actually runs as of 2026-09-01.
+It is a multi-channel, one-process-per-Agent system: the supervisor owns peer
+WeChat and Lark/Feishu accounts, SQLite, routing, and delivery, while every
+enabled Agent owns a persistent, independent OS child process containing its
+own `CodexRuntime` and SDK client.
 An Agent is not a supervisor coroutine or thread: it has a distinct PID,
 interpreter, address space, event loop, runtime, and SDK client.
 
-The latest SQLite schema is version 33. The process cutover uses the existing
-durable task/mailbox claim path; v32 adds reply-candidate presentation state
-and command-receipt `response_fragments_json`, while v33 adds scoped
-`session_agent_working_directories`. Neither changes which process owns durable
-scheduling.
+The latest SQLite schema is version 37. Versions 32-35 add reply presentation,
+working-directory, aggregation, and Codex configuration-profile state. Version
+36 adds canonical principals, bot-local conversation subjects, Lark bot
+profiles/health, immutable identity provenance, and transport-neutral delivery
+sidecars. Version 37 binds mapped direct accounts to a provider-history anchor
+keyed by canonical principal, Agent, and session, while task provenance and
+reply targets stay transport-local. Groups and threads remain bot-local.
+Existing WeChat route, reply-scope, outbox and iLink wire identities are
+retained unchanged.
 
 ## 1. Architecture at a glance
 
 | Area | Active implementation |
 | --- | --- |
-| Public runtime | One `./cow` supervisor process per database and WeChat account |
+| Public runtime | One `./cow` supervisor per database and atomically owned set of WeChat/Lark accounts |
 | Agent execution | One persistent fresh-interpreter child process per enabled Agent |
 | Agent state | One child-local asyncio loop, `CodexRuntime`, SDK client, thread cache, and execution slot per Agent |
 | Cross-Agent concurrency | Different Agent children execute concurrently |
 | Same-Agent concurrency | Task and mailbox work share one serialized Agent slot |
-| Durability | Supervisor-owned SQLite v33 with claims, leases, events, workspace preferences, reply presentation/projection, and outboxes |
+| Durability | Supervisor-owned SQLite v37 with claims, leases, identity provenance, account profiles, events, preferences, reply presentation/projection, and outboxes |
 | Working directories | Per-session/Agent selection inside one configured confinement root; immutable per accepted task |
 | Context management | Exact-model provider discovery plus native manual/automatic compaction inside each Agent child |
-| Replies | Stable completed text items, ten sends per inbound scope, 3,000-character fragments |
+| Replies | Channel-policy projection: WeChat retains ten 3,000-character sends and `/recv`; Lark uses exact chat/thread delivery without that quota |
 | Collaboration | Durable mailbox plus a supervisor-owned capability bridge |
 | Failure isolation | One child can be interrupted, killed, restarted, or deleted without replacing peer children |
 | Diagnostics | Owner-only rotating supervisor log with sanitized structured task lifecycle and typed provider failures |
@@ -41,21 +46,22 @@ generation, or does not become ready.
 ```mermaid
 flowchart LR
     WX[WeChat iLink service]
-    DB[(SQLite v33)]
+    LK[Lark/Feishu service<br/>one CLI consumer per app]
+    DB[(SQLite v37)]
     FS[(Managed attachments<br/>and workspace confinement root)]
 
     subgraph SUP[./cow supervisor OS process]
         MON[Monitor main thread<br/>+ contact worker pool]
 
         subgraph LOOP[AsyncLoopThread: one supervisor asyncio loop]
-            GW[WeChatGateway<br/>normalize + commands]
+            GW[Peer channel gateways<br/>WeChat + Lark accounts]
             TM[TaskManager<br/>routes + immutable snapshots]
             TW[TaskWorker coroutines]
             MB[Mailbox supervisor<br/>one coroutine per Agent]
             REG[AgentRegistry]
             PA[ProcessAgentRuntime proxies]
             BR[AgentBridgeServer]
-            OD[Text/media delivery workers]
+            OD[Account-local text/media<br/>delivery workers]
         end
 
         SQL[SQLiteStore executor thread]
@@ -83,6 +89,7 @@ flowchart LR
     end
 
     WX <-->|poll, typing, SendMsg, CDN| MON
+    LK <-->|NDJSON events, exact replies/files| GW
     MON --> GW --> TM
     TM --> TW
     TM <--> SQL <--> DB
@@ -116,8 +123,8 @@ exposed through `/agents` is the dedicated leader PID and generation.
 
 | Resource or responsibility | Supervisor | One Agent child |
 | --- | --- | --- |
-| WeChat credentials/client, polling, typing, CDN, `SendMsg` | owns | absent |
-| SQLite connection, migrations, claims, leases, reply quotas | owns | absent |
+| Channel credentials/clients, polling or CLI consumers, typing, media, sends | owns per account | absent |
+| SQLite connection, migrations, account-exact claims, leases, WeChat reply quota | owns | absent |
 | Routes, Profiles, Modes, roles, model preferences, skill snapshots | resolves/persists | consumes immutable task snapshot |
 | Working-directory preferences and execution snapshots | resolves, persists, captures | validates and consumes task-local snapshot |
 | Task/mailbox scheduling | owns | executes only assigned work for its Agent |
@@ -129,9 +136,78 @@ exposed through `/agents` is the dedicated leader PID and generation.
 | Agent collaboration policy/mailbox | validates and persists | calls bridge with task capability |
 | Workspace confinement root | configures and validates | accesses the accepted directory according to task policy |
 
-The children receive no store, database connection, WeChat client, sender, or
-reply quota allocator. The fresh interpreter and a strict import check keep
-SQLite/store/channel/WeChat modules out of the child runtime graph.
+The children receive no store, database connection, channel client, sender, or
+reply-policy allocator. The fresh interpreter and a strict import check keep
+SQLite/store/channel/transport modules out of the child runtime graph.
+
+### Channel and identity layers
+
+Five identities are deliberately separate:
+
+| Layer | Meaning | Authority / scope |
+| --- | --- | --- |
+| Transport account | One WeChat bot or one registered Lark app (`channel`, `bot_id`) | Local owner configuration and account lock |
+| Authenticated actor | The sender ID authenticated by that transport; Lark requires tenant-stable `open_id` | Inbound adapter only; never message text or raw principal fields |
+| Canonical principal | Optional mapping of an authenticated human sender across channel accounts | Authorization/audit, plus an explicitly bound direct-chat provider-history anchor; never bot ownership or a reply key |
+| Conversation subject | Direct sender, bot-local group chat, or bot-local topic/root | Routes, modes, roles, models, cwd, and the transport alias for provider-thread continuity |
+| Outbound reply target | Exact originating account plus user/chat and thread/root | Immutable task/outbox snapshot |
+
+For a WeChat direct chat the actor, legacy subject scope, and reply recipient
+remain the same value, so all established IDs are byte-for-byte compatible.
+For Lark direct messages the subject scope is likewise the sender. For a group
+or topic, the actor remains the sender `open_id`, while the subject is a framed
+bot+chat or bot+chat+thread identity and the delivery address retains the exact
+chat/thread. Mapping two direct accounts to one principal does not merge their
+routes, reply scopes, or destinations. It does make them eligible to resolve
+the same explicit `(principal, Agent, session)` provider-history anchor. A new
+binding gets a collision-safe canonical anchor, while `./cow principal adopt`
+can select one existing direct conversation as the anchor. Adoption never
+copies or merges another provider thread: old task/thread rows remain immutable
+and visible only under their exact originating account. Groups and topics stay
+bot-local, and every result still replies through the task's initiating target.
+
+Every enabled Lark profile has an owner-only CLI config directory and one
+generation-fenced `lark-cli event consume im.message.receive_v1 --as bot`
+process. Events with another app ID, an unstable sender identifier, a stale
+generation, or a group message lacking a structured mention of that exact bot
+are rejected before durable acceptance. Only the authenticated mention entity
+key is removed; matching display-name text is left intact.
+
+A connected Lark account also exposes an owner-only live onboarding boundary.
+`/lark add [profile]` and the adapter-local exact Chinese trigger are accepted
+only in a direct chat whose authenticated app-scoped sender currently resolves
+to the enabled canonical `owner`. The service relays only a validated official
+configuration URL, unchanged, plus a QR attachment. Credential staging is
+globally serialized, while registration reuses the supervisor's already-open
+SQLite store and incrementally acquires only the discovered `(lark, app_id)`
+account lock. It never opens a competing store or releases startup account
+locks. The prompt warns that the scanning account will receive canonical
+`owner` authority and that the one-time link must not be forwarded.
+
+Live registration is a fenced two-resource transaction: validate and publish
+the isolated config and preflight its bot identity without starting ingress.
+Using only that isolated Bot credential, it calls the official own-application
+API and verifies the exact App ID, bot identity mode, enabled custom-app state,
+and an app-scoped human creator distinct from the Bot Open ID. Feishu's owner
+member object must corroborate the creator; international Lark may omit that
+object according to its schema, but any returned object must agree. The target
+owner is reverified after preflight, then a single `BEGIN IMMEDIATE` rechecks
+the initiating account's exact active owner mapping and creates the
+definitely-new profile, status, and revision-1 target owner mapping. It never
+revision-remaps pre-existing target state. Only after that commit may ingress
+start.
+
+A failure before ingress is compensated by an exact conditional hard rollback
+of the mapping/profile bundle; if the mapping changed or any ingress, outbox,
+command, or other durable state appeared, the private credential and account
+lock are retained instead of guessing. The onboarding service is drained
+before dynamic account shutdown so credential rollback cannot race
+account-lock release. Prompt and completion outboxes retain the initiating
+bot/chat/thread target; no reply is redirected through the newly added app.
+
+The durable outbox retains the shared Markdown source, but channel adapters own
+its wire projection. Lark sends it through `--markdown` as a native rich-text
+`post`; WeChat continues through its established plain-text Markdown sender.
 
 ## 4. Threads, loops, and processes
 
@@ -162,24 +238,35 @@ Startup proceeds in this order:
 
 1. Resolve credentials, database, account, workspace, attachment, bridge, skill,
    and capacity configuration.
-2. Acquire exclusive advisory locks for the database and `(channel, bot_id)`.
-   Another live supervisor fails before SQLite opens.
+2. Acquire one exclusive database lock, then the sorted/deduplicated set of
+   enabled `(channel, bot_id)` account locks atomically. Any conflict rolls the
+   complete partial set back before SQLite opens.
 3. Start the supervisor asyncio loop, open SQLite, apply consecutive migrations
-   through v33, activate a new supervisor epoch, and reconcile durable state.
-4. Hydrate ready attachment metadata and create the parent-owned image publisher.
-5. Construct one unstarted `ProcessAgentRuntime` for `codex`; no SDK runtime is
+   through v41, activate one database supervisor epoch, and reconcile durable state.
+4. Still inside that owned store, idempotently map an enabled account to
+   canonical principal `owner` only when it has no active mapping and exactly
+   one distinct authenticated sender in durable inbound history. Zero or
+   multiple senders are logged and skipped; Lark uses `open_id` and WeChat
+   `from_user_id`.
+5. Hydrate ready attachment metadata and create the parent-owned image publisher.
+6. Construct one unstarted `ProcessAgentRuntime` for `codex`; no SDK runtime is
    constructed in the supervisor.
-6. Register immutable Codex Profile versions, build `TaskManager` with
+7. Register immutable Codex Profile versions, build `TaskManager` with
    `require_process_isolation=True`, and start the owner-only Agent bridge.
-7. Manager startup restores durable dynamic-Agent registrations. Each named
+8. Manager startup restores durable dynamic-Agent registrations. Each named
    registration calls the template's `for_agent(id)`, producing an independent
    proxy with shared configuration and process-capacity accounting.
-8. `AgentRegistry.start()` starts every enabled proxy. Each child must publish
+9. `AgentRegistry.start()` starts every enabled proxy. Each child must publish
    a positive PID, positive generation, and `ready` health.
-9. The production gate verifies every PID is distinct from the supervisor and
+10. The production gate verifies every PID is distinct from the supervisor and
    every other enabled Agent before task/mailbox workers start.
-10. Start delivery/media/mailbox workers, restore the channel cursor, and begin
-    polling WeChat.
+11. Start account-local delivery workers, then ingress: restore the WeChat
+    cursor/poll and start one generation-fenced CLI consumer for each enabled
+    Lark profile. One account restart does not reconstruct shared components.
+12. While running, the live onboarding controller may add a Lark account by
+    preflighting it, strictly registering it through this same store, and
+    acquiring one incremental account lock. Existing account supervisors and
+    the database ownership remain continuously held.
 
 ### Fresh child bootstrap
 
@@ -303,7 +390,7 @@ The proxy and child each add a second one-slot guard. Thus task work and mailbox
 work for one Agent cannot overlap even with a lightweight custom store, while
 different proxies send to different child PIDs and execute simultaneously.
 
-`CODEX_WECHAT_MAX_AGENT_PROCESSES` defaults to 16 and supplies both the shared
+`CODEX_WECHAT_MAX_AGENT_PROCESSES` defaults to 32 and supplies both the shared
 child-process capacity and production task-dispatch breadth. The old
 `CODEX_WECHAT_WORKERS` value is ignored with a warning so a stale value of `1`
 cannot globally serialize the process topology.
@@ -311,6 +398,60 @@ cannot globally serialize the process topology.
 The concurrency tests use filesystem entry/release barriers in separate child
 PIDs. Both Agents must enter before either release file exists, proving real
 overlap rather than two queued supervisor coroutines.
+
+### Durable cron scheduling
+
+Schema v41 adds `natural_cron_drafts`, a durable confirmation state machine
+for schedules interpreted by an Agent from ordinary WeChat or Lark messages.
+The task-scoped local bridge derives the principal, account mapping revision,
+originating bot/chat/thread, Agent incarnation, conversation, and immutable
+task template from the authenticated running task; model-supplied routing or
+identity values are never accepted. A proposal persists only a 15-minute
+`pending` draft. A deterministic job ID is materialized only after a later
+authenticated inbound message explicitly says `确认` / `confirm`. An applied
+steering row created after the proposal is valid later-message evidence for an
+input delivered into the still-running turn. Same-turn confirmation is
+rejected. Confirmation inserts the deterministic job and marks the draft
+confirmed in one SQLite transaction, so an insert failure rolls back fully and
+a retry after a lost bridge response is idempotent. Cancellation, expiry, and a
+newer same-scope draft close older proposals without enqueueing work or creating
+an outbox message.
+Cron, mailbox, child, and background tasks never receive this scheduling
+capability.
+
+Schema v40 stores each confirmed schedule in `cron_jobs` with its optional
+canonical owner principal/account snapshot, exact originating channel/bot/actor and
+chat/topic reply target, target Agent incarnation, schedule/timezone, next and
+last firing times, optional expiry, and a frozen future-task template.
+That template captures the conversation, mode, Profile/policy, model and
+reasoning effort, role, and device/inode-pinned execution workspace at
+creation time. Later route, `/mode`, `/model`, `/system`, or `/cd` changes do
+not reinterpret an existing job.
+
+After task workers are ready, the manager reconciles persisted schedules and
+runs a bounded tick/wake loop. One `BEGIN IMMEDIATE` transaction selects the
+earliest due job that has global, Agent, account, and Agent-account admission
+capacity; a full per-account or per-Agent stream remains due without blocking
+another eligible account. The transaction revalidates principal ownership,
+the exact enabled Agent incarnation/Profile, and an originating Lark bot,
+then inserts the queued task/invocation, an immutable `cron_firings` audit row,
+and the next schedule projection without creating a raw-prompt outbox. On
+completion, result/failure projection recognizes the authoritative firing-task
+relationship and makes that result proactively deliverable through the
+original bot and chat/topic without classifying it as an interactive
+foreground reply. The unique `(job_id, scheduled_for)` firing identity plus
+the transaction prevents double fire across scheduler races and restarts.
+Schema v40 retains optional references to already-sent v39 reminder rows for
+audit, suppresses undelivered prompt echoes, and repairs unseen v39 result
+rows that had been incorrectly notification-disabled.
+
+An overdue repeating job catches up once at most and advances directly to its
+first future occurrence. A one-shot disables after firing; expiry, owner
+mapping/principal revocation, originating Lark-bot removal, or target
+Agent/Profile retirement disables future firing instead of rerouting it.
+Listing and deletion validate the caller's exact active mapping revision in
+the same transaction as the job access; a mapped principal may also manage
+only legacy unmapped jobs from that exact transport account.
 
 ## 8. Agent lifecycle, routing, and history
 
@@ -556,8 +697,9 @@ SQLite owns all correctness-critical state: inbound deduplication, command
 receipts, Profiles/Modes, Agent lifecycle, routes, roles, session/Agent
 working-directory preferences, tasks/executions and their immutable workspace
 snapshots, events, mailbox invocations, thread bindings, attachments, reply
-candidates/fragments/scopes/slots, and delivery outboxes. IPC wakeups and child
-memory are never durable truth.
+candidates/fragments/scopes/slots, delivery outboxes, natural-cron drafts, cron
+jobs, and immutable cron firing audits. IPC wakeups and child memory are never
+durable truth.
 
 Task claims carry worker and claim-token leases. Event append, thread binding,
 terminal completion, admission release, and mailbox transitions are conditional
@@ -582,13 +724,15 @@ behind the existing durable claim path.
 
 Normal shutdown order is:
 
-1. stop Monitor ingress;
-2. stop/drain delivery and mailbox supervisor coroutines;
-3. stop TaskManager workers and every Agent process while the bridge is live;
-4. close the Agent bridge;
-5. close SQLite and its executor;
-6. close the supervisor event loop and WeChat client; and
-7. release ownership locks.
+1. cancel and drain any live Lark onboarding transaction, retaining its exact
+   account lock until credential publication is committed or rolled back;
+2. stop every account ingress (WeChat Monitor and Lark consumers);
+3. stop/drain every account-local delivery worker, then mailbox coroutines;
+4. stop TaskManager workers and every Agent process while the bridge is live;
+5. close the Agent bridge;
+6. close SQLite and its executor;
+7. close the supervisor event loop and all account clients/processes; and
+8. release ownership locks.
 
 Child stop asks the local runtime to interrupt active work, waits boundedly,
 closes the SDK client, sends `stopped`, exits, and is reaped. Timeout escalates
@@ -635,12 +779,68 @@ startup prerequisite.
 | `CODEX_WECHAT_AGENT_SOCKET` | beside DB | Owner-only collaboration socket |
 | `CODEX_WECHAT_SKILL_ROOTS` | empty | Trusted skill roots |
 | `CODEX_WECHAT_TURN_TIMEOUT` | runtime default | Child Codex turn timeout |
-| `CODEX_WECHAT_MAX_AGENT_PROCESSES` | `16` | Child capacity and dispatcher breadth |
+| `CODEX_WECHAT_MAX_AGENT_PROCESSES` | `32` | Child capacity and dispatcher breadth |
 | `CODEX_WECHAT_MAX_AGENT_QUEUE` | store default | Per-Agent unfinished work bound |
 | `CODEX_WECHAT_MAX_GLOBAL_QUEUE` | store default | Global unfinished work bound |
+| `CODEX_WECHAT_MAX_ACCOUNT_QUEUE` | global bound | Per-channel-account unfinished work bound |
+| `CODEX_WECHAT_MAX_ACCOUNT_AGENT_QUEUE` | Agent bound | Per-channel-account/Agent unfinished work bound |
 | `CODEX_WECHAT_MAILBOX_TTL` | store default | Mailbox expiry |
+| `CODEX_LARK_CLI` | `lark-cli` | Version-pinned Lark CLI executable |
+| `CODEX_LARK_ADMIN_PRINCIPALS` | empty | Comma-separated canonical principals allowed to mutate the global Agent registry from Lark |
 
 `CODEX_WECHAT_WORKERS` is deprecated and ignored.
+
+The owner manages app profiles with `./cow lark add [profile]`, `list`,
+`status`, `reauthorize`, `disable`, `enable`, and `remove`. `./cow lark list`
+is concise bot inventory. Every profile created through this local owner CLI is
+implicitly managed by the local OS owner; bot management does not require or
+create a human `open_id` principal mapping. Unfiltered `./cow lark principal
+list` presents `OWNER-MANAGED LARK BOT PROFILES` followed by `HUMAN PRINCIPAL
+MAPPINGS (OPTIONAL)`, making that separation visible. A principal-ID filter
+selects only the human section. The legacy `./cow lark principal map|unmap`
+surface manages those Lark-only human mappings; `./cow principal
+list|map|unmap|adopt` manages exact human accounts across channels and selects
+an existing direct-chat history anchor when required. Its list remains
+human-only. Existing profiles without a human mapping are already
+owner-managed and can optionally be attached with `./cow lark principal map
+owner <profile> <ou_open_id>`.
+
+Terminal `add` and `reauthorize` use the pinned QR-based `lark-cli config init
+--new` flow in an isolated owner-only directory and relay its terminal
+QR/verification URL. `add` also accepts an existing application through
+`--app-id`, `--brand`, and an echo-disabled App Secret prompt. Either add flow
+optionally accepts `--owner-open-id ou_...` to map one app-scoped human sender
+identity to canonical principal `owner`; omission is the normal case without a
+human mapping and never triggers an Open ID prompt. The mutually exclusive
+`--without-owner` remains a compatibility no-op for that default. Those
+terminal paths never infer a human account: an explicitly supplied ID must
+belong to the human account under the exact app being added. By contrast, live
+chat QR onboarding verifies a freshly created app's creator/owner with that
+new app's Bot credential and always creates the owner mapping atomically. Open
+IDs are app-scoped and differ across apps and organizations.
+
+After the new bot identity is verified, private-config publication is an
+atomic filesystem rename but remains a separately recoverable step from the
+database commit. The durable profile, its status, and, when requested, the
+mapping of `(channel=lark, bot_id=app ID, external_user_id=owner Open ID)` to
+canonical principal `owner` commit in one SQLite transaction. Thus a requested
+mapping cannot commit without its profile, but filesystem publication and the
+SQLite transaction are not one cross-resource atomic operation. The recovery
+sidecar retains an explicit human-mapping request across a recoverable failure.
+Neither compatibility/identity option runs `lark-cli auth login` or creates
+user OAuth state.
+`./cow` forwards the captured App Secret through an anonymous stdin descriptor;
+`--app-secret-stdin` retains the explicit non-interactive secret path and does
+not require either human-mapping flag. In both cases the secret reaches
+`lark-cli config init` only through bounded stdin, and child output is not
+relayed. Imported
+profiles retain durable credential provenance so removal deletes COW-local
+state without deleting a potentially pre-existing OS-user-global keychain
+entry. That App-ID-level provenance survives profile removal, vetoes later
+automatic credential cleanup, and prevents imported profiles from entering QR
+reauthorization. Bot registration and existing-app authentication are
+application/bot identity, not user OAuth; neither path runs `lark-cli auth
+login` or uses user impersonation.
 
 ## 17. Implementation map
 
@@ -653,9 +853,14 @@ startup prerequisite.
 | `src/runtime/registry.py` | Runtime ownership and retryable start/stop bookkeeping |
 | `src/runtime/worker.py` | Task/mailbox execution, event commit callbacks, uncertainty mapping |
 | `src/runtime/dispatcher.py` | Durable claim wakeups and compatibility serialization |
-| `src/runtime/sqlite_store.py` | SQLite v35 schema, immutable Agent config-profile bindings, scoped working-directory preferences, claims, events, reply presentation/projection, recovery |
-| `src/channels/wechat.py` | Command registry, gateway, item projection, 3,000-character replies |
-| `src/runtime/agent_bridge.py` | Task capability and local collaboration server |
+| `src/runtime/sqlite_store.py` | SQLite v41 schema, identity/profile provenance, principal history anchors, transport sidecars, preferences, claims, cron drafts/scheduling/firing, reply projection and recovery |
+| `src/channels/commands.py` | Shared command registry/help and channel capability filtering |
+| `src/channels/wechat.py` | WeChat gateway, iLink projection, typing, `/recv`, ten-send/3,000-character policy |
+| `src/channels/lark.py` | Lark CLI process, normalization/mentions, exact-account gateway, delivery and account restart isolation |
+| `src/lark_cli.py` | Owner-only QR/existing-app onboarding and profile management |
+| `src/lark_onboarding.py` | Isolated live QR staging, bot/owner identity fencing, publication and credential compensation |
+| `src/lark_chat_onboarding.py` | Owner-direct-chat orchestration, exact-source replies, atomic profile/owner registration and live activation |
+| `src/runtime/agent_bridge.py` | Task capability and local collaboration/natural-cron server |
 | `src/runtime/media.py` | Managed attachments and parent-owned image publication |
 | `src/agents/workspace.py` | Canonical workspace snapshots, confinement, and device/inode revalidation |
 | `src/agents/model_context.py` | Child-local exact-provider/model context discovery and auto-compaction settings |

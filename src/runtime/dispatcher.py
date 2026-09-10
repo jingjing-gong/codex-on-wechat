@@ -34,7 +34,8 @@ def task_serialization_key(task: Any) -> tuple[str, str, str, str, str]:
     return (
         reply_value("channel"),
         reply_value("bot_id"),
-        reply_value("external_user_id"),
+        reply_value("conversation_subject_scope")
+        or reply_value("external_user_id"),
         reply_value("session_id") or str(value("conversation_id", "")),
         str(value("agent_id", "codex") or "codex"),
     )

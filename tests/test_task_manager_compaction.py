@@ -11,6 +11,7 @@ import pytest
 
 from src.agents.base import AgentResult, ReplyTarget
 from src.agents.workspace import EXECUTION_WORKSPACE_KEY
+from src.channels.models import InboundEnvelope
 from src.runtime.identity import conversation_id
 from src.runtime.manager import TaskManager
 from src.runtime.registry import AgentRegistry, codex_profile
@@ -262,6 +263,125 @@ def test_compact_shares_the_per_session_control_lock(tmp_path: Path) -> None:
             assert second_result["thread_id"] == "thread-writer"
             assert len(writer_runtime.compact_calls) == 2
             assert writer_runtime.max_active_compactions == 1
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
+def test_mapped_cross_channel_acceptance_waits_for_shared_compaction(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        manager, codex_runtime, _writer_runtime = _manager(
+            tmp_path / "runtime.sqlite",
+            workspace,
+        )
+        await manager.start()
+        try:
+            await manager.store.create_principal(principal_id="owner")
+            await manager.store.map_principal_account(
+                principal_id="owner",
+                channel="wechat",
+                bot_id="wx-bot",
+                external_user_id="wx-owner",
+                identifier_kind="from_user_id",
+                configured_by="test-owner",
+            )
+            await manager.store.map_principal_account(
+                principal_id="owner",
+                channel="lark",
+                bot_id="cli_bot",
+                external_user_id="ou_owner",
+                identifier_kind="open_id",
+                configured_by="test-owner",
+            )
+            seeded = await manager.accept_inbound(
+                InboundEnvelope(
+                    channel="wechat",
+                    bot_id="wx-bot",
+                    external_user_id="wx-owner",
+                    external_message_id="wx-seed",
+                    session_id="shared-session",
+                    text="seed shared history",
+                )
+            )
+            assert seeded.task is not None
+            assert await manager.store.set_task_thread(
+                seeded.task.task_id,
+                thread_id="shared-provider-thread",
+            )
+
+            # Observe when the peer-channel acceptance has resolved the same
+            # principal lock and is waiting to enter it.  This avoids timing-
+            # based assertions that could pass merely because the task had not
+            # been scheduled yet.
+            original_resolve = manager.store.resolve_principal_account
+            lark_reached_provider_lock = asyncio.Event()
+
+            async def observed_resolve(**kwargs: Any) -> Any:
+                resolved = await original_resolve(**kwargs)
+                if kwargs.get("channel") == "lark":
+                    lark_reached_provider_lock.set()
+                return resolved
+
+            manager.store.resolve_principal_account = observed_resolve  # type: ignore[method-assign]
+
+            codex_runtime.compact_release = asyncio.Event()
+            compaction = asyncio.create_task(
+                manager.compact_session(
+                    channel="wechat",
+                    bot_id="wx-bot",
+                    external_user_id="wx-owner",
+                    session_id="shared-session",
+                    agent_id="codex",
+                )
+            )
+            await asyncio.wait_for(codex_runtime.compact_entered.wait(), timeout=1)
+
+            lark_acceptance = asyncio.create_task(
+                manager.accept_inbound(
+                    InboundEnvelope(
+                        channel="lark",
+                        bot_id="cli_bot",
+                        external_user_id="ou_owner",
+                        external_message_id="om-after-compact",
+                        session_id="shared-session",
+                        text="continue from lark",
+                        destination_kind="direct",
+                        destination_id="oc_owner",
+                        transport_metadata={
+                            "chat_id": "oc_owner",
+                            "chat_type": "p2p",
+                        },
+                    )
+                )
+            )
+            await asyncio.wait_for(lark_reached_provider_lock.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert not compaction.done()
+            assert not lark_acceptance.done()
+            assert await manager.store.get_inbound(
+                "lark", "cli_bot", "om-after-compact"
+            ) is None
+
+            codex_runtime.compact_release.set()
+            compact_result, accepted = await asyncio.gather(
+                compaction,
+                lark_acceptance,
+            )
+            assert compact_result == {
+                "thread_id": "shared-provider-thread",
+                "compacted": True,
+            }
+            assert accepted.task is not None
+            assert accepted.task.conversation_id == seeded.task.conversation_id
+            assert accepted.task.thread_id == "shared-provider-thread"
+            assert accepted.task.reply_target.channel == "lark"
+            assert accepted.task.reply_target.destination_id == "oc_owner"
+            assert codex_runtime.max_active_compactions == 1
         finally:
             await manager.stop()
 

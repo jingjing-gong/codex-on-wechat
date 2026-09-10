@@ -1,4 +1,4 @@
-"""Task-scoped local bridge for controlled Agent-to-Agent messaging."""
+"""Task-scoped bridge for controlled Agent messaging and cron drafts."""
 
 from __future__ import annotations
 
@@ -41,6 +41,90 @@ def _public_peer(value: Any) -> dict[str, Any]:
             for item in (_field(value, "accepted_request_types", ()) or ())
         ),
     }
+
+
+def _public_scalar(value: Any) -> str:
+    """Render one allowlisted bridge value without serializing its object."""
+
+    if value is None:
+        return ""
+    candidate = getattr(value, "value", value)
+    isoformat = getattr(candidate, "isoformat", None)
+    if callable(isoformat):
+        return str(isoformat())
+    return str(candidate)
+
+
+def _public_cron_draft(value: Any) -> dict[str, str]:
+    """Project only user-visible fields from one natural-cron draft."""
+
+    return {
+        "draft_id": _public_scalar(
+            _field(value, "draft_id", _field(value, "id", ""))
+        ),
+        "state": _public_scalar(
+            _field(value, "state", _field(value, "status", ""))
+        ),
+        "schedule_kind": _public_scalar(
+            _field(value, "schedule_kind", _field(value, "kind", ""))
+        ),
+        "schedule_expression": _public_scalar(
+            _field(value, "schedule_expression", _field(value, "expression", ""))
+        ),
+        "timezone_name": _public_scalar(
+            _field(value, "timezone_name", _field(value, "timezone", ""))
+        ),
+        "prompt": _public_scalar(_field(value, "prompt", "")),
+        "next_fire_at": _public_scalar(_field(value, "next_fire_at", "")),
+        "expires_at": _public_scalar(_field(value, "expires_at", "")),
+    }
+
+
+def _public_cron_job(value: Any) -> dict[str, str]:
+    """Project the narrow confirmation fields from a committed cron job."""
+
+    return {
+        "job_id": _public_scalar(
+            _field(value, "job_id", _field(value, "id", ""))
+        ),
+        "schedule_kind": _public_scalar(
+            _field(value, "schedule_kind", _field(value, "kind", ""))
+        ),
+        "schedule_expression": _public_scalar(
+            _field(value, "schedule_expression", _field(value, "expression", ""))
+        ),
+        "timezone_name": _public_scalar(
+            _field(value, "timezone_name", _field(value, "timezone", ""))
+        ),
+        "next_fire_at": _public_scalar(_field(value, "next_fire_at", "")),
+    }
+
+
+def _cron_result_parts(value: Any) -> tuple[Any, Any]:
+    """Accept direct records and manager wrappers without exposing either."""
+
+    draft = _field(value, "draft", None)
+    job = _field(value, "job", None)
+    return (draft if draft is not None else value, job if job is not None else value)
+
+
+def _public_pending_drafts(value: Any) -> list[dict[str, str]]:
+    raw = _field(value, "drafts", value)
+    if raw is None:
+        return []
+    if isinstance(raw, Mapping) or _field(raw, "draft_id", None) is not None:
+        records = (raw,)
+    elif isinstance(raw, (str, bytes, bytearray)):
+        raise ValueError("pending cron drafts result is invalid")
+    else:
+        try:
+            records = tuple(raw)
+        except TypeError as exc:
+            raise ValueError("pending cron drafts result is invalid") from exc
+    result = [_public_cron_draft(record) for record in records]
+    if any(not draft["draft_id"] for draft in result):
+        raise ValueError("pending cron draft has no durable identity")
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,9 +196,8 @@ class AgentBridgeServer:
     """Serve one bounded JSON request per owner-only Unix-socket connection.
 
     The bridge is deliberately a thin facade.  It never writes SQLite or
-    constructs mailbox events itself: discovery is resolved from the running
-    task's immutable policy and every send delegates to
-    :meth:`TaskManager.send_agent_message` with active-task enforcement.
+    constructs mailbox/cron records itself: discovery, messaging, and cron
+    drafts delegate to the manager with active-execution enforcement.
     """
 
     def __init__(
@@ -270,8 +353,19 @@ class AgentBridgeServer:
             raise ValueError(f"{name} is too long")
         return value
 
+    @staticmethod
+    def _optional_text(
+        request: Mapping[str, Any], name: str, *, maximum: int
+    ) -> str:
+        value = str(request.get(name, "") or "").strip()
+        if len(value) > maximum:
+            raise ValueError(f"{name} is too long")
+        return value
+
     async def _dispatch(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        operation = str(request.get("operation", request.get("op", "")) or "").strip().lower()
+        operation = str(
+            request.get("operation", request.get("op", "")) or ""
+        ).strip().lower()
         task_id = self._required_text(request, "task_id", maximum=256)
         capability = self._required_text(request, "capability", maximum=512)
         grant = self.capability_authority.validate(
@@ -315,7 +409,88 @@ class AgentBridgeServer:
                     _field(result, "destination_agent_id", destination) or destination
                 ),
             }
-        raise ValueError("operation must be 'list' or 'send'")
+        if operation == "cron_propose":
+            schedule = self._required_text(request, "schedule", maximum=512)
+            prompt = self._required_text(request, "prompt", maximum=60 * 1024)
+            result = await self.manager.propose_natural_cron(
+                task_id,
+                schedule,
+                prompt,
+                required_execution_id=grant.execution_id,
+            )
+            draft, _job = _cron_result_parts(result)
+            public = _public_cron_draft(draft)
+            if not public["draft_id"]:
+                raise ValueError("natural cron proposal has no durable identity")
+            return {
+                "ok": True,
+                "operation": operation,
+                # A proposal is deliberately not a cron job.  Keeping this
+                # explicit prevents a language model from interpreting an
+                # otherwise successful tool call as completed persistence.
+                "created": False,
+                **public,
+            }
+        if operation == "cron_confirm":
+            draft_id = self._optional_text(request, "draft_id", maximum=256)
+            result = await self.manager.confirm_natural_cron(
+                task_id,
+                draft_id=draft_id,
+                required_execution_id=grant.execution_id,
+            )
+            draft, job = _cron_result_parts(result)
+            public_draft = _public_cron_draft(draft)
+            public_job = _public_cron_job(job)
+            resolved_draft_id = public_draft["draft_id"] or draft_id
+            if not resolved_draft_id or not public_job["job_id"]:
+                raise ValueError("natural cron confirmation result is incomplete")
+            return {
+                "ok": True,
+                "operation": operation,
+                "created": True,
+                **public_draft,
+                **{
+                    name: value or public_draft.get(name, "")
+                    for name, value in public_job.items()
+                },
+                "draft_id": resolved_draft_id,
+                "state": public_draft["state"] or "confirmed",
+            }
+        if operation == "cron_cancel":
+            draft_id = self._optional_text(request, "draft_id", maximum=256)
+            result = await self.manager.cancel_natural_cron(
+                task_id,
+                draft_id=draft_id,
+                required_execution_id=grant.execution_id,
+            )
+            draft, _job = _cron_result_parts(result)
+            public = _public_cron_draft(draft)
+            resolved_draft_id = public["draft_id"] or draft_id
+            if not resolved_draft_id:
+                raise ValueError("natural cron cancellation has no durable identity")
+            return {
+                "ok": True,
+                "operation": operation,
+                "created": False,
+                **public,
+                "draft_id": resolved_draft_id,
+                "state": public["state"] or "cancelled",
+            }
+        if operation == "cron_pending":
+            result = await self.manager.pending_natural_cron(
+                task_id,
+                required_execution_id=grant.execution_id,
+            )
+            return {
+                "ok": True,
+                "operation": operation,
+                "created": False,
+                "drafts": _public_pending_drafts(result),
+            }
+        raise ValueError(
+            "operation must be 'list', 'send', 'cron_propose', "
+            "'cron_confirm', 'cron_cancel', or 'cron_pending'"
+        )
 
     @staticmethod
     def _error_response(exc: BaseException) -> dict[str, Any]:

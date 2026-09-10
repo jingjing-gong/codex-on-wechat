@@ -369,7 +369,7 @@ def test_v32_migration_marks_preexisting_reply_candidates_as_history(tmp_path):
         # historical schema in this focused regression.
         with sqlite3.connect(database) as connection:
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (32,33,34,35)"
+                "DELETE FROM schema_migrations WHERE version IN (32,33,34,35,36,37,38,39,40,41)"
             )
             connection.commit()
 

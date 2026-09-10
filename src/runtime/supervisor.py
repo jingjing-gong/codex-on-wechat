@@ -23,6 +23,7 @@ import stat
 import threading
 import uuid
 import weakref
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -114,6 +115,15 @@ class SupervisorLockPaths:
     root: Path
     database: Path
     account: Path
+
+
+@dataclass(frozen=True, slots=True)
+class SupervisorAccountSetLockPaths:
+    """Resolved lock paths for one database and a sorted account set."""
+
+    root: Path
+    database: Path
+    accounts: tuple[Path, ...]
 
 
 def _canonical_component(value: Any, name: str) -> str:
@@ -402,6 +412,304 @@ class CredentialMutationOwnership(_SingleLockOwnership):
         )
 
 
+class DatabaseOwnership(_SingleLockOwnership):
+    """Hold one canonical runtime-database lock without an account lock."""
+
+    def __init__(
+        self,
+        database_path: str | os.PathLike[str],
+        *,
+        lock_root: str | os.PathLike[str] | None = None,
+        owner_instance_id: str | None = None,
+    ) -> None:
+        self.database_path = _canonical_database_path(database_path)
+        super().__init__(
+            scope="database",
+            components=(str(self.database_path),),
+            lock_root=lock_root,
+            owner_instance_id=owner_instance_id,
+        )
+
+
+def _canonical_account(value: Any) -> tuple[str, str]:
+    """Normalize one ``(channel, bot_id)`` account descriptor."""
+
+    channel = getattr(value, "channel", None)
+    bot_id = getattr(value, "bot_id", None)
+    if channel is None and bot_id is None:
+        if isinstance(value, (str, bytes, bytearray)):
+            raise TypeError("an account must be a (channel, bot_id) pair")
+        try:
+            channel, bot_id = value
+        except (TypeError, ValueError) as exc:
+            raise TypeError("an account must be a (channel, bot_id) pair") from exc
+    elif channel is None or bot_id is None:
+        raise TypeError("an account must provide both channel and bot_id")
+    return (
+        _canonical_component(channel, "channel"),
+        _canonical_component(bot_id, "bot_id"),
+    )
+
+
+class SupervisorAccountSetOwnership:
+    """Atomically own one database and a deterministic set of channel accounts.
+
+    The existing :class:`SupervisorOwnership` remains the compatibility owner
+    for exactly one account.  This additive composition is the multi-channel
+    boundary: it acquires the database first, then every unique account in
+    canonical lexical order.  Any failure rolls all earlier acquisitions back
+    in reverse order before the original error is re-raised.
+
+    Each component is an ordinary ``_SingleLockOwnership``.  Consequently the
+    existing at-fork descriptor fence applies without introducing a second raw
+    descriptor collection that a child process could accidentally inherit.
+    """
+
+    def __init__(
+        self,
+        database_path: str | os.PathLike[str],
+        *,
+        accounts: Iterable[Any],
+        lock_root: str | os.PathLike[str] | None = None,
+        owner_instance_id: str | None = None,
+    ) -> None:
+        canonical_accounts = tuple(
+            sorted({_canonical_account(account) for account in accounts})
+        )
+        if not canonical_accounts:
+            raise ValueError("at least one channel account is required")
+
+        self._account_mutation_lock = threading.RLock()
+        self.database_path = _canonical_database_path(database_path)
+        self.accounts = canonical_accounts
+        self.owner_instance_id = _canonical_component(
+            owner_instance_id or uuid.uuid4().hex,
+            "owner_instance_id",
+        )
+        self.database_ownership = DatabaseOwnership(
+            self.database_path,
+            lock_root=lock_root,
+            owner_instance_id=self.owner_instance_id,
+        )
+        self.account_ownerships = tuple(
+            ChannelAccountOwnership(
+                channel=channel,
+                bot_id=bot_id,
+                lock_root=lock_root,
+                owner_instance_id=self.owner_instance_id,
+            )
+            for channel, bot_id in self.accounts
+        )
+        # Incremental accounts are tracked by exact object identity as well as
+        # canonical account key.  A caller may release only the handle returned
+        # by ``acquire_account``; it can never name and accidentally release an
+        # account that formed part of the startup ownership set.
+        self._incremental_account_ownerships: dict[
+            tuple[str, str], ChannelAccountOwnership
+        ] = {}
+        self.paths = SupervisorAccountSetLockPaths(
+            root=self.database_ownership.root,
+            database=self.database_ownership.path,
+            accounts=tuple(ownership.path for ownership in self.account_ownerships),
+        )
+
+    @property
+    def held(self) -> bool:
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            return self.database_ownership.held and all(
+                ownership.held for ownership in self.account_ownerships
+            )
+
+    def owns_account(self, *, channel: str, bot_id: str) -> bool:
+        """Return whether the canonical account is in this held lock set."""
+
+        account = _canonical_account((channel, bot_id))
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            return self.held and account in self.accounts
+
+    def acquire(self) -> "SupervisorAccountSetOwnership":
+        """Acquire the complete lock set or leave none of it held."""
+
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            component_ownerships = (
+                self.database_ownership,
+                *self.account_ownerships,
+            )
+            held_states = tuple(ownership.held for ownership in component_ownerships)
+            if all(held_states):
+                return self
+            if any(held_states):
+                raise SupervisorOwnershipError(
+                    "supervisor account-set ownership is in a partial state"
+                )
+
+            acquired: list[_SingleLockOwnership] = []
+            try:
+                for ownership in component_ownerships:
+                    ownership.acquire()
+                    acquired.append(ownership)
+            except BaseException:
+                # The acquisition error is authoritative, but every earlier lock is
+                # still released even if one best-effort rollback close also fails.
+                for ownership in reversed(acquired):
+                    try:
+                        ownership.close()
+                    except BaseException:
+                        pass
+                raise
+            return self
+
+    def acquire_account(
+        self,
+        *,
+        channel: str,
+        bot_id: str,
+    ) -> ChannelAccountOwnership:
+        """Add one account lock without releasing the live database lock.
+
+        Acquisition is serialized with account-set shutdown and is atomic
+        from the composite owner's perspective: a conflict or security error
+        leaves the existing set unchanged.  Duplicate acquisition is rejected
+        rather than returning an existing handle, because returning a startup
+        handle would let onboarding rollback release a lock it does not own.
+        """
+
+        account = _canonical_account((channel, bot_id))
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            if not self.held:
+                raise SupervisorOwnershipError(
+                    "incremental account acquisition requires held supervisor ownership"
+                )
+            if account in self.accounts:
+                raise SupervisorOwnershipError(
+                    "channel account is already owned by this supervisor"
+                )
+            candidate = ChannelAccountOwnership(
+                channel=account[0],
+                bot_id=account[1],
+                lock_root=self.database_ownership.root,
+                owner_instance_id=self.owner_instance_id,
+            )
+            candidate.acquire()
+            try:
+                self._incremental_account_ownerships[account] = candidate
+                pairs = {
+                    (ownership.channel, ownership.bot_id): ownership
+                    for ownership in self.account_ownerships
+                }
+                pairs[account] = candidate
+                self.accounts = tuple(sorted(pairs))
+                self.account_ownerships = tuple(
+                    pairs[key] for key in self.accounts
+                )
+                self.paths = SupervisorAccountSetLockPaths(
+                    root=self.database_ownership.root,
+                    database=self.database_ownership.path,
+                    accounts=tuple(
+                        ownership.path for ownership in self.account_ownerships
+                    ),
+                )
+            except BaseException:
+                self._incremental_account_ownerships.pop(account, None)
+                candidate.close()
+                raise
+            return candidate
+
+    def release_account(self, ownership: ChannelAccountOwnership) -> None:
+        """Release exactly one handle returned by :meth:`acquire_account`.
+
+        Runtime composition must fence and stop that account's resources
+        before calling this method.  The identity check intentionally rejects
+        a newly constructed lookalike and every account acquired at startup.
+        """
+
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            account = next(
+                (
+                    key
+                    for key, candidate in self._incremental_account_ownerships.items()
+                    if candidate is ownership
+                ),
+                None,
+            )
+            if account is None:
+                raise SupervisorOwnershipError(
+                    "incremental account ownership does not belong to this supervisor"
+                )
+            ownership.close()
+            del self._incremental_account_ownerships[account]
+            self.accounts = tuple(
+                key
+                for key in self.accounts
+                if key != account
+            )
+            self.account_ownerships = tuple(
+                candidate
+                for candidate in self.account_ownerships
+                if candidate is not ownership
+            )
+            self.paths = SupervisorAccountSetLockPaths(
+                root=self.database_ownership.root,
+                database=self.database_ownership.path,
+                accounts=tuple(
+                    candidate.path for candidate in self.account_ownerships
+                ),
+            )
+
+    def close(self) -> None:
+        """Release every account in reverse order, then release the database."""
+
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            _RETAINED_OWNERSHIPS.discard(self)
+
+            error: BaseException | None = None
+            for ownership in reversed(
+                (self.database_ownership, *self.account_ownerships)
+            ):
+                try:
+                    ownership.close()
+                except BaseException as exc:
+                    error = error or exc
+            if error is not None:
+                raise SupervisorOwnershipError(
+                    "supervisor account-set ownership release failed"
+                ) from error
+
+    release = close
+
+    def retain_until_process_exit(self) -> None:
+        """Keep the complete lock set alive after an unproven shutdown."""
+
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            if not self.held:
+                raise SupervisorOwnershipError(
+                    "cannot retain supervisor ownership that is not held"
+                )
+            # This strong reference prevents ``__del__`` from releasing any
+            # component while live runtime resources might still use them.
+            _RETAINED_OWNERSHIPS.add(self)
+
+    def __enter__(self) -> "SupervisorAccountSetOwnership":
+        return self.acquire()
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        if isinstance(_exc, SupervisorResourcesStillLive):
+            self.retain_until_process_exit()
+            return
+        self.close()
+
+    def __del__(self) -> None:  # pragma: no cover - deterministic close is tested
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+# Short descriptive alias for callers that do not need the historical
+# ``SupervisorOwnership`` naming convention.
+MultiAccountOwnership = SupervisorAccountSetOwnership
+
+
 class SupervisorOwnership:
     """Hold exclusive database and channel-account ownership until closed.
 
@@ -426,6 +734,10 @@ class SupervisorOwnership:
             owner_instance_id or uuid.uuid4().hex,
             "owner_instance_id",
         )
+        self._account_mutation_lock = threading.RLock()
+        self._incremental_account_ownerships: dict[
+            tuple[str, str], ChannelAccountOwnership
+        ] = {}
         root = _lock_root_path(lock_root)
         database_name = _lock_filename("database", (str(self.database_path),))
         account_name = _lock_filename("account", (self.channel, self.bot_id))
@@ -440,26 +752,54 @@ class SupervisorOwnership:
 
     @property
     def held(self) -> bool:
-        return bool(
-            self._owner_pid == os.getpid()
-            and self._database_descriptor is not None
-            and self._account_descriptor is not None
-        )
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            return bool(
+                self._owner_pid == os.getpid()
+                and self._database_descriptor is not None
+                and self._account_descriptor is not None
+                and all(
+                    ownership.held
+                    for ownership in self._incremental_account_ownerships.values()
+                )
+            )
+
+    def owns_account(self, *, channel: str, bot_id: str) -> bool:
+        """Return whether the canonical account is held by this owner."""
+
+        account = _canonical_account((channel, bot_id))
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            return self.held and (
+                account == (self.channel, self.bot_id)
+                or account in self._incremental_account_ownerships
+            )
 
     def acquire(self) -> "SupervisorOwnership":
         """Acquire both locks, rolling the first back if the second conflicts."""
 
-        if self.held:
-            return self
-        if self._database_descriptor is not None or self._account_descriptor is not None:
-            raise SupervisorOwnershipError("supervisor ownership is in a partial state")
-        if self._owner_pid is not None and self._owner_pid != os.getpid():
-            raise SupervisorOwnershipError("supervisor ownership cannot cross a fork boundary")
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            if self.held:
+                return self
+            component_states = (
+                self._database_descriptor is not None,
+                self._account_descriptor is not None,
+                *(
+                    ownership.held
+                    for ownership in self._incremental_account_ownerships.values()
+                ),
+            )
+            if any(component_states):
+                raise SupervisorOwnershipError(
+                    "supervisor ownership is in a partial state"
+                )
+            if self._owner_pid is not None and self._owner_pid != os.getpid():
+                raise SupervisorOwnershipError(
+                    "supervisor ownership cannot cross a fork boundary"
+                )
 
-        with _FORK_DESCRIPTOR_LOCK:
             root_descriptor = _open_private_lock_root(self.paths.root)
             database_descriptor: int | None = None
             account_descriptor: int | None = None
+            acquired_incremental: list[ChannelAccountOwnership] = []
             try:
                 database_descriptor = _open_lock_file(
                     root_descriptor, self.paths.database.name
@@ -469,6 +809,9 @@ class SupervisorOwnership:
                     root_descriptor, self.paths.account.name
                 )
                 _lock_nonblocking(account_descriptor, "account")
+                for ownership in self._incremental_account_ownerships.values():
+                    ownership.acquire()
+                    acquired_incremental.append(ownership)
                 _write_lock_diagnostic(
                     database_descriptor,
                     owner_instance_id=self.owner_instance_id,
@@ -481,8 +824,13 @@ class SupervisorOwnership:
                 )
             except BaseException:
                 # Acquisition failures take precedence over best-effort
-                # rollback.  Still attempt both closes so a failure releasing
-                # the account descriptor cannot strand the database lock.
+                # rollback.  Still attempt every close so no earlier lock
+                # in the expanded ownership set can be stranded.
+                for ownership in reversed(acquired_incremental):
+                    try:
+                        ownership.close()
+                    except BaseException:
+                        pass
                 for descriptor in (account_descriptor, database_descriptor):
                     try:
                         _release_descriptor(descriptor)
@@ -496,36 +844,98 @@ class SupervisorOwnership:
             self._account_descriptor = account_descriptor
             self._owner_pid = os.getpid()
             _HELD_OWNERSHIPS.add(self)
-        return self
+            return self
+
+    def acquire_account(
+        self,
+        *,
+        channel: str,
+        bot_id: str,
+    ) -> ChannelAccountOwnership:
+        """Acquire one additional account while retaining both startup locks."""
+
+        account = _canonical_account((channel, bot_id))
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            if not self.held:
+                raise SupervisorOwnershipError(
+                    "incremental account acquisition requires held supervisor ownership"
+                )
+            if account == (self.channel, self.bot_id) or (
+                account in self._incremental_account_ownerships
+            ):
+                raise SupervisorOwnershipError(
+                    "channel account is already owned by this supervisor"
+                )
+            candidate = ChannelAccountOwnership(
+                channel=account[0],
+                bot_id=account[1],
+                lock_root=self.paths.root,
+                owner_instance_id=self.owner_instance_id,
+            )
+            candidate.acquire()
+            try:
+                self._incremental_account_ownerships[account] = candidate
+            except BaseException:
+                candidate.close()
+                raise
+            return candidate
+
+    def release_account(self, ownership: ChannelAccountOwnership) -> None:
+        """Release exactly one handle returned by :meth:`acquire_account`."""
+
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            account = next(
+                (
+                    key
+                    for key, candidate in self._incremental_account_ownerships.items()
+                    if candidate is ownership
+                ),
+                None,
+            )
+            if account is None:
+                raise SupervisorOwnershipError(
+                    "incremental account ownership does not belong to this supervisor"
+                )
+            ownership.close()
+            del self._incremental_account_ownerships[account]
 
     def close(self) -> None:
         """Release both kernel locks.  The stable rendezvous files remain."""
 
-        with _FORK_DESCRIPTOR_LOCK:
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
             _HELD_OWNERSHIPS.discard(self)
             _RETAINED_OWNERSHIPS.discard(self)
             account, self._account_descriptor = self._account_descriptor, None
             database, self._database_descriptor = self._database_descriptor, None
             self._owner_pid = None
             error: BaseException | None = None
+            for ownership in reversed(
+                tuple(self._incremental_account_ownerships.values())
+            ):
+                try:
+                    ownership.close()
+                except BaseException as exc:
+                    error = error or exc
             for descriptor in (account, database):
                 try:
                     _release_descriptor(descriptor)
-                except BaseException as exc:  # close both before reporting one error
+                except BaseException as exc:  # close all before reporting one error
                     error = error or exc
-        if error is not None:
-            raise SupervisorOwnershipError("supervisor ownership release failed") from error
+            if error is not None:
+                raise SupervisorOwnershipError(
+                    "supervisor ownership release failed"
+                ) from error
 
     release = close
 
     def retain_until_process_exit(self) -> None:
         """Keep fatal-shutdown ownership live even if local references unwind."""
 
-        if not self.held:
-            raise SupervisorOwnershipError(
-                "cannot retain supervisor ownership that is not held"
-            )
-        with _FORK_DESCRIPTOR_LOCK:
+        with _FORK_DESCRIPTOR_LOCK, self._account_mutation_lock:
+            if not self.held:
+                raise SupervisorOwnershipError(
+                    "cannot retain supervisor ownership that is not held"
+                )
             _RETAINED_OWNERSHIPS.add(self)
 
     def __enter__(self) -> "SupervisorOwnership":
@@ -547,7 +957,11 @@ class SupervisorOwnership:
 __all__ = [
     "ChannelAccountOwnership",
     "CredentialMutationOwnership",
+    "DatabaseOwnership",
     "DEFAULT_SUPERVISOR_LOCK_ROOT",
+    "MultiAccountOwnership",
+    "SupervisorAccountSetLockPaths",
+    "SupervisorAccountSetOwnership",
     "SupervisorLockPaths",
     "SupervisorLockSecurityError",
     "SupervisorOwnership",

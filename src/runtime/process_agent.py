@@ -47,7 +47,7 @@ from typing import Any, Callable
 
 _PROTOCOL_VERSION = 1
 _DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
-_DEFAULT_MAX_PROCESSES = 16
+_DEFAULT_MAX_PROCESSES = 32
 _BRIDGE_CAPABILITY_METADATA_KEY = "_process_agent_bridge_capability"
 _AGENT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _CONFIG_PROFILE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -164,6 +164,28 @@ class ProcessAgentLostError(ProcessAgentError):
         self.agent_id = agent_id
         self.generation = generation
         self.pid = pid
+        self.execution_uncertain = True
+
+
+class ProcessAgentSteeringUncertainError(ProcessAgentError):
+    """A steer may have reached the child but its acknowledgement was lost."""
+
+    execution_uncertain = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        agent_id: str,
+        generation: int,
+        task_id: str,
+        steering_id: str,
+    ) -> None:
+        super().__init__(message)
+        self.agent_id = agent_id
+        self.generation = generation
+        self.task_id = task_id
+        self.steering_id = steering_id
         self.execution_uncertain = True
 
 
@@ -810,7 +832,11 @@ class _ChildSession:
         self._active_execution: asyncio.Task[None] | None = None
         self._active_run_id: str | None = None
         self._active_task_id: str | None = None
+        self._active_execution_id: str | None = None
+        self._active_accepting_steering = False
         self._execution_started = asyncio.Event()
+        self._backend_ready_or_done = asyncio.Event()
+        self._steer_lock = asyncio.Lock()
         self._interrupt_latch: set[str] = set()
         self._stopping = False
         self._done = asyncio.Event()
@@ -935,6 +961,9 @@ class _ChildSession:
             kind = incoming["type"]
             if kind == "run":
                 await self._accept_run(incoming)
+            elif kind == "steer":
+                task = asyncio.create_task(self._handle_steer(incoming))
+                self._track_control_task(task)
             elif kind == "interrupt":
                 task = asyncio.create_task(self._handle_interrupt(incoming))
                 self._track_control_task(task)
@@ -979,9 +1008,19 @@ class _ChildSession:
         # backend registers its native turn.
         self._active_run_id = str(incoming["id"])
         self._active_task_id = task_id
+        self._active_execution_id = str(
+            task_payload.get("execution_id", "") or ""
+        )
+        self._active_accepting_steering = True
         self._execution_started.clear()
+        backend_ready_or_done = asyncio.Event()
+        self._backend_ready_or_done = backend_ready_or_done
         execution = asyncio.create_task(
-            self._execute_run(str(incoming["id"]), task_payload)
+            self._execute_run(
+                str(incoming["id"]),
+                task_payload,
+                backend_ready_or_done=backend_ready_or_done,
+            )
         )
         self._active_execution = execution
 
@@ -989,6 +1028,8 @@ class _ChildSession:
         self,
         request_id: str,
         task_payload: Mapping[str, Any],
+        *,
+        backend_ready_or_done: asyncio.Event,
     ) -> None:
         self._execution_started.set()
         _AgentTask, _AgentEvent, AgentResult = _runtime_types()
@@ -1026,6 +1067,11 @@ class _ChildSession:
                         },
                     )
 
+                # CodexRuntime registers its task steering latch synchronously
+                # when this coroutine is first awaited.  Publish the child
+                # boundary immediately before that await so an earlier IPC
+                # request waits instead of spuriously reporting no task.
+                backend_ready_or_done.set()
                 result = runtime.run(task, emit)
                 if inspect.isawaitable(result):
                     result = await result
@@ -1067,15 +1113,92 @@ class _ChildSession:
                 ),
             )
         finally:
-            if self._active_task_id is not None:
-                self._interrupt_latch.discard(self._active_task_id)
-            self._active_run_id = None
-            self._active_task_id = None
+            self._active_accepting_steering = False
+            backend_ready_or_done.set()
+            # An accepted backend steer owns this lock through its response.
+            # Do not publish RESULT or reuse the child slot until that exact
+            # delivery has resolved.
+            async with self._steer_lock:
+                if self._active_run_id == request_id:
+                    if self._active_task_id is not None:
+                        self._interrupt_latch.discard(self._active_task_id)
+                    self._active_run_id = None
+                    self._active_task_id = None
+                    self._active_execution_id = None
         result_payload = _result_payload_for_ipc(dict(result.as_dict()))
         await self.send(
             "result",
             {"ok": True, "result": _wire_value(result_payload)},
             reply_to=request_id,
+        )
+
+    async def _handle_steer(self, incoming: Mapping[str, Any]) -> None:
+        payload = incoming["payload"]
+        steering_id = str(payload.get("steering_id", "") or "")
+        backend_invoked = False
+        try:
+            run_id = str(payload.get("run_id", "") or "")
+            task_id = str(payload.get("task_id", "") or "")
+            execution_id = str(payload.get("execution_id", "") or "")
+            boundary = self._backend_ready_or_done
+            accepted = False
+            if (
+                run_id
+                and task_id
+                and run_id == self._active_run_id
+                and task_id == self._active_task_id
+                and execution_id == self._active_execution_id
+            ):
+                async with self._steer_lock:
+                    await boundary.wait()
+                    if (
+                        self._active_accepting_steering
+                        and run_id == self._active_run_id
+                        and task_id == self._active_task_id
+                        and execution_id == self._active_execution_id
+                        and boundary is self._backend_ready_or_done
+                    ):
+                        runtime = self.runtime
+                        steer = getattr(runtime, "steer", None)
+                        if callable(steer):
+                            kwargs = _supported_kwargs(
+                                steer,
+                                {
+                                    "steering_id": steering_id,
+                                    "execution_id": execution_id,
+                                },
+                            )
+                            backend_invoked = True
+                            outcome = steer(
+                                task_id,
+                                payload.get("inputs"),
+                                **kwargs,
+                            )
+                            accepted = bool(
+                                await outcome
+                                if inspect.isawaitable(outcome)
+                                else outcome
+                            )
+            response = {
+                "ok": True,
+                "value": accepted,
+                "steering_id": steering_id,
+            }
+        except BaseException as exc:
+            response = {
+                "ok": False,
+                "error": _sanitized_ipc_error(
+                    str(exc), fallback=exc.__class__.__name__
+                ),
+                "execution_uncertain": bool(
+                    getattr(exc, "execution_uncertain", backend_invoked)
+                ),
+                "steering_id": steering_id,
+            }
+        await self.send(
+            "steer_ack",
+            response,
+            reply_to=str(incoming["id"]),
         )
 
     async def _handle_interrupt(self, incoming: Mapping[str, Any]) -> None:
@@ -1394,11 +1517,13 @@ class ProcessAgentRuntime:
         self._lifecycle_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._slot_lock = asyncio.Lock()
+        self._steer_lock = asyncio.Lock()
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._budget_reserved = False
         self._expected_stop = False
         self._active_run_id: str | None = None
         self._active_task_id: str | None = None
+        self._active_execution_id: str | None = None
         self._active_task: Any | None = None
         self._active_emit: Callable[[Any], Any] | None = None
         self._lost_error: ProcessAgentLostError | None = None
@@ -1667,10 +1792,14 @@ class ProcessAgentRuntime:
                 ).strip() or None
             payload = _task_payload(task, bridge_capability=capability)
             run_id = uuid.uuid4().hex
-            self._active_run_id = run_id
-            self._active_task_id = task_id
-            self._active_task = task
-            self._active_emit = emit
+            async with self._steer_lock:
+                self._active_run_id = run_id
+                self._active_task_id = task_id
+                self._active_execution_id = str(
+                    payload.get("execution_id", "") or ""
+                )
+                self._active_task = task
+                self._active_emit = emit
             self._health = ProcessAgentHealth.BUSY
             future = self._register_pending(run_id)
             try:
@@ -1694,12 +1823,133 @@ class ProcessAgentRuntime:
                 raise
             finally:
                 self._pending.pop(run_id, None)
-                self._active_run_id = None
-                self._active_task_id = None
-                self._active_task = None
-                self._active_emit = None
+                async with self._steer_lock:
+                    if self._active_run_id == run_id:
+                        self._active_run_id = None
+                        self._active_task_id = None
+                        self._active_execution_id = None
+                        self._active_task = None
+                        self._active_emit = None
                 if self._health is ProcessAgentHealth.BUSY:
                     self._health = ProcessAgentHealth.READY
+
+    async def steer(
+        self,
+        task_id: str,
+        inputs: Any,
+        *,
+        steering_id: str = "",
+        execution_id: str = "",
+    ) -> bool:
+        """Steer the exact active run without waiting for its execution slot."""
+
+        self._assert_loop()
+        canonical_task_id = str(task_id)
+        if not canonical_task_id:
+            return False
+        async with self._steer_lock:
+            process = self._process
+            if (
+                process is None
+                or process.exitcode is not None
+                or self._health is not ProcessAgentHealth.BUSY
+                or self._active_run_id is None
+                or self._active_task_id != canonical_task_id
+                or self._active_execution_id is None
+                or (
+                    execution_id
+                    and self._active_execution_id != str(execution_id)
+                )
+            ):
+                return False
+            run_id = self._active_run_id
+            execution_id = self._active_execution_id
+            generation = self._generation
+            correlation = str(steering_id or "")
+            request_id = uuid.uuid4().hex
+            future = self._register_pending(request_id)
+            sent = False
+            try:
+                await self._send(
+                    "steer",
+                    {
+                        "run_id": run_id,
+                        "task_id": canonical_task_id,
+                        "execution_id": execution_id,
+                        "inputs": _wire_value(inputs),
+                        "steering_id": correlation,
+                    },
+                    message_id=request_id,
+                )
+                sent = True
+                response = await asyncio.shield(future)
+            except (asyncio.CancelledError, ProcessAgentLostError):
+                raise
+            except BaseException as exc:
+                if not sent:
+                    raise
+                raise ProcessAgentSteeringUncertainError(
+                    "Agent child steering response was lost",
+                    agent_id=self.agent_id,
+                    generation=generation,
+                    task_id=canonical_task_id,
+                    steering_id=correlation,
+                ) from exc
+            finally:
+                self._pending.pop(request_id, None)
+            try:
+                if response.get("type") != "steer_ack":
+                    raise ProcessAgentProtocolError(
+                        "expected child steer_ack response"
+                    )
+                response_payload = response.get("payload")
+                if type(response_payload) is not dict:
+                    raise ProcessAgentProtocolError(
+                        "child STEER acknowledgement payload is invalid"
+                    )
+                if str(response_payload.get("steering_id", "") or "") != correlation:
+                    raise ProcessAgentProtocolError(
+                        "child STEER acknowledgement identity conflicts"
+                    )
+                if response_payload.get("ok") is not True:
+                    error = str(
+                        response_payload.get("error")
+                        or "child steering operation failed"
+                    )
+                    execution_uncertain = response_payload.get(
+                        "execution_uncertain", False
+                    )
+                    if type(execution_uncertain) is not bool:
+                        raise ProcessAgentProtocolError(
+                            "child STEER uncertainty marker is invalid"
+                        )
+                    if execution_uncertain:
+                        raise ProcessAgentSteeringUncertainError(
+                            error,
+                            agent_id=self.agent_id,
+                            generation=generation,
+                            task_id=canonical_task_id,
+                            steering_id=correlation,
+                        )
+                    raise ProcessAgentRemoteError(error)
+                accepted = response_payload.get("value")
+                if type(accepted) is not bool:
+                    raise ProcessAgentProtocolError(
+                        "child STEER acknowledgement is invalid"
+                    )
+                return accepted
+            except (ProcessAgentRemoteError, ProcessAgentSteeringUncertainError):
+                raise
+            except BaseException as exc:
+                # The request crossed the pipe.  A malformed or
+                # mis-correlated response cannot prove whether it took effect.
+                raise ProcessAgentSteeringUncertainError(
+                    "Agent child steering acknowledgement was invalid",
+                    agent_id=self.agent_id,
+                    generation=generation,
+                    task_id=canonical_task_id,
+                    steering_id=correlation,
+                ) from exc
 
     async def interrupt(self, task_id: str) -> bool:
         """Interrupt only the active task in this exact Agent process."""
@@ -2368,4 +2618,5 @@ __all__ = [
     "ProcessAgentRemoteError",
     "ProcessAgentRuntime",
     "ProcessAgentStartupError",
+    "ProcessAgentSteeringUncertainError",
 ]

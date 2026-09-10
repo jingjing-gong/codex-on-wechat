@@ -12,6 +12,7 @@ import pytest
 openai_codex = pytest.importorskip("openai_codex")
 from openai_codex import (  # noqa: E402
     ApprovalMode,
+    InvalidRequestError,
     LocalImageInput,
     Sandbox,
     SkillInput,
@@ -39,7 +40,10 @@ from openai_codex.models import (  # noqa: E402
     TurnCompletedNotification,
 )
 
-from src.agents.base import AgentTask  # noqa: E402
+from src.agents.base import (  # noqa: E402
+    AgentSteeringUncertainError,
+    AgentTask,
+)
 from src.agents.codex_runtime import CodexRuntime  # noqa: E402
 from src.codex_agent import CodexAgent  # noqa: E402
 from src.runtime.manager import TaskManager  # noqa: E402
@@ -810,6 +814,231 @@ def test_explicit_interrupt_finishes_as_interrupted():
     asyncio.run(scenario())
 
 
+class _SteerableTurn(_FakeTurn):
+    def __init__(self) -> None:
+        super().__init__(())
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.first_steer_started = asyncio.Event()
+        self.release_first_steer = asyncio.Event()
+        self.steer_calls: list[Any] = []
+        self.steer_active = 0
+        self.maximum_steer_active = 0
+
+    async def steer(self, inputs: Any) -> None:
+        self.steer_active += 1
+        self.maximum_steer_active = max(
+            self.maximum_steer_active, self.steer_active
+        )
+        self.steer_calls.append(inputs)
+        try:
+            if len(self.steer_calls) == 1:
+                self.first_steer_started.set()
+                await self.release_first_steer.wait()
+        finally:
+            self.steer_active -= 1
+
+    def stream(self):
+        async def produce():
+            self.started.set()
+            await self.release.wait()
+            yield "done"
+            yield _turn_notification(TurnStatus.completed)
+
+        return produce()
+
+
+class _SteerableThread(_FakeThread):
+    def __init__(self, *, delay_turn: bool = False) -> None:
+        super().__init__(())
+        self.turn_handle = _SteerableTurn()
+        self.delay_turn = delay_turn
+        self.turn_called = asyncio.Event()
+        self.allow_turn = asyncio.Event()
+
+    async def turn(self, input_value: Any, **kwargs: Any) -> _SteerableTurn:
+        self.start_kwargs.append(dict(kwargs))
+        self.turn_called.set()
+        if self.delay_turn:
+            await self.allow_turn.wait()
+        self.turn_handle.turn_calls.append((input_value, dict(kwargs)))
+        self.turns.append(self.turn_handle)
+        return self.turn_handle
+
+
+class _SteerableCodex(_FakeCodex):
+    def __init__(self, *, delay_turn: bool = False) -> None:
+        self.thread = _SteerableThread(delay_turn=delay_turn)
+        self.thread_start_calls = []
+        self.thread_resume_calls = []
+
+
+def test_active_turn_steering_is_translated_and_serialized_in_arrival_order():
+    async def scenario() -> None:
+        fake = _SteerableCodex()
+        runtime = CodexRuntime(codex=fake, cwd="/workspace", turn_timeout=2)
+        running = asyncio.create_task(runtime.run(_task()))
+        await fake.thread.turn_handle.started.wait()
+        assert (
+            await runtime.steer(
+                "task-1", "stale", execution_id="stale-execution"
+            )
+            is False
+        )
+        assert fake.thread.turn_handle.steer_calls == []
+
+        first = asyncio.create_task(
+            runtime.steer("task-1", {"text": "first"}, steering_id="s-1")
+        )
+        await fake.thread.turn_handle.first_steer_started.wait()
+        second = asyncio.create_task(
+            runtime.steer("task-1", {"text": "second"}, steering_id="s-2")
+        )
+        await asyncio.sleep(0)
+
+        assert len(fake.thread.turn_handle.steer_calls) == 1
+        fake.thread.turn_handle.release_first_steer.set()
+        assert await asyncio.gather(first, second) == [True, True]
+        assert fake.thread.turn_handle.maximum_steer_active == 1
+        translated = fake.thread.turn_handle.steer_calls
+        assert [value.text for value in translated] == ["first", "second"]
+
+        fake.thread.turn_handle.release.set()
+        assert (await running).status == "completed"
+        assert await runtime.steer("task-1", "too late") is False
+        assert await runtime.steer("another-task", "wrong task") is False
+
+    asyncio.run(scenario())
+
+
+def test_steering_waits_for_delayed_native_turn_registration():
+    async def scenario() -> None:
+        fake = _SteerableCodex(delay_turn=True)
+        runtime = CodexRuntime(codex=fake, cwd="/workspace", turn_timeout=2)
+        running = asyncio.create_task(runtime.run(_task()))
+        await fake.thread.turn_called.wait()
+
+        steering = asyncio.create_task(runtime.steer("task-1", "during startup"))
+        await asyncio.sleep(0)
+        assert not steering.done()
+
+        fake.thread.allow_turn.set()
+        await fake.thread.turn_handle.first_steer_started.wait()
+        fake.thread.turn_handle.release_first_steer.set()
+        assert await steering is True
+        assert fake.thread.turn_handle.steer_calls == ["during startup"]
+
+        fake.thread.turn_handle.release.set()
+        assert (await running).status == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_turn_completion_waits_for_inflight_steer_and_rejects_queued_input():
+    async def scenario() -> None:
+        fake = _SteerableCodex()
+        runtime = CodexRuntime(codex=fake, cwd="/workspace", turn_timeout=2)
+        running = asyncio.create_task(runtime.run(_task()))
+        await fake.thread.turn_handle.started.wait()
+
+        accepted = asyncio.create_task(runtime.steer("task-1", "accepted"))
+        await fake.thread.turn_handle.first_steer_started.wait()
+        too_late = asyncio.create_task(runtime.steer("task-1", "too late"))
+        fake.thread.turn_handle.release.set()
+        while runtime._active_steering["task-1"].accepting:
+            await asyncio.sleep(0)
+        assert not running.done()
+
+        fake.thread.turn_handle.release_first_steer.set()
+        assert await accepted is True
+        assert await too_late is False
+        assert (await running).status == "completed"
+        assert fake.thread.turn_handle.steer_calls == ["accepted"]
+
+    asyncio.run(scenario())
+
+
+def test_native_steer_timeout_is_delivery_uncertain():
+    async def scenario() -> None:
+        fake = _SteerableCodex()
+        runtime = CodexRuntime(codex=fake, cwd="/workspace", turn_timeout=0.05)
+        running = asyncio.create_task(runtime.run(_task()))
+        await fake.thread.turn_handle.started.wait()
+
+        with pytest.raises(AgentSteeringUncertainError) as raised:
+            await runtime.steer("task-1", "may have arrived")
+        assert isinstance(raised.value.__cause__, asyncio.TimeoutError)
+        assert raised.value.execution_uncertain is True
+        assert (await running).status == "failed"
+
+    asyncio.run(scenario())
+
+
+def test_steering_waiter_returns_false_when_turn_start_times_out():
+    async def scenario() -> None:
+        fake = _SteerableCodex(delay_turn=True)
+        runtime = CodexRuntime(codex=fake, cwd="/workspace", turn_timeout=0.05)
+        running = asyncio.create_task(runtime.run(_task()))
+        await fake.thread.turn_called.wait()
+        steering = asyncio.create_task(runtime.steer("task-1", "during startup"))
+
+        result = await running
+        assert result.status == "failed"
+        assert result.error == "Codex turn timed out"
+        assert await steering is False
+        assert fake.thread.turn_handle.steer_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_active_handle_without_public_steer_is_not_accepted():
+    async def scenario() -> None:
+        fake = _BlockingCodex()
+        runtime = CodexRuntime(codex=fake, cwd="/workspace", turn_timeout=1)
+        running = asyncio.create_task(runtime.run(_task()))
+        await fake.thread.blocking_turn.started.wait()
+        assert await runtime.steer("task-1", "follow up") is False
+        fake.thread.blocking_turn.release.set()
+        await running
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("message", "returns_false"),
+    (
+        ("no active turn to steer", True),
+        ("expected active turn id `turn-1` but found `turn-2`", True),
+        ("cannot steer a review turn", False),
+    ),
+)
+def test_steering_only_downgrades_proven_inactive_sdk_errors(
+    message: str,
+    returns_false: bool,
+):
+    class RejectingTurn(_SteerableTurn):
+        async def steer(self, _inputs: Any) -> None:
+            raise InvalidRequestError(-32600, message)
+
+    async def scenario() -> None:
+        fake = _SteerableCodex()
+        fake.thread.turn_handle = RejectingTurn()
+        runtime = CodexRuntime(codex=fake, cwd="/workspace", turn_timeout=1)
+        running = asyncio.create_task(runtime.run(_task()))
+        await fake.thread.turn_handle.started.wait()
+        if returns_false:
+            assert await runtime.steer("task-1", "follow up") is False
+        else:
+            with pytest.raises(AgentSteeringUncertainError) as raised:
+                await runtime.steer("task-1", "follow up")
+            assert isinstance(raised.value.__cause__, InvalidRequestError)
+            assert message in str(raised.value.__cause__)
+        fake.thread.turn_handle.release.set()
+        await running
+
+    asyncio.run(scenario())
+
+
 def test_local_image_input_requires_managed_root(tmp_path):
     async def scenario() -> None:
         inside = tmp_path / "inside.png"
@@ -996,6 +1225,171 @@ def test_collaboration_bridge_context_is_scoped_to_the_current_task():
         assert "src.agent_cli" in context.text
         assert "'/tmp/agent bridge.sock'" in context.text
         assert prompt.text == "hello"
+
+    asyncio.run(scenario())
+
+
+def test_natural_cron_bridge_context_requires_two_turn_confirmation():
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        runtime = CodexRuntime(
+            codex=fake,
+            cwd="/workspace",
+            agent_bridge_command=("python", "-m", "src.agent_cli"),
+            agent_bridge_capability_issuer=lambda _task: "cron-capability",
+        )
+        task = _task(
+            task_id="natural-cron-task",
+            inbound_message_id="inbound-natural-cron",
+            profile_version=3,
+            policy_version=3,
+            metadata={
+                "effective_policy": {
+                    "profile_id": "codex",
+                    "profile_version": 3,
+                    "mode_id": "chat",
+                    "mode_policy_version": 3,
+                    "can_execute_commands": True,
+                    "can_send_agent_messages": False,
+                },
+                "mode": {
+                    "mode_id": "chat",
+                    "policy_version": 3,
+                    "sandbox_policy": "full-access",
+                    "approval_policy": "deny_all",
+                },
+            },
+        )
+
+        result = await runtime.run(task)
+
+        assert result.status == "completed"
+        input_value = fake.thread.turns[0].turn_calls[0][0]
+        assert isinstance(input_value, list)
+        context, prompt = input_value
+        assert isinstance(context, TextInput)
+        assert isinstance(prompt, TextInput)
+        assert "cron propose" in context.text
+        assert "created: false" in context.text
+        assert "no job exists yet" in context.text
+        assert "reply exactly `确认` or `confirm`" in context.text
+        assert "Never call `cron confirm` during the same user input" in context.text
+        assert "cron pending" in context.text
+        assert "Never claim that a cron job was created" in context.text
+        assert "Asia/Shanghai" in context.text
+        assert " send <agent-id> " not in context.text
+        assert prompt.text == "hello"
+
+    asyncio.run(scenario())
+
+
+def test_natural_cron_bridge_is_not_advertised_to_non_human_or_recursive_work():
+    async def scenario() -> None:
+        cases = (
+            {},
+            {"inbound_message_id": "inbound", "parent_task_id": "parent"},
+            {"inbound_message_id": "inbound", "child_depth": 1},
+            {"inbound_message_id": "inbound", "metadata_marker": "cron"},
+            {"inbound_message_id": "inbound", "metadata_marker": "cron_job_id"},
+            {"inbound_message_id": "inbound", "metadata_marker": "internal_mailbox"},
+            {"inbound_message_id": "inbound", "can_execute_commands": False},
+        )
+        for ordinal, case in enumerate(cases):
+            fake = _FakeCodex(_message_notifications())
+            issued = 0
+
+            def issue(_task):
+                nonlocal issued
+                issued += 1
+                return "must-not-be-issued"
+
+            runtime = CodexRuntime(
+                codex=fake,
+                cwd="/workspace",
+                agent_bridge_command=("python", "-m", "src.agent_cli"),
+                agent_bridge_capability_issuer=issue,
+            )
+            metadata = {
+                "effective_policy": {
+                    "profile_id": "codex",
+                    "profile_version": 3,
+                    "mode_id": "chat",
+                    "mode_policy_version": 3,
+                    "can_execute_commands": case.get("can_execute_commands", True),
+                    "can_send_agent_messages": False,
+                },
+                "mode": {
+                    "mode_id": "chat",
+                    "policy_version": 3,
+                    "sandbox_policy": "full-access",
+                    "approval_policy": "deny_all",
+                },
+            }
+            marker = case.get("metadata_marker")
+            if marker:
+                metadata[str(marker)] = True
+            task = _task(
+                task_id=f"non-cron-capability-{ordinal}",
+                inbound_message_id=case.get("inbound_message_id"),
+                parent_task_id=case.get("parent_task_id"),
+                child_depth=case.get("child_depth", 0),
+                profile_version=3,
+                policy_version=3,
+                metadata=metadata,
+            )
+
+            result = await runtime.run(task)
+
+            assert result.status == "completed"
+            assert issued == 0
+            input_value = fake.thread.turns[0].turn_calls[0][0]
+            assert isinstance(input_value, TextInput)
+            assert input_value.text == "hello"
+
+    asyncio.run(scenario())
+
+
+def test_cron_task_keeps_peer_bridge_without_advertising_recursive_cron():
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        runtime = CodexRuntime(
+            codex=fake,
+            cwd="/workspace",
+            agent_bridge_command=("python", "-m", "src.agent_cli"),
+            agent_bridge_capability_issuer=lambda _task: "peer-capability",
+        )
+        task = _task(
+            inbound_message_id="compatibility-inbound",
+            profile_version=3,
+            policy_version=3,
+            metadata={
+                "cron_job_id": "cron-job-a",
+                "effective_policy": {
+                    "profile_id": "codex",
+                    "profile_version": 3,
+                    "mode_id": "chat",
+                    "mode_policy_version": 3,
+                    "can_execute_commands": True,
+                    "can_send_agent_messages": True,
+                },
+                "mode": {
+                    "mode_id": "chat",
+                    "policy_version": 3,
+                    "sandbox_policy": "full-access",
+                    "approval_policy": "deny_all",
+                },
+            },
+        )
+
+        result = await runtime.run(task)
+
+        assert result.status == "completed"
+        input_value = fake.thread.turns[0].turn_calls[0][0]
+        assert isinstance(input_value, list)
+        context = input_value[0]
+        assert isinstance(context, TextInput)
+        assert "send <agent-id>" in context.text
+        assert "cron propose" not in context.text
 
     asyncio.run(scenario())
 

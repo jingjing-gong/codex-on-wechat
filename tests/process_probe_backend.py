@@ -23,6 +23,7 @@ class BarrierProbeBackend:
         self.agent_id = str(agent_id)
         self.configured_cwd = str(_kwargs.get("cwd") or "")
         self._interrupts: dict[str, asyncio.Event] = {}
+        self._steering: dict[str, dict[str, Any]] = {}
         self._image_output_publisher = _kwargs.get("image_output_publisher")
 
     async def start(self) -> None:
@@ -34,6 +35,18 @@ class BarrierProbeBackend:
 
     async def run(self, task: Any, emit: Any) -> dict[str, Any]:
         metadata = dict(task.metadata)
+        if metadata.get("probe_task_provenance"):
+            return {
+                "task_id": str(task.task_id),
+                "execution_id": task.execution_id,
+                "status": "completed",
+                "content": "task-provenance-probed",
+                "metadata": {
+                    "inbound_message_id": getattr(
+                        task, "inbound_message_id", None
+                    ),
+                },
+            }
         if metadata.get("probe_workspace"):
             snapshot = metadata.get("execution_workspace")
             return {
@@ -103,13 +116,25 @@ class BarrierProbeBackend:
         root = Path(str(metadata["probe_root"]))
         root.mkdir(parents=True, exist_ok=True)
         task_id = str(task.task_id)
-        pre_register_marker = str(metadata.get("pre_register_marker", "") or "")
-        if pre_register_marker:
-            Path(pre_register_marker).touch()
-            await asyncio.sleep(float(metadata.get("pre_register_delay", 1.0)))
-        interrupt = asyncio.Event()
-        self._interrupts[task_id] = interrupt
+        steering_state = {
+            "root": root,
+            "calls": [],
+            "delay": float(metadata.get("steer_delay", 0) or 0),
+            "entered_marker": str(
+                metadata.get("steer_entered_marker", "") or ""
+            ),
+            "fail_uncertain": bool(metadata.get("steer_fail_uncertain", False)),
+            "ready": asyncio.Event(),
+        }
+        self._steering[task_id] = steering_state
         try:
+            pre_register_marker = str(metadata.get("pre_register_marker", "") or "")
+            if pre_register_marker:
+                Path(pre_register_marker).touch()
+                await asyncio.sleep(float(metadata.get("pre_register_delay", 1.0)))
+            steering_state["ready"].set()
+            interrupt = asyncio.Event()
+            self._interrupts[task_id] = interrupt
             (root / f"{task_id}.entered.json").write_text(
                 json.dumps(
                     {
@@ -155,7 +180,47 @@ class BarrierProbeBackend:
                 "events": [],
             }
         finally:
+            steering_state["ready"].set()
             self._interrupts.pop(task_id, None)
+            self._steering.pop(task_id, None)
+
+    async def steer(
+        self,
+        task_id: str,
+        inputs: Any,
+        *,
+        steering_id: str = "",
+        execution_id: str = "",
+    ) -> bool:
+        state = self._steering.get(str(task_id))
+        if state is None:
+            return False
+        await state["ready"].wait()
+        if self._steering.get(str(task_id)) is not state:
+            return False
+        if state["entered_marker"]:
+            Path(state["entered_marker"]).touch()
+        delay = float(state["delay"])
+        if delay:
+            await asyncio.sleep(delay)
+        calls = state["calls"]
+        calls.append(
+            {
+                "execution_id": str(execution_id),
+                "inputs": inputs,
+                "steering_id": str(steering_id),
+            }
+        )
+        root = Path(state["root"])
+        (root / f"{task_id}.steering.json").write_text(
+            json.dumps(calls, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        if state["fail_uncertain"]:
+            error = RuntimeError("synthetic post-steer acknowledgement failure")
+            error.execution_uncertain = True
+            raise error
+        return True
 
     async def interrupt(self, task_id: str) -> bool:
         interrupt = self._interrupts.get(str(task_id))

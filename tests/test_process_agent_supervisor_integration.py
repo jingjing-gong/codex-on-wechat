@@ -77,6 +77,13 @@ def test_supervisor_worker_count_ignores_legacy_single_worker(monkeypatch, caplo
     assert "CODEX_WECHAT_WORKERS is deprecated and ignored" in caplog.text
 
 
+def test_default_process_capacity_has_headroom_beyond_sixteen_agents(monkeypatch):
+    monkeypatch.delenv("CODEX_WECHAT_MAX_AGENT_PROCESSES", raising=False)
+
+    assert _DEFAULT_MAX_AGENT_PROCESSES == 32
+    assert _agent_supervisor_worker_count() == 32
+
+
 def test_production_builder_constructs_only_process_proxy(monkeypatch, tmp_path: Path):
     captured = {}
 

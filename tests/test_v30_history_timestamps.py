@@ -292,7 +292,7 @@ def test_pre_v28_offset_invocation_history_migrates_to_canonical_utc(
                 (invocation_id,),
             )
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (28,29,30,31,32,33,34,35)"
+                "DELETE FROM schema_migrations WHERE version IN (28,29,30,31,32,33,34,35,36,37,38,39,40,41)"
             )
             connection.commit()
 
@@ -318,7 +318,7 @@ def test_pre_v28_offset_invocation_history_migrates_to_canonical_utc(
                 "2026-08-15T00:00:00.000000+00:00",
                 "2026-08-15T00:00:03.000000+00:00",
                 "2026-08-15T00:00:03.000000+00:00",
-                35,
+                41,
             )
         finally:
             await migrated.close()
@@ -406,7 +406,7 @@ def _prepare_v29_ordering_seed(path, corruption: str) -> str:
             raise AssertionError(corruption)
         connection.execute(trigger_sql)
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35)"
+            "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35,36,37,38,39,40,41)"
         )
         connection.commit()
     return invocation_id
@@ -540,7 +540,7 @@ def _prepare_review(
                 "DROP COLUMN authorization_grant_digest"
             )
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35)"
+                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35,36,37,38,39,40,41)"
             )
             connection.commit()
     return expected_id, maintenance_id, reviewed_at
@@ -595,7 +595,7 @@ def _prepare_rejected_review(path, suffix: str, *, legacy_shape: bool = True):
                 "DROP COLUMN authorization_grant_digest"
             )
             connection.execute(
-                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35)"
+                "DELETE FROM schema_migrations WHERE version IN (30,31,32,33,34,35,36,37,38,39,40,41)"
             )
             connection.commit()
     return expected_id, maintenance_id, reviewed_at
@@ -1055,7 +1055,7 @@ def test_v29_review_id_may_equal_invocation_id_through_v31(tmp_path):
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone() == (35,)
+        ).fetchone() == (41,)
         assert connection.execute(
             "SELECT COUNT(*) FROM agent_invocation_events "
             "WHERE source_kind='mailbox_orphan_review' AND source_id=? "
@@ -1131,7 +1131,7 @@ def test_v30_to_v31_canonicalizes_review_and_event_together(tmp_path):
         connection.execute(event_trigger)
         connection.execute(review_trigger)
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version IN (31,32,33,34,35)"
+            "DELETE FROM schema_migrations WHERE version IN (31,32,33,34,35,36,37,38,39,40,41)"
         )
         connection.commit()
 
@@ -1171,7 +1171,7 @@ def test_v30_to_v31_canonicalizes_review_and_event_together(tmp_path):
     assert text_to_datetime(str(retained[3])) == text_to_datetime(
         _offset_text(_utc_text(reviewed_at))
     )
-    assert retained[5] == 35
+    assert retained[5] == 41
 
 
 def test_v30_to_v31_canonicalizes_rejected_review_timestamp(tmp_path):
@@ -1225,7 +1225,7 @@ def test_v30_to_v31_canonicalizes_rejected_review_timestamp(tmp_path):
         )
         connection.execute(trigger_sql)
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version IN (31,32,33,34,35)"
+            "DELETE FROM schema_migrations WHERE version IN (31,32,33,34,35,36,37,38,39,40,41)"
         )
         connection.commit()
 
@@ -1266,4 +1266,4 @@ def test_v30_to_v31_canonicalizes_rejected_review_timestamp(tmp_path):
         _offset_text(_utc_text(reviewed_at))
     )
     assert event_count == 0
-    assert version == 35
+    assert version == 41

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
+import signal
 import time
 from typing import Any
 
@@ -18,8 +20,10 @@ from src.agents.workspace import (
 from src.runtime.process_agent import (
     ProcessAgentCapacityError,
     ProcessAgentError,
+    ProcessAgentLostError,
     ProcessAgentRuntime,
     ProcessAgentStartupError,
+    ProcessAgentSteeringUncertainError,
 )
 
 
@@ -53,6 +57,32 @@ def _runtime(
     return ProcessAgentRuntime.create(agent_id, **values)
 
 
+def test_inbound_message_provenance_survives_process_boundary(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        runtime = _runtime("alpha", tmp_path)
+        task = AgentTask(
+            task_id="provenance-task",
+            execution_id="provenance-execution",
+            agent_id="alpha",
+            conversation_id="conversation-alpha",
+            inputs="inspect provenance",
+            metadata={"probe_task_provenance": True},
+            inbound_message_id="inbound-human-message",
+        )
+        try:
+            result = await runtime.run(task)
+            assert result.status == "completed"
+            assert result.metadata == {
+                "inbound_message_id": "inbound-human-message"
+            }
+        finally:
+            await runtime.stop()
+
+    asyncio.run(scenario())
+
+
 def test_interrupt_before_backend_registration_always_returns_result(
     tmp_path: Path,
 ) -> None:
@@ -78,6 +108,189 @@ def test_interrupt_before_backend_registration_always_returns_result(
             result = await asyncio.wait_for(running, timeout=5)
             assert result.status == "interrupted"
             assert result.interrupted is True
+        finally:
+            await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_steering_waits_for_registration_and_preserves_order_without_slot_lock(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        runtime = _runtime("alpha", tmp_path, event_ack_timeout=0.02)
+        root = tmp_path / "steering-barriers"
+        marker = tmp_path / "steering-pre-registration.entered"
+        task = AgentTask(
+            task_id="steered-task",
+            execution_id="execution-steered-task",
+            agent_id="alpha",
+            conversation_id="conversation-alpha",
+            inputs="wait",
+            metadata={
+                "probe_root": str(root),
+                "pre_register_marker": str(marker),
+                "pre_register_delay": 0.15,
+            },
+        )
+        try:
+            await runtime.start()
+            running = asyncio.create_task(runtime.run(task))
+            while runtime._active_task_id != task.task_id:
+                await asyncio.sleep(0)
+            assert await runtime.steer("another-task", "wrong") is False
+            assert (
+                await runtime.steer(
+                    task.task_id,
+                    "stale",
+                    execution_id="stale-execution",
+                )
+                is False
+            )
+
+            await _wait_for_path(marker)
+            first = asyncio.create_task(
+                runtime.steer(
+                    task.task_id,
+                    {"text": "first"},
+                    steering_id="steering-1",
+                    execution_id=task.execution_id,
+                )
+            )
+            second = asyncio.create_task(
+                runtime.steer(
+                    task.task_id,
+                    {"text": "second"},
+                    steering_id="steering-2",
+                    execution_id=task.execution_id,
+                )
+            )
+            # Registration takes longer than the ordinary IPC ack timeout;
+            # the proxy must keep the definitely-unsent request latched.
+            await asyncio.sleep(0.05)
+            assert not first.done()
+            assert not second.done()
+            assert await asyncio.gather(first, second) == [True, True]
+
+            steering_path = root / f"{task.task_id}.steering.json"
+            await _wait_for_path(steering_path)
+            assert json.loads(steering_path.read_text(encoding="utf-8")) == [
+                {
+                    "execution_id": task.execution_id,
+                    "inputs": {"text": "first"},
+                    "steering_id": "steering-1",
+                },
+                {
+                    "execution_id": task.execution_id,
+                    "inputs": {"text": "second"},
+                    "steering_id": "steering-2",
+                },
+            ]
+            (root / f"{task.task_id}.release").touch()
+            assert (await running).status == "completed"
+            assert (
+                await runtime.steer(
+                    task.task_id,
+                    "too late",
+                    execution_id=task.execution_id,
+                )
+                is False
+            )
+        finally:
+            await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_post_effect_steering_failure_remains_delivery_uncertain(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        runtime = _runtime("alpha", tmp_path)
+        root = tmp_path / "uncertain-steering"
+        task = AgentTask(
+            task_id="uncertain-task",
+            execution_id="execution-uncertain-task",
+            agent_id="alpha",
+            conversation_id="conversation-alpha",
+            inputs="wait",
+            metadata={
+                "probe_root": str(root),
+                "steer_fail_uncertain": True,
+            },
+        )
+        try:
+            running = asyncio.create_task(runtime.run(task))
+            await _wait_for_path(root / f"{task.task_id}.entered.json")
+            with pytest.raises(ProcessAgentSteeringUncertainError) as raised:
+                await runtime.steer(
+                    task.task_id,
+                    "possibly applied",
+                    steering_id="steering-uncertain",
+                    execution_id=task.execution_id,
+                )
+            assert raised.value.execution_uncertain is True
+            assert raised.value.steering_id == "steering-uncertain"
+            steering_path = root / f"{task.task_id}.steering.json"
+            assert steering_path.exists()
+            (root / f"{task.task_id}.release").touch()
+            assert (await running).status == "completed"
+        finally:
+            await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="requires SIGKILL")
+def test_child_loss_after_steer_dispatch_is_uncertain(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = _runtime("alpha", tmp_path)
+        root = tmp_path / "lost-steering"
+        marker = tmp_path / "steer-dispatched"
+        task = AgentTask(
+            task_id="lost-steer-task",
+            execution_id="execution-lost-steer-task",
+            agent_id="alpha",
+            conversation_id="conversation-alpha",
+            inputs="wait",
+            metadata={
+                "probe_root": str(root),
+                "steer_delay": 30,
+                "steer_entered_marker": str(marker),
+            },
+        )
+        try:
+            # Before a RUN is assigned, absence is proven and retry-safe.
+            assert (
+                await runtime.steer(
+                    task.task_id,
+                    "not sent",
+                    steering_id="pre-write",
+                    execution_id=task.execution_id,
+                )
+                is False
+            )
+
+            running = asyncio.create_task(runtime.run(task))
+            await _wait_for_path(root / f"{task.task_id}.entered.json")
+            steering = asyncio.create_task(
+                runtime.steer(
+                    task.task_id,
+                    "sent before crash",
+                    steering_id="lost-ack",
+                    execution_id=task.execution_id,
+                )
+            )
+            await _wait_for_path(marker)
+            process = runtime._process
+            assert process is not None and process.exitcode is None
+            process.kill()
+
+            with pytest.raises(ProcessAgentLostError) as raised:
+                await asyncio.wait_for(steering, timeout=5)
+            assert raised.value.execution_uncertain is True
+            with pytest.raises(ProcessAgentLostError):
+                await asyncio.wait_for(running, timeout=5)
         finally:
             await runtime.stop()
 

@@ -697,7 +697,7 @@ def test_migrations_23_and_24_are_idempotent_over_a_schema_22_database(
         with sqlite3.connect(path) as connection:
             assert connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone() == (35,)
+            ).fetchone() == (41,)
             columns = {
                 str(row[1])
                 for row in connection.execute(

@@ -167,7 +167,7 @@ def test_fresh_v27_schema_has_canonical_foreign_keys(tmp_path):
                 }
 
             schema = await store._call(inspect)
-            assert schema["version"] == 35
+            assert schema["version"] == 41
             assert {
                 "agent_invocations",
                 "agent_admission_counters",
