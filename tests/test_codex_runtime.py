@@ -43,8 +43,18 @@ from openai_codex.models import (  # noqa: E402
 from src.agents.base import (  # noqa: E402
     AgentSteeringUncertainError,
     AgentTask,
+    ReplyTarget,
 )
 from src.agents.codex_runtime import CodexRuntime  # noqa: E402
+from src.agents.lark_tool_identity import (  # noqa: E402
+    LARK_CREDENTIAL_ENV_KEYS,
+    LARK_ENVIRONMENT_EXCLUDES,
+    LARK_TOOL_IDENTITY_METADATA_KEY,
+    LARK_UNAVAILABLE_CONFIG_DIR,
+    config_dir_identity,
+    lark_shell_environment_set,
+    lark_tool_identity_for_profile,
+)
 from src.codex_agent import CodexAgent  # noqa: E402
 from src.runtime.manager import TaskManager  # noqa: E402
 from src.runtime.registry import AgentRegistry, codex_profile  # noqa: E402
@@ -1120,6 +1130,12 @@ def test_turn_kwargs_match_openai_codex_01444_surface():
                 "cwd": "/workspace",
                 "model": "gpt-test",
                 "config": {
+                    "shell_environment_policy": {
+                        "exclude": list(LARK_ENVIRONMENT_EXCLUDES),
+                        "set": lark_shell_environment_set(
+                            LARK_UNAVAILABLE_CONFIG_DIR
+                        ),
+                    },
                     "features": {"unified_exec": False},
                     "tool_output_token_limit": 500,
                 },
@@ -1136,6 +1152,177 @@ def test_turn_kwargs_match_openai_codex_01444_surface():
         assert turn_kwargs["cwd"] == "/workspace"
         assert turn_kwargs["model"] == "gpt-test"
         assert turn_kwargs["effort"] == "high"
+
+    asyncio.run(scenario())
+
+
+def _lark_identity(config_dir: Path, app_id: str, profile_id: str) -> dict[str, Any]:
+    canonical = str(config_dir.resolve(strict=False))
+    return {
+        "version": 1,
+        "state": "bound",
+        "source": "origin_bot",
+        "profile_id": profile_id,
+        "bot_id": app_id,
+        "brand": "feishu",
+        "config_dir": canonical,
+        "config_dir_identity": config_dir_identity(canonical),
+    }
+
+
+def test_lark_profile_snapshot_preserves_absolute_path_alias_contract():
+    config_dir = "/tmp/cow-lark-path-alias"
+    snapshot = lark_tool_identity_for_profile(
+        {
+            "profile_id": "lark-alias",
+            "channel": "lark",
+            "bot_id": "cli_aliasaccount",
+            "brand": "feishu",
+            "config_dir": config_dir,
+            "config_dir_identity": config_dir_identity(config_dir),
+            "enabled": True,
+            "removed_at": None,
+        }
+    )
+    assert snapshot["config_dir"] == config_dir
+    assert snapshot["config_dir_identity"] == config_dir_identity(config_dir)
+
+
+def test_lark_origin_configures_new_and_resumed_threads_without_global_fallback(
+    tmp_path,
+):
+    async def scenario() -> None:
+        config_dir = tmp_path / "lark-a"
+        identity = _lark_identity(config_dir, "cli_account_a", "lark-a")
+        metadata = {LARK_TOOL_IDENTITY_METADATA_KEY: identity}
+
+        starting = _FakeCodex(_message_notifications())
+        runtime = CodexRuntime(codex=starting, cwd="/workspace")
+        result = await runtime.run(_task(metadata=metadata))
+        assert result.status == "completed"
+        policy = starting.thread_start_calls[0]["config"][
+            "shell_environment_policy"
+        ]
+        assert policy["set"] == lark_shell_environment_set(str(config_dir))
+        assert set(LARK_CREDENTIAL_ENV_KEYS).issubset(policy["exclude"])
+        assert {
+            "LARKSUITE_CLI_CONFIG_DIR",
+            "LARK_CHANNEL",
+            "LARK*",
+            "FEISHU*",
+            "OPENCLAW_*",
+            "HERMES_*",
+        }.issubset(policy["exclude"])
+
+        resumed = _FakeCodex(_message_notifications())
+        restarted_runtime = CodexRuntime(codex=resumed, cwd="/workspace")
+        resumed_result = await restarted_runtime.run(
+            _task(
+                task_id="task-resumed",
+                thread_id="thread-1",
+                metadata=metadata,
+            )
+        )
+        assert resumed_result.status == "completed"
+        assert resumed.thread_start_calls == []
+        assert resumed.thread_resume_calls[0][0] == "thread-1"
+        assert resumed.thread_resume_calls[0][1]["config"] == (
+            starting.thread_start_calls[0]["config"]
+        )
+
+    asyncio.run(scenario())
+
+
+def test_lark_and_wechat_binding_changes_reconfigure_without_losing_history(
+    tmp_path,
+):
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        runtime = CodexRuntime(codex=fake, cwd="/workspace")
+        identity_a = _lark_identity(
+            tmp_path / "lark-a", "cli_account_a", "lark-a"
+        )
+        identity_b = _lark_identity(
+            tmp_path / "lark-b", "cli_account_b", "lark-b"
+        )
+        first = await runtime.run(
+            _task(metadata={LARK_TOOL_IDENTITY_METADATA_KEY: identity_a})
+        )
+        second = await runtime.run(
+            _task(
+                task_id="task-2",
+                metadata={LARK_TOOL_IDENTITY_METADATA_KEY: identity_b},
+            )
+        )
+        unbound = await runtime.run(
+            _task(
+                task_id="task-3",
+                reply_target=ReplyTarget(
+                    channel="wechat",
+                    bot_id="wechat-bot",
+                    external_user_id="owner",
+                ),
+                metadata={},
+            )
+        )
+
+        assert (
+            first.thread_id
+            == second.thread_id
+            == unbound.thread_id
+            == "thread-1"
+        )
+        assert len(fake.thread_start_calls) == 1
+        assert len(fake.thread_resume_calls) == 2
+        resumed_id, kwargs = fake.thread_resume_calls[0]
+        assert resumed_id == "thread-1"
+        assert kwargs["config"]["shell_environment_policy"]["set"][
+            "LARKSUITE_CLI_CONFIG_DIR"
+        ] == str((tmp_path / "lark-b").resolve())
+        unbound_id, unbound_kwargs = fake.thread_resume_calls[1]
+        assert unbound_id == "thread-1"
+        assert unbound_kwargs["config"]["shell_environment_policy"]["set"][
+            "LARKSUITE_CLI_CONFIG_DIR"
+        ] == LARK_UNAVAILABLE_CONFIG_DIR
+
+    asyncio.run(scenario())
+
+
+def test_unavailable_lark_origin_fails_closed_and_malformed_snapshot_is_rejected():
+    async def scenario() -> None:
+        fake = _FakeCodex(_message_notifications())
+        runtime = CodexRuntime(codex=fake, cwd="/workspace")
+        unavailable = {
+            "version": 1,
+            "state": "unavailable",
+            "source": "origin_bot",
+            "bot_id": "cli_missing",
+        }
+        result = await runtime.run(
+            _task(metadata={LARK_TOOL_IDENTITY_METADATA_KEY: unavailable})
+        )
+        assert result.status == "completed"
+        assert fake.thread_start_calls[0]["config"][
+            "shell_environment_policy"
+        ]["set"]["LARKSUITE_CLI_CONFIG_DIR"] == LARK_UNAVAILABLE_CONFIG_DIR
+
+        malformed = _FakeCodex(_message_notifications())
+        malformed_runtime = CodexRuntime(codex=malformed, cwd="/workspace")
+        rejected = await malformed_runtime.run(
+            _task(
+                task_id="task-malformed",
+                metadata={
+                    LARK_TOOL_IDENTITY_METADATA_KEY: {
+                        **unavailable,
+                        "config_dir": "/ambient/tmpbot",
+                    }
+                },
+            )
+        )
+        assert rejected.status == "failed"
+        assert "snapshot is malformed" in str(rejected.error)
+        assert malformed.thread_start_calls == []
+        assert malformed.thread_resume_calls == []
 
     asyncio.run(scenario())
 
@@ -2587,8 +2774,10 @@ class _GateCodex:
     def __init__(self, tracker: _ConcurrencyTracker) -> None:
         self.tracker = tracker
         self.thread_number = 0
+        self.thread_start_calls: list[dict[str, Any]] = []
 
-    async def thread_start(self, **_kwargs: Any) -> _GateThread:
+    async def thread_start(self, **kwargs: Any) -> _GateThread:
+        self.thread_start_calls.append(dict(kwargs))
         self.thread_number += 1
         return _GateThread(self.tracker, self.thread_number)
 
@@ -2646,5 +2835,53 @@ def test_runtime_serializes_modes_per_conversation_but_allows_other_conversation
             cross_first, cross_second
         )
         assert cross_first_result.status == cross_second_result.status == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_conversations_keep_different_lark_bot_configs_isolated(tmp_path):
+    async def scenario() -> None:
+        tracker = _ConcurrencyTracker()
+        codex = _GateCodex(tracker)
+        runtime = CodexRuntime(codex=codex, cwd="/workspace")
+        identity_a = _lark_identity(
+            tmp_path / "lark-a", "cli_account_a", "lark-a"
+        )
+        identity_b = _lark_identity(
+            tmp_path / "lark-b", "cli_account_b", "lark-b"
+        )
+        first = asyncio.create_task(
+            runtime.run(
+                _task(
+                    task_id="lark-a-task",
+                    conversation_id="conversation-a",
+                    metadata={LARK_TOOL_IDENTITY_METADATA_KEY: identity_a},
+                )
+            )
+        )
+        second = asyncio.create_task(
+            runtime.run(
+                _task(
+                    task_id="lark-b-task",
+                    conversation_id="conversation-b",
+                    metadata={LARK_TOOL_IDENTITY_METADATA_KEY: identity_b},
+                )
+            )
+        )
+        await _wait_for_started(tracker, 2)
+        configured_dirs = {
+            call["config"]["shell_environment_policy"]["set"][
+                "LARKSUITE_CLI_CONFIG_DIR"
+            ]
+            for call in codex.thread_start_calls
+        }
+        assert configured_dirs == {
+            str((tmp_path / "lark-a").resolve()),
+            str((tmp_path / "lark-b").resolve()),
+        }
+        for release in tracker.releases:
+            release.set()
+        results = await asyncio.gather(first, second)
+        assert [result.status for result in results] == ["completed", "completed"]
 
     asyncio.run(scenario())

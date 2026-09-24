@@ -159,6 +159,10 @@ class CodexAgent(CodexRuntime):
             persona_composition_version=str(
                 default_role["persona_composition_version"]
             ),
+            provider_id="",
+            model_id="",
+            context_config_fingerprint="",
+            lark_tool_identity_fingerprint="",
             thread_id=str(getattr(thread, "id", thread_id)),
             thread=thread,
         )

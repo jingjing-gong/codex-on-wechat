@@ -1103,11 +1103,20 @@ class LarkCliProcess:
                 _signal_process_group(process, signal.SIGKILL)
         output = (stdout or b"").decode("utf-8", errors="replace").strip()
         raw_error = (stderr or b"").decode("utf-8", errors="replace").strip()
+        stderr_value = _last_json_object(raw_error)
         if strict_single_object:
-            stdout_value = _strict_json_object(output)
+            try:
+                stdout_value = _strict_json_object(output)
+            except LarkProtocolError:
+                if not (
+                    process.returncode != 0
+                    and isinstance(stderr_value, Mapping)
+                    and _error_detail(stderr_value)
+                ):
+                    raise
+                stdout_value = {}
         else:
             stdout_value = _last_json_object(output)
-        stderr_value = _last_json_object(raw_error)
         value = stdout_value or {}
         detail = _error_detail(
             value if value.get("ok") is False else None,

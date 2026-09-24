@@ -210,9 +210,9 @@ class Client:
             get_updates_buf=buf, base_info=BaseInfo(channel_version="1.0.0")
         )
         timeout = (
-            max(LONG_POLL_TIMEOUT + 5, self._timeout)
+            max(LONG_POLL_TIMEOUT + 15, self._timeout)
             if self._timeout is not None
-            else LONG_POLL_TIMEOUT + 5
+            else LONG_POLL_TIMEOUT + 15
         )
         data = self._post("/ilink/bot/getupdates", req, timeout=timeout)
         return GetUpdatesResponse.model_validate(data)

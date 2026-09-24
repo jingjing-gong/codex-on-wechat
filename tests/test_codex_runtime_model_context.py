@@ -10,6 +10,11 @@ import pytest
 from src.agents import model_context
 from src.agents.base import AgentTask
 from src.agents.codex_runtime import CodexRuntime
+from src.agents.lark_tool_identity import (
+    LARK_ENVIRONMENT_EXCLUDES,
+    LARK_UNAVAILABLE_CONFIG_DIR,
+    lark_shell_environment_set,
+)
 from src.agents.model_context import (
     ModelContextResolutionError,
     ModelContextSettings,
@@ -87,6 +92,10 @@ def _expected_config(window: int, threshold: int) -> dict[str, Any]:
         "model_context_window": window,
         "model_auto_compact_token_limit": threshold,
         "model_auto_compact_token_limit_scope": "total",
+        "shell_environment_policy": {
+            "exclude": list(LARK_ENVIRONMENT_EXCLUDES),
+            "set": lark_shell_environment_set(LARK_UNAVAILABLE_CONFIG_DIR),
+        },
         "features": {"unified_exec": False},
         "tool_output_token_limit": 500,
     }

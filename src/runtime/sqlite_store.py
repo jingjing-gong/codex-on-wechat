@@ -159,6 +159,10 @@ from .identity import (
 logger = logging.getLogger(__name__)
 
 
+class _PermanentCronJobError(StoreError):
+    """A deterministic stored cron snapshot error safe to quarantine."""
+
+
 # Startup state is recovered when the first connection to a durable database
 # opens in this process.  Additional stores may legitimately share that
 # database (for example, channel and maintenance facades); treating each
@@ -35477,7 +35481,12 @@ class SQLiteStore:
         conversation_subject_id: str | None,
         now_text: str,
     ) -> dict[str, Any]:
-        """Validate and freeze a complete occurrence-independent AgentTask."""
+        """Validate and freeze an occurrence-independent AgentTask template.
+
+        The stored provider ``thread_id`` records creation-time provenance;
+        each occurrence resolves the current exact-context binding again so a
+        later ``/clear`` remains authoritative.
+        """
 
         lifecycle = conn.execute(
             """SELECT profile_version,lifecycle_state,desired_process_state
@@ -37127,37 +37136,54 @@ class SQLiteStore:
     ) -> TaskRecord:
         template = json_loads(job["task_template_json"], {}) or {}
         if not isinstance(template, Mapping):
-            raise StoreError("cron task template is malformed")
+            raise _PermanentCronJobError("cron task template is malformed")
         template = dict(template)
-        target = cls._fresh_cron_reply_target(
-            ReplyTarget.from_value(template.get("reply_target", {}))
-        )
-        origin_target = cls._fresh_cron_reply_target(
-            ReplyTarget.from_value(
-                json_loads(job["origin_reply_target_json"], {}) or {}
+        try:
+            target = cls._fresh_cron_reply_target(
+                ReplyTarget.from_value(template.get("reply_target", {}))
             )
-        )
+            origin_target = cls._fresh_cron_reply_target(
+                ReplyTarget.from_value(
+                    json_loads(job["origin_reply_target_json"], {}) or {}
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise _PermanentCronJobError(
+                "cron task reply target is malformed"
+            ) from exc
         if cls._reply_target_snapshot(
             target.to_dict()
         ) != cls._reply_target_snapshot(origin_target.to_dict()):
-            raise StoreError("cron task template reply target was altered")
+            raise _PermanentCronJobError(
+                "cron task template reply target was altered"
+            )
         route_scope = str(job["origin_conversation_subject_scope"])
-        cls._validate_reply_target_scope(
-            target,
-            channel=str(job["origin_channel"]),
-            bot_id=str(job["origin_bot_id"]),
-            external_user_id=route_scope,
-            session_id=str(job["origin_session_id"] or "default"),
-        )
+        try:
+            cls._validate_reply_target_scope(
+                target,
+                channel=str(job["origin_channel"]),
+                bot_id=str(job["origin_bot_id"]),
+                external_user_id=route_scope,
+                session_id=str(job["origin_session_id"] or "default"),
+            )
+        except StoreError as exc:
+            raise _PermanentCronJobError(str(exc)) from exc
         actor = str(template.get("actor_external_user_id") or "")
         if actor != str(job["origin_external_user_id"]):
-            raise StoreError("cron task template actor was altered")
+            raise _PermanentCronJobError("cron task template actor was altered")
         if str(template.get("agent_id") or "") != str(job["agent_id"]):
-            raise StoreError("cron task template Agent was altered")
-        if int(template.get("profile_version") or 0) <= 0 or int(
-            template.get("policy_version") or 0
-        ) <= 0:
-            raise StoreError("cron task template policy is incomplete")
+            raise _PermanentCronJobError("cron task template Agent was altered")
+        try:
+            profile_version = int(template.get("profile_version") or 0)
+            policy_version = int(template.get("policy_version") or 0)
+        except (TypeError, ValueError) as exc:
+            raise _PermanentCronJobError(
+                "cron task template policy is malformed"
+            ) from exc
+        if profile_version <= 0 or policy_version <= 0:
+            raise _PermanentCronJobError(
+                "cron task template policy is incomplete"
+            )
         lifecycle = conn.execute(
             "SELECT profile_version,lifecycle_state,desired_process_state "
             "FROM agent_lifecycle WHERE agent_id=? AND agent_incarnation=?",
@@ -37168,14 +37194,13 @@ class SQLiteStore:
             != AgentLifecycleState.ENABLED.value
             or str(lifecycle["desired_process_state"])
             != AgentDesiredProcessState.RUNNING.value
-            or int(lifecycle["profile_version"])
-            != int(template["profile_version"])
+            or int(lifecycle["profile_version"]) != profile_version
         ):
             raise InvalidTransition("cron target Agent incarnation changed")
         profile = conn.execute(
             "SELECT enabled FROM agent_profiles WHERE agent_id=? "
             "AND profile_version=?",
-            (str(job["agent_id"]), int(template["profile_version"])),
+            (str(job["agent_id"]), profile_version),
         ).fetchone()
         mode = conn.execute(
             "SELECT 1 FROM agent_modes WHERE agent_id=? AND mode_id=? "
@@ -37183,7 +37208,7 @@ class SQLiteStore:
             (
                 str(job["agent_id"]),
                 str(template.get("mode_id") or ""),
-                int(template["policy_version"]),
+                policy_version,
             ),
         ).fetchone()
         if profile is None or not bool(profile["enabled"]) or mode is None:
@@ -37196,7 +37221,9 @@ class SQLiteStore:
             (conversation_id,),
         ).fetchone()
         if conversation is None:
-            raise StoreError("cron task conversation is unavailable")
+            raise _PermanentCronJobError(
+                "cron task conversation is unavailable"
+            )
         expected_conversation = (
             str(job["origin_channel"]),
             str(job["origin_bot_id"]),
@@ -37229,29 +37256,42 @@ class SQLiteStore:
                 ),
             ).fetchone()
         if actual_conversation != expected_conversation and principal_binding is None:
-            raise StoreError("cron task conversation origin was altered")
+            raise _PermanentCronJobError(
+                "cron task conversation origin was altered"
+            )
 
         metadata = template.get("metadata", {})
         if not isinstance(metadata, Mapping):
-            raise StoreError("cron task metadata is malformed")
+            raise _PermanentCronJobError("cron task metadata is malformed")
         metadata = dict(metadata)
-        role_snapshot = cls._task_role_snapshot_tx(
-            conn,
-            metadata=metadata,
-            channel=str(job["origin_channel"]),
-            bot_id=str(job["origin_bot_id"]),
-            external_user_id=route_scope,
-            session_id=str(job["origin_session_id"] or "default"),
-            agent_id=str(job["agent_id"]),
-        )
+        try:
+            role_snapshot = cls._task_role_snapshot_tx(
+                conn,
+                metadata=metadata,
+                channel=str(job["origin_channel"]),
+                bot_id=str(job["origin_bot_id"]),
+                external_user_id=route_scope,
+                session_id=str(job["origin_session_id"] or "default"),
+                agent_id=str(job["agent_id"]),
+            )
+        except StoreError as exc:
+            raise _PermanentCronJobError(str(exc)) from exc
         role_version, role_hash, persona_version = role_binding_key(role_snapshot)
+        # A cron template freezes the task's authorization and routing
+        # context, but its provider thread is only the continuation that was
+        # current when the job was created.  ``/clear`` deliberately removes
+        # that binding so future work starts a new conversation.  Resolve the
+        # live binding for the frozen *exact* context on every occurrence;
+        # when none exists, materialize an unbound task and let the runtime
+        # create a fresh thread.  Never resurrect the template's historical
+        # thread or borrow one from a different mode/policy/role context.
         thread_id = cls._resolve_task_thread_tx(
             conn,
-            supplied_thread_id=template.get("thread_id"),
+            supplied_thread_id=None,
             conversation_id=conversation_id,
             mode_id=str(template["mode_id"]),
-            profile_version=int(template["profile_version"]),
-            policy_version=int(template["policy_version"]),
+            profile_version=profile_version,
+            policy_version=policy_version,
             role_version=role_version,
             role_snapshot_hash=role_hash,
             persona_composition_version=persona_version,
@@ -37260,9 +37300,13 @@ class SQLiteStore:
         if not isinstance(inputs, Mapping) or str(inputs.get("text") or "") != str(
             job["prompt"]
         ):
-            raise StoreError("cron task prompt snapshot was altered")
+            raise _PermanentCronJobError(
+                "cron task prompt snapshot was altered"
+            )
         if set(inputs) - {"text"}:
-            raise StoreError("cron task template contains unsupported inputs")
+            raise _PermanentCronJobError(
+                "cron task template contains unsupported inputs"
+            )
 
         firing_id = cls._cron_occurrence_id(
             "firing", str(job["job_id"]), scheduled_for
@@ -37283,17 +37327,23 @@ class SQLiteStore:
         }
         identity_snapshot = template.get("identity_snapshot", {})
         if not isinstance(identity_snapshot, Mapping):
-            raise StoreError("cron task identity snapshot is malformed")
+            raise _PermanentCronJobError(
+                "cron task identity snapshot is malformed"
+            )
         supplied_subject = str(template.get("conversation_subject_id") or "")
         expected_subject = str(job["origin_conversation_subject_id"] or "")
         if supplied_subject != expected_subject:
-            raise StoreError("cron task conversation subject was altered")
+            raise _PermanentCronJobError(
+                "cron task conversation subject was altered"
+            )
         supplied_principal = str(template.get("principal_id") or "")
         supplied_account = str(template.get("principal_account_id") or "")
         if supplied_principal != principal_id or supplied_account != str(
             job["principal_account_id"] or ""
         ):
-            raise StoreError("cron task principal snapshot was altered")
+            raise _PermanentCronJobError(
+                "cron task principal snapshot was altered"
+            )
 
         conn.execute(
             """INSERT INTO tasks (
@@ -37319,8 +37369,8 @@ class SQLiteStore:
                 conversation_id,
                 thread_id,
                 str(template["mode_id"]),
-                int(template["profile_version"]),
-                int(template["policy_version"]),
+                profile_version,
+                policy_version,
                 str(template.get("model") or ""),
                 str(template.get("reasoning_effort") or ""),
                 json_dumps(target.to_dict()),
@@ -37513,6 +37563,17 @@ class SQLiteStore:
                             max_account_queue=self.max_account_queue,
                             max_account_agent_queue=self.max_account_agent_queue,
                         )
+                    except _PermanentCronJobError as exc:
+                        # Quarantine only deterministic, pre-insert snapshot
+                        # failures.  Plain StoreError/SQLite failures remain
+                        # retryable and must still escape this transaction.
+                        self._cron_job_disable_tx(
+                            conn,
+                            job_id=job_id,
+                            now_text=now_text,
+                            reason=f"invalid cron job: {exc}",
+                        )
+                        continue
                     except InvalidTransition as exc:
                         self._cron_job_disable_tx(
                             conn,
@@ -42968,6 +43029,31 @@ class SQLiteStore:
                 conn.execute(
                     "SELECT * FROM bot_profiles WHERE profile_id=?" + suffix,
                     (identity,),
+                ).fetchone()
+            )
+        )
+
+    async def get_bot_profile_for_account(
+        self,
+        channel: str,
+        bot_id: str,
+        *,
+        enabled: bool | None = None,
+    ) -> BotProfileRecord | None:
+        """Resolve the one live profile registered for an exact bot account."""
+
+        channel_value = self._required_store_identity(channel, "channel").lower()
+        bot_value = self._required_store_identity(bot_id, "bot_id")
+        predicate = "channel=? AND bot_id=? AND removed_at IS NULL"
+        params: list[Any] = [channel_value, bot_value]
+        if enabled is not None:
+            predicate += " AND enabled=?"
+            params.append(int(bool(enabled)))
+        return await self._call(
+            lambda conn: self._bot_profile_from_row(
+                conn.execute(
+                    "SELECT * FROM bot_profiles WHERE " + predicate,
+                    params,
                 ).fetchone()
             )
         )

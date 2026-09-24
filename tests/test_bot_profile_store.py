@@ -184,6 +184,85 @@ def test_bot_profile_crud_uniqueness_generation_and_pending_removal(tmp_path):
     asyncio.run(scenario())
 
 
+def test_get_bot_profile_for_account_filters_live_and_enabled(tmp_path):
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        await store.initialize()
+        try:
+            created = await store.create_bot_profile(_profile())
+
+            assert (
+                await store.get_bot_profile_for_account(
+                    " LARK ", "cli_botaccount1"
+                )
+                == created
+            )
+            assert (
+                await store.get_bot_profile_for_account(
+                    "lark", "cli_botaccount1", enabled=True
+                )
+                == created
+            )
+            assert (
+                await store.get_bot_profile_for_account(
+                    "lark", "cli_botaccount1", enabled=False
+                )
+                is None
+            )
+            assert (
+                await store.get_bot_profile_for_account(
+                    "lark", "cli_otheraccount"
+                )
+                is None
+            )
+
+            disabled = await store.disable_bot_profile(created.profile_id)
+            assert (
+                await store.get_bot_profile_for_account(
+                    "lark", created.bot_id
+                )
+                == disabled
+            )
+            assert (
+                await store.get_bot_profile_for_account(
+                    "lark", created.bot_id, enabled=True
+                )
+                is None
+            )
+            assert (
+                await store.get_bot_profile_for_account(
+                    "lark", created.bot_id, enabled=False
+                )
+                == disabled
+            )
+
+            assert await store.remove_bot_profile(created.profile_id)
+            assert (
+                await store.get_bot_profile_for_account(
+                    "lark", created.bot_id
+                )
+                is None
+            )
+
+            replacement = _profile("replacement")
+            replacement_created = await store.create_bot_profile(replacement)
+            assert (
+                await store.get_bot_profile_for_account(
+                    "lark", created.bot_id, enabled=True
+                )
+                == replacement_created
+            )
+
+            with pytest.raises(ValueError, match="channel is required"):
+                await store.get_bot_profile_for_account(" ", created.bot_id)
+            with pytest.raises(ValueError, match="bot_id is required"):
+                await store.get_bot_profile_for_account("lark", " ")
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
 def test_live_onboarding_profile_create_is_strict_and_rollback_is_retryable(
     tmp_path,
 ):

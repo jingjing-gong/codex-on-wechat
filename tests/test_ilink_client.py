@@ -422,10 +422,11 @@ def test_concurrent_close_waits_for_poll_and_send_and_closes_sessions_once(
     assert [session.close_calls for session in sessions] == [1, 1]
 
 
+@pytest.mark.parametrize("client_timeout, poll_timeout", [(2.5, 50), (75, 75)])
 def test_explicit_client_timeout_controls_requests_without_shortening_long_poll(
-    monkeypatch,
+    monkeypatch, client_timeout, poll_timeout
 ):
-    client = Client(timeout=2.5)
+    client = Client(timeout=client_timeout)
     calls: list[tuple[str, float]] = []
 
     def fake_post(path, _body, timeout):
@@ -445,12 +446,26 @@ def test_explicit_client_timeout_controls_requests_without_shortening_long_poll(
         client.close()
 
     assert calls == [
-        ("/ilink/bot/sendmessage", 2.5),
-        ("/ilink/bot/getconfig", 2.5),
-        ("/ilink/bot/sendtyping", 2.5),
-        ("/ilink/bot/getuploadurl", 2.5),
-        ("/ilink/bot/getupdates", 40),
+        ("/ilink/bot/sendmessage", client_timeout),
+        ("/ilink/bot/getconfig", client_timeout),
+        ("/ilink/bot/sendtyping", client_timeout),
+        ("/ilink/bot/getuploadurl", client_timeout),
+        ("/ilink/bot/getupdates", poll_timeout),
     ]
+
+
+def test_default_client_uses_50_second_long_poll_timeout(monkeypatch):
+    calls: list[tuple[str, float]] = []
+
+    def fake_post(path, _body, timeout):
+        calls.append((path, timeout))
+        return {"ret": 0, "errcode": 0}
+
+    with Client() as client:
+        monkeypatch.setattr(client, "_post", fake_post)
+        client.get_updates()
+
+    assert calls == [("/ilink/bot/getupdates", 50)]
 
 
 def test_client_rejects_nonpositive_timeout():

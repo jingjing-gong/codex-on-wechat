@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from src.agents.base import AgentResult, ReplyTarget
+from src.agents.lark_tool_identity import LARK_TOOL_IDENTITY_METADATA_KEY
 from src.agents.workspace import EXECUTION_WORKSPACE_KEY
 from src.channels.models import InboundEnvelope
 from src.runtime.identity import conversation_id
@@ -191,6 +192,12 @@ def test_compact_resolves_and_forwards_the_exact_current_agent_binding(
 
             metadata = kwargs["metadata"]
             assert metadata["session_role"] == session_role
+            assert metadata[LARK_TOOL_IDENTITY_METADATA_KEY] == {
+                "version": 1,
+                "state": "unavailable",
+                "source": "unbound",
+                "bot_id": "",
+            }
             assert metadata["profile"]["agent_id"] == "writer"
             assert metadata["profile"]["profile_version"] == 4
             assert metadata["mode"]["mode_id"] == "plan"

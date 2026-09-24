@@ -13,6 +13,8 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
+from requests.exceptions import ReadTimeout
+
 from .auth import _legacy_account_stem, accounts_dir, normalize_account_id
 from .client import Client
 from .types import ITEM_TYPE_TEXT, WeixinMessage
@@ -160,6 +162,10 @@ class Monitor:
         while not stop_event.is_set():
             try:
                 resp = self.client.get_updates(self._get_updates_buf)
+            except ReadTimeout:
+                logger.debug("GetUpdates long-poll read timeout; retrying")
+                stop_event.wait(INITIAL_BACKOFF)
+                continue
             except Exception as exc:  # network/timeout errors are expected
                 self._failures += 1
                 backoff = self._calc_backoff()

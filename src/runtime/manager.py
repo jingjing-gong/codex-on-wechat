@@ -40,6 +40,7 @@ from .identity import (
 )
 from .models import iter_model_descriptors, text_to_datetime
 from .registry import AgentRegistry, DYNAMIC_AGENT_SUMMARY, codex_profile
+from .lark_tool_binding import bind_lark_tool_identity
 from .worker import TaskWorker
 from .modes import ModeRegistry
 from .media import canonical_media_inputs
@@ -5993,6 +5994,11 @@ class TaskManager:
                 )
                 if execution_workspace is not None:
                     metadata[EXECUTION_WORKSPACE_KEY] = execution_workspace
+                metadata = await bind_lark_tool_identity(
+                    self.store,
+                    target,
+                    metadata,
+                )
 
                 get_binding = getattr(
                     self.store, "get_thread_binding", None

@@ -12,7 +12,7 @@ import pytest
 from src.agents.base import AgentResult, ReplyTarget
 from src.runtime.manager import TaskManager
 from src.runtime.identity import thread_conversation_subject
-from src.runtime.models import InboundMessage
+from src.runtime.models import AgentTask, InboundMessage
 from src.runtime.sqlite_store import SQLiteStore
 from src.runtime.store import QueueFullError, StoreError
 from src.runtime.worker import TaskWorker
@@ -511,6 +511,297 @@ def test_sqlite_cron_survives_restart_catches_up_once_and_routes_wechat(
         firings = await restarted.list_cron_firings("cron-restart")
         assert len(firings) == 1
         await restarted.close()
+
+    asyncio.run(scenario())
+
+
+async def _create_cron_with_bound_chat_thread(
+    store: SQLiteStore,
+    *,
+    job_id: str,
+    thread_id: str = "provider-thread-before-clear",
+) -> tuple[TaskManager, ReplyTarget, object, str]:
+    target = ReplyTarget(
+        channel="wechat",
+        bot_id="wechat-bot",
+        external_user_id="wx-owner",
+        session_id="default",
+        conversation_subject_scope="wx-owner",
+    )
+    manager = TaskManager(
+        store,
+        _Runtime(),
+        worker_count=0,
+        reconcile_interval=None,
+        cron_tick_interval=None,
+    )
+    seed = await manager.submit("establish provider thread", target)
+    assert await store.set_task_thread(seed.task_id, thread_id=thread_id)
+    created_at = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+    job = await manager.add_cron_job(
+        "every 1h",
+        "run after context clear",
+        job_id=job_id,
+        reply_target=target,
+        channel=target.channel,
+        bot_id=target.bot_id,
+        external_user_id=target.external_user_id,
+        session_id=target.session_id,
+        conversation_subject_scope=target.conversation_subject_scope,
+        agent_id="codex",
+        now=created_at,
+    )
+    assert job.task_template["thread_id"] == thread_id
+    assert job.task_template["conversation_id"] == seed.conversation_id
+    return manager, target, job, seed.conversation_id
+
+
+def test_cron_after_clear_starts_fresh_and_catches_up_only_once(tmp_path) -> None:
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "cron-clear.sqlite3")
+        await store.initialize()
+        try:
+            _, _, job, conversation_id = await _create_cron_with_bound_chat_thread(
+                store,
+                job_id="cron-clear-fresh",
+            )
+            assert await store.clear_thread_bindings(conversation_id) == 1
+
+            catch_up_at = datetime(2026, 9, 8, 3, 30, tzinfo=timezone.utc)
+            fired = await store.fire_next_due_cron_job(now=catch_up_at)
+            assert fired is not None
+            assert fired.task.thread_id is None
+            assert fired.firing.scheduled_for == datetime(
+                2026, 9, 8, 1, 0, tzinfo=timezone.utc
+            )
+            assert fired.job.next_fire_at == datetime(
+                2026, 9, 8, 4, 0, tzinfo=timezone.utc
+            )
+
+            # Scheduler retries at the same wall clock must not duplicate the
+            # single bounded catch-up occurrence after recovering from /clear.
+            assert await store.fire_next_due_cron_job(now=catch_up_at) is None
+            firings = await store.list_cron_firings(job.job_id)
+            assert [item.task_id for item in firings] == [fired.task.task_id]
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_cron_after_clear_uses_new_exact_context_thread_binding(tmp_path) -> None:
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "cron-clear-rebound.sqlite3")
+        await store.initialize()
+        try:
+            manager, target, _, conversation_id = (
+                await _create_cron_with_bound_chat_thread(
+                    store,
+                    job_id="cron-clear-rebound",
+                    thread_id="provider-thread-old",
+                )
+            )
+            assert await store.clear_thread_bindings(conversation_id) == 1
+
+            replacement = await manager.submit("new conversation", target)
+            assert replacement.conversation_id == conversation_id
+            assert replacement.thread_id is None
+            assert await store.set_task_thread(
+                replacement.task_id,
+                thread_id="provider-thread-new",
+            )
+
+            fired = await store.fire_next_due_cron_job(
+                now=datetime(2026, 9, 8, 1, 0, tzinfo=timezone.utc)
+            )
+            assert fired is not None
+            assert fired.task.thread_id == "provider-thread-new"
+            assert fired.task.thread_id != "provider-thread-old"
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_cron_after_clear_never_borrows_execute_context_thread(tmp_path) -> None:
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "cron-clear-execute.sqlite3")
+        await store.initialize()
+        try:
+            _, target, job, conversation_id = (
+                await _create_cron_with_bound_chat_thread(
+                    store,
+                    job_id="cron-clear-execute-isolation",
+                )
+            )
+            assert job.task_template["mode_id"] == "chat"
+            assert await store.clear_thread_bindings(conversation_id) == 1
+
+            execute_task = await store.create_task(
+                AgentTask(
+                    task_id="unrelated-execute-context",
+                    agent_id="codex",
+                    conversation_id=conversation_id,
+                    mode_id="execute",
+                    profile_version=int(job.task_template["profile_version"]),
+                    policy_version=1,
+                    reply_target=target,
+                    inputs={"text": "unrelated execute work"},
+                )
+            )
+            assert await store.set_task_thread(
+                execute_task.task_id,
+                thread_id="provider-thread-execute",
+            )
+            assert await store.get_thread_binding(
+                conversation_id,
+                mode_id="chat",
+                profile_version=int(job.task_template["profile_version"]),
+                policy_version=int(job.task_template["policy_version"]),
+            ) is None
+            assert await store.get_thread_binding(
+                conversation_id,
+                mode_id="execute",
+                profile_version=int(job.task_template["profile_version"]),
+                policy_version=1,
+            ) == "provider-thread-execute"
+
+            fired = await store.fire_next_due_cron_job(
+                now=datetime(2026, 9, 8, 1, 0, tzinfo=timezone.utc)
+            )
+            assert fired is not None
+            assert fired.task.mode_id == "chat"
+            assert fired.task.thread_id is None
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_permanently_invalid_cron_is_quarantined_without_blocking_next_due_job(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "cron-quarantine.sqlite3")
+        await store.initialize()
+        manager = TaskManager(
+            store,
+            _Runtime(),
+            worker_count=0,
+            reconcile_interval=None,
+            cron_tick_interval=None,
+        )
+        target = ReplyTarget(
+            channel="wechat",
+            bot_id="wechat-bot",
+            external_user_id="wx-owner",
+            conversation_subject_scope="wx-owner",
+        )
+        created_at = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+        try:
+            poisoned = await manager.add_cron_job(
+                "every 1h",
+                "poisoned work",
+                job_id="cron-a-poisoned",
+                reply_target=target,
+                channel=target.channel,
+                bot_id=target.bot_id,
+                external_user_id=target.external_user_id,
+                principal_mapping_revision=0,
+                agent_id="codex",
+                now=created_at,
+            )
+            healthy = await manager.add_cron_job(
+                "every 1h",
+                "healthy work",
+                job_id="cron-b-healthy",
+                reply_target=target,
+                channel=target.channel,
+                bot_id=target.bot_id,
+                external_user_id=target.external_user_id,
+                principal_mapping_revision=0,
+                agent_id="codex",
+                now=created_at,
+            )
+            await store._call(
+                lambda conn: conn.execute(
+                    "UPDATE cron_jobs SET task_template_json="
+                    "json_set(task_template_json,'$.actor_external_user_id',?) "
+                    "WHERE job_id=?",
+                    ("altered-actor", poisoned.job_id),
+                )
+            )
+
+            fired = await store.fire_next_due_cron_job(
+                now=datetime(2026, 9, 8, 1, 0, tzinfo=timezone.utc)
+            )
+            assert fired is not None
+            assert fired.job.job_id == healthy.job_id
+            assert fired.task.inputs == {"text": "healthy work"}
+
+            quarantined = await store.get_cron_job(poisoned.job_id)
+            assert quarantined is not None
+            assert not quarantined.enabled
+            assert quarantined.disabled_reason == (
+                "invalid cron job: cron task template actor was altered"
+            )
+            assert await store.list_cron_firings(poisoned.job_id) == []
+            assert len(await store.list_cron_firings(healthy.job_id)) == 1
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_plain_cron_store_error_propagates_without_disabling_job(tmp_path) -> None:
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "cron-transient-error.sqlite3")
+        await store.initialize()
+        manager = TaskManager(
+            store,
+            _Runtime(),
+            worker_count=0,
+            reconcile_interval=None,
+            cron_tick_interval=None,
+        )
+        target = ReplyTarget(
+            channel="wechat",
+            bot_id="wechat-bot",
+            external_user_id="wx-owner",
+            conversation_subject_scope="wx-owner",
+        )
+        created_at = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+        try:
+            job = await manager.add_cron_job(
+                "every 1h",
+                "retryable work",
+                job_id="cron-retryable-store-error",
+                reply_target=target,
+                channel=target.channel,
+                bot_id=target.bot_id,
+                external_user_id=target.external_user_id,
+                principal_mapping_revision=0,
+                agent_id="codex",
+                now=created_at,
+            )
+
+            def transient_failure(*_args: object, **_kwargs: object) -> object:
+                raise StoreError("transient store failure")
+
+            store._materialize_cron_task_tx = transient_failure  # type: ignore[method-assign]
+            with pytest.raises(StoreError, match="transient store failure"):
+                await store.fire_next_due_cron_job(
+                    now=datetime(2026, 9, 8, 1, 0, tzinfo=timezone.utc)
+                )
+
+            unchanged = await store.get_cron_job(job.job_id)
+            assert unchanged is not None
+            assert unchanged.enabled
+            assert unchanged.next_fire_at == job.next_fire_at
+            assert unchanged.disabled_reason is None
+            assert await store.list_cron_firings(job.job_id) == []
+        finally:
+            await store.close()
 
     asyncio.run(scenario())
 

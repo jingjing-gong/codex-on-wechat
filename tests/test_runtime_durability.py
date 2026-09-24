@@ -7,8 +7,13 @@ import sqlite3
 
 import pytest
 
-from src.agents.base import AgentEvent, AgentResult, AgentTask
+from src.agents.base import AgentEvent, AgentResult, AgentTask, ReplyTarget
+from src.agents.lark_tool_identity import (
+    LARK_TOOL_IDENTITY_METADATA_KEY,
+    config_dir_identity,
+)
 from src.runtime.media import AttachmentStore
+from src.runtime.lark_tool_binding import bind_lark_tool_identity
 from src.runtime.models import InboundMessage, ReplyFragmentState
 from src.runtime.sqlite_store import SQLiteStore
 from src.runtime.sqlite_store import StoreError
@@ -62,6 +67,244 @@ def test_worker_does_not_terminalize_after_thread_binding_persistence_error():
         with pytest.raises(StoreError, match="thread binding persistence failed"):
             await worker._finish(task, result, "claim-token")
         assert store.completed is False
+
+    asyncio.run(scenario())
+
+
+def test_lark_tool_binding_requires_owner_mapping_and_exact_bot_profile(tmp_path):
+    target = ReplyTarget(
+        channel="lark",
+        bot_id="cli_requestedbot",
+        external_user_id="ou_sender1234",
+    )
+    profile = {
+        "profile_id": "lark-other",
+        "channel": "lark",
+        "bot_id": "cli_otherbot",
+        "brand": "feishu",
+        "config_dir": str(tmp_path / "other"),
+        "config_dir_identity": config_dir_identity(tmp_path / "other"),
+        "enabled": True,
+        "removed_at": None,
+    }
+
+    class Store:
+        def __init__(self, principal_id: str) -> None:
+            self.principal_id = principal_id
+            self.profile_calls = 0
+
+        async def resolve_principal_account(self, **_scope):
+            return {
+                "principal_id": self.principal_id,
+                "channel": "lark",
+                "bot_id": target.bot_id,
+                "external_user_id": target.external_user_id,
+                "identifier_kind": "open_id",
+                "active": True,
+                "principal_enabled": True,
+            }
+
+        async def get_bot_profile_for_account(self, *_args, **_kwargs):
+            self.profile_calls += 1
+            return profile
+
+    async def scenario() -> None:
+        guest_store = Store("guest")
+        guest = await bind_lark_tool_identity(guest_store, target, {})
+        assert guest_store.profile_calls == 0
+        assert guest[LARK_TOOL_IDENTITY_METADATA_KEY]["state"] == "unavailable"
+
+        wrong_profile_store = Store("owner")
+        wrong_profile = await bind_lark_tool_identity(
+            wrong_profile_store,
+            target,
+            {},
+        )
+        assert wrong_profile_store.profile_calls == 1
+        assert wrong_profile[LARK_TOOL_IDENTITY_METADATA_KEY]["state"] == (
+            "unavailable"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_worker_overwrites_lark_tool_binding_from_exact_live_bot_profile(tmp_path):
+    class Runtime:
+        agent_id = "codex"
+
+        def __init__(self) -> None:
+            self.tasks: list[AgentTask] = []
+
+        async def run(self, task, _emit):
+            self.tasks.append(task)
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="completed",
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return True
+
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        runtime = Runtime()
+        config_dir = tmp_path / "lark-profile"
+        bot_id = "cli_exactaccount"
+        owner_open_id = "ou_owner1234"
+        try:
+            await store.create_principal(principal_id="owner")
+            await store.create_bot_profile(
+                {
+                    "profile_id": "lark-exact",
+                    "channel": "lark",
+                    "bot_id": bot_id,
+                    "brand": "feishu",
+                    "config_dir": str(config_dir),
+                    "config_dir_identity": config_dir_identity(config_dir),
+                    "cli_version": "1.0.92",
+                    "credential_ref": "keychain:lark/exact",
+                    "mention_policy": "direct_or_mention",
+                    "access_policy": "all",
+                    "restart_policy": {},
+                }
+            )
+            await store.map_principal_account(
+                principal_id="owner",
+                channel="lark",
+                bot_id=bot_id,
+                external_user_id=owner_open_id,
+                identifier_kind="open_id",
+                configured_by="test",
+            )
+            values = _task()
+            values.update(
+                {
+                    "conversation_id": "",
+                    "reply_target": {
+                        "channel": "lark",
+                        "bot_id": bot_id,
+                        "external_user_id": owner_open_id,
+                        "session_id": "default",
+                    },
+                    "metadata": {
+                        LARK_TOOL_IDENTITY_METADATA_KEY: {
+                            "version": 1,
+                            "state": "bound",
+                            "source": "origin_bot",
+                            "profile_id": "attacker",
+                            "bot_id": "cli_attacker",
+                            "brand": "feishu",
+                            "config_dir": "/ambient/tmpbot",
+                            "config_dir_identity": config_dir_identity(
+                                "/ambient/tmpbot"
+                            ),
+                        }
+                    },
+                }
+            )
+            task = await store.create_task(values)
+            worker = TaskWorker(store, runtime=runtime, worker_id="worker")
+
+            assert await worker.run_once() is True
+            assert len(runtime.tasks) == 1
+            snapshot = runtime.tasks[0].metadata[
+                LARK_TOOL_IDENTITY_METADATA_KEY
+            ]
+            assert snapshot == {
+                "version": 1,
+                "state": "bound",
+                "source": "origin_bot",
+                "profile_id": "lark-exact",
+                "bot_id": bot_id,
+                "brand": "feishu",
+                "config_dir": str(config_dir.absolute()),
+                "config_dir_identity": config_dir_identity(config_dir),
+            }
+            assert (await store.get_task(task.task_id)).state.value == "completed"
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_worker_fails_closed_when_lark_profile_was_disabled_before_execution(
+    tmp_path,
+):
+    class Runtime:
+        agent_id = "codex"
+
+        def __init__(self) -> None:
+            self.task: AgentTask | None = None
+
+        async def run(self, task, _emit):
+            self.task = task
+            return AgentResult(
+                task_id=task.task_id,
+                execution_id=task.execution_id,
+                status="completed",
+            )
+
+        async def interrupt(self, _task_id: str) -> bool:
+            return True
+
+    async def scenario() -> None:
+        store = SQLiteStore(tmp_path / "runtime.sqlite")
+        runtime = Runtime()
+        bot_id = "cli_disabledaccount"
+        owner_open_id = "ou_owner1234"
+        config_dir = tmp_path / "disabled-profile"
+        try:
+            await store.create_principal(principal_id="owner")
+            profile = await store.create_bot_profile(
+                {
+                    "profile_id": "lark-disabled",
+                    "channel": "lark",
+                    "bot_id": bot_id,
+                    "brand": "feishu",
+                    "config_dir": str(config_dir),
+                    "config_dir_identity": config_dir_identity(config_dir),
+                    "cli_version": "1.0.92",
+                    "credential_ref": "keychain:lark/disabled",
+                    "mention_policy": "direct_or_mention",
+                    "access_policy": "all",
+                    "restart_policy": {},
+                }
+            )
+            await store.map_principal_account(
+                principal_id="owner",
+                channel="lark",
+                bot_id=bot_id,
+                external_user_id=owner_open_id,
+                identifier_kind="open_id",
+                configured_by="test",
+            )
+            values = _task()
+            values.update(
+                {
+                    "conversation_id": "",
+                    "reply_target": {
+                        "channel": "lark",
+                        "bot_id": bot_id,
+                        "external_user_id": owner_open_id,
+                        "session_id": "default",
+                    },
+                }
+            )
+            await store.create_task(values)
+            await store.disable_bot_profile(profile.profile_id)
+            worker = TaskWorker(store, runtime=runtime, worker_id="worker")
+
+            assert await worker.run_once() is True
+            assert runtime.task is not None
+            assert runtime.task.metadata[LARK_TOOL_IDENTITY_METADATA_KEY] == {
+                "version": 1,
+                "state": "unavailable",
+                "source": "origin_bot",
+                "bot_id": bot_id,
+            }
+        finally:
+            await store.close()
 
     asyncio.run(scenario())
 

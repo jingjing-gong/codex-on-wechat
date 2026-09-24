@@ -66,6 +66,18 @@ if remote_meta_kind and sys.argv[1:2] != ["event"]:
 if sys.argv[1:] == ["--version"]:
     print("lark-cli " + os.environ.get("FAKE_LARK_VERSION", "1.0.92"))
     raise SystemExit(0)
+if (
+    os.environ.get("FAKE_LARK_VERIFY_ERROR") == "1"
+    and sys.argv[1:2] in (["auth"], ["whoami"])
+):
+    print(json.dumps({
+        "ok": False,
+        "error": {
+            "type": "api", "subtype": "unknown",
+            "message": "keychain Get failed: keychain access blocked", "hint": "..."
+        }
+    }), file=sys.stderr)
+    raise SystemExit(1)
 if sys.argv[1:] == ["config", "show"]:
     print(json.dumps({
         "appId": "cli_processbot1", "brand": "lark", "appSecret": "****"
@@ -699,6 +711,20 @@ def test_unsupported_cli_version_fails_before_consumer_start(tmp_path, monkeypat
         )
         with pytest.raises(LarkCliVersionError, match="unsupported"):
             await process.start()
+        assert not process.running
+
+    asyncio.run(scenario())
+
+
+def test_runtime_surfaces_structured_stderr_verification_error(tmp_path, monkeypatch):
+    async def scenario():
+        monkeypatch.setenv("FAKE_LARK_VERIFY_ERROR", "1")
+        process = LarkCliProcess(
+            _profile(tmp_path), executable=str(_executable(tmp_path)), ready_timeout=2
+        )
+        with pytest.raises(LarkError, match="keychain") as raised:
+            await process.start()
+        assert not isinstance(raised.value, LarkProtocolError)
         assert not process.running
 
     asyncio.run(scenario())

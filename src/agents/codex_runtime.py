@@ -34,6 +34,12 @@ from .base import (
     emit_if_awaitable,
 )
 from .config_profile import LoadedCodexConfigProfile, load_config_profile
+from .lark_tool_identity import (
+    LARK_ENVIRONMENT_EXCLUDES,
+    LarkToolIdentity,
+    lark_shell_environment_set,
+    lark_tool_identity_from_metadata,
+)
 from .model_context import (
     ModelContextResolutionError,
     ModelContextSettings,
@@ -95,6 +101,7 @@ def _create_codex_client() -> Any:
 def _thread_config_overrides(
     context_settings: ModelContextSettings | None,
     config_profile: LoadedCodexConfigProfile | None = None,
+    lark_tool_identity: LarkToolIdentity | None = None,
 ) -> dict[str, Any]:
     """Return a fresh fail-safe config for one new or resumed Codex thread."""
 
@@ -103,6 +110,32 @@ def _thread_config_overrides(
     )
     if context_settings is not None:
         overrides.update(context_settings.as_config_overrides())
+    if lark_tool_identity is not None:
+        raw_policy = overrides.get("shell_environment_policy", {})
+        if not isinstance(raw_policy, Mapping):
+            raise ValueError("Codex shell environment policy is malformed")
+        policy = dict(raw_policy)
+        raw_excludes = policy.get("exclude", ())
+        if isinstance(raw_excludes, str) or not isinstance(
+            raw_excludes, Sequence
+        ):
+            raise ValueError("Codex shell environment excludes are malformed")
+        excludes = [str(value) for value in raw_excludes]
+        for value in LARK_ENVIRONMENT_EXCLUDES:
+            if value not in excludes:
+                excludes.append(value)
+        raw_set = policy.get("set", {})
+        if not isinstance(raw_set, Mapping):
+            raise ValueError("Codex shell environment overrides are malformed")
+        set_values = dict(raw_set)
+        set_values.update(
+            lark_shell_environment_set(
+                lark_tool_identity.shell_config_dir
+            )
+        )
+        policy["exclude"] = excludes
+        policy["set"] = set_values
+        overrides["shell_environment_policy"] = policy
     overrides["features"] = {"unified_exec": False}
     overrides["tool_output_token_limit"] = CODEX_TOOL_OUTPUT_TOKEN_LIMIT
     return overrides
@@ -133,6 +166,7 @@ class ThreadBinding:
     provider_id: str
     model_id: str
     context_config_fingerprint: str
+    lark_tool_identity_fingerprint: str
     thread_id: str
     thread: Any
 
@@ -2211,6 +2245,7 @@ class CodexRuntime:
     ) -> ThreadBinding:
         if task_cwd is None:
             task_cwd = self._cwd_for_task(task)
+        lark_tool_identity = lark_tool_identity_from_metadata(task.metadata)
         canonical_role = (
             validate_role_snapshot(session_role)
             if session_role is not None
@@ -2245,6 +2280,7 @@ class CodexRuntime:
             context_settings,
             self._loaded_config_profile,
         )
+        lark_tool_identity_fingerprint = lark_tool_identity.fingerprint
         kwargs: dict[str, Any] = {
             "approval_mode": approval_for_policy(
                 self._policy_value(task, "approval_policy", "deny_all")
@@ -2265,6 +2301,7 @@ class CodexRuntime:
         kwargs["config"] = _thread_config_overrides(
             context_settings,
             self._loaded_config_profile,
+            lark_tool_identity,
         )
         if provider_id:
             kwargs["model_provider"] = provider_id
@@ -2317,6 +2354,8 @@ class CodexRuntime:
             context_changed = bool(
                 existing.provider_id != provider_id
                 or existing.context_config_fingerprint != context_fingerprint
+                or existing.lark_tool_identity_fingerprint
+                != lark_tool_identity_fingerprint
             )
             if not model_changed and not context_changed:
                 return existing
@@ -2354,6 +2393,7 @@ class CodexRuntime:
             provider_id=provider_id,
             model_id=model_id,
             context_config_fingerprint=context_fingerprint,
+            lark_tool_identity_fingerprint=lark_tool_identity_fingerprint,
             thread_id=thread_id,
             thread=thread,
         )

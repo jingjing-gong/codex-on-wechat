@@ -25,6 +25,7 @@ from src.agents.base import (
 from .dispatcher import SQLiteDispatcher, _call_compatible
 from .diagnostics import log_task_started, log_task_terminal
 from .identity import mailbox_conversation_id
+from .lark_tool_binding import bind_lark_tool_identity
 from .store import MAILBOX_OPERATOR_CANCEL_REASON
 
 logger = logging.getLogger(__name__)
@@ -263,6 +264,22 @@ class TaskWorker:
                                 logger.debug("could not finalize raced cancellation for %s", task_id, exc_info=True)
                         return True
                     return True
+                # Resolve tool identity at the execution boundary, not merely
+                # at message acceptance. This covers old queued/cron tasks and
+                # revalidates a profile that may have been disabled or removed
+                # in the meantime. The reserved value is overwritten, so a
+                # persisted caller-controlled value cannot choose credentials.
+                # Do this after the claim heartbeat is live: profile lookup is
+                # I/O and must not lengthen the unfenced claim window.
+                task = AgentTask.from_record(
+                    task,
+                    metadata=await bind_lark_tool_identity(
+                        self.store,
+                        task.reply_target,
+                        task.metadata,
+                    ),
+                )
+                self._active[task_id] = (raw_task, task)
                 attempt = _field(raw_task, "attempts", _field(raw_task, "attempt", None))
                 runtime_started_at = time.monotonic()
                 log_task_started(

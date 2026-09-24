@@ -7,6 +7,9 @@ import logging
 import threading
 from types import SimpleNamespace
 
+import pytest
+from requests.exceptions import ReadTimeout
+
 from wechat_ilink.monitor import Monitor, _is_immediate_command_message
 from wechat_ilink.types import (
     ITEM_TYPE_TEXT,
@@ -156,6 +159,51 @@ def test_monitor_does_not_advance_cursor_when_either_server_code_fails(monkeypat
 
         assert handled == []
         assert client.cursors == ["", ""]
+
+
+@pytest.mark.parametrize("initial_failures", [0, 2])
+def test_monitor_retries_read_timeouts_without_counting_failures(
+    monkeypatch, caplog, initial_failures
+):
+    class StopAfterSixWaits:
+        def __init__(self) -> None:
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            return len(self.waits) >= 6
+
+        def wait(self, timeout: float) -> bool:
+            self.waits.append(timeout)
+            return self.is_set()
+
+    class Client:
+        bot_id = "bot"
+
+        def __init__(self) -> None:
+            self.cursors: list[str] = []
+
+        def get_updates(self, cursor: str):
+            self.cursors.append(cursor)
+            raise ReadTimeout("long-poll hold exceeded read timeout")
+
+    monkeypatch.setattr(Monitor, "_load_buf", lambda self: None)
+    monkeypatch.setattr("wechat_ilink.monitor.INITIAL_BACKOFF", 1.0)
+    stop = StopAfterSixWaits()
+    client = Client()
+    monitor = Monitor(client, lambda *_args: None, initial_cursor="saved-cursor")
+    monitor._failures = initial_failures
+    with caplog.at_level(logging.DEBUG, logger="wechat_ilink.monitor"):
+        try:
+            monitor.run(stop)
+        finally:
+            monitor.close()
+
+    assert stop.waits == [1.0] * 6
+    assert client.cursors == ["saved-cursor"] * 6
+    assert monitor._get_updates_buf == "saved-cursor"
+    assert monitor._failures == initial_failures
+    assert caplog.text.count("GetUpdates long-poll read timeout; retrying") == 6
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
 
 
 def test_monitor_backs_off_repeated_protocol_errors(monkeypatch):

@@ -12,6 +12,11 @@ import pytest
 import src.agents.config_profile as config_profile_module
 from src.agents.base import AgentTask
 from src.agents.codex_runtime import CodexRuntime
+from src.agents.lark_tool_identity import (
+    LARK_ENVIRONMENT_EXCLUDES,
+    LARK_UNAVAILABLE_CONFIG_DIR,
+    lark_shell_environment_set,
+)
 from src.agents.config_profile import (
     CodexConfigProfileError,
     load_config_profile,
@@ -381,6 +386,12 @@ def test_thread_start_and_resume_receive_selected_provider_and_safety_config(
         }
         expected_config = {
             "model_providers": {"qwen": expected_provider},
+            "shell_environment_policy": {
+                "exclude": list(LARK_ENVIRONMENT_EXCLUDES),
+                "set": lark_shell_environment_set(
+                    LARK_UNAVAILABLE_CONFIG_DIR
+                ),
+            },
             "features": {"unified_exec": False},
             "tool_output_token_limit": 500,
         }
